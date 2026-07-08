@@ -1,0 +1,95 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import { getCollection } from 'astro:content';
+
+const posts = (await getCollection('blog', ({ data }) => !data.draft))
+  .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
+---
+
+<BaseLayout title="Devlog" description="Devlog posts from Coinless Games.">
+  <section class="wrap page">
+    <p class="eyebrow">// PATCH NOTES</p>
+    <h1>Devlog</h1>
+
+    {posts.length === 0 && (
+      <p class="empty">No entries yet. Check back after the next build.</p>
+    )}
+
+    <ul class="post-list">
+      {posts.map((post) => (
+        <li class="post-entry">
+          <a href={`/blog/${post.slug}`} class="post-title">{post.data.title}</a>
+          <div class="post-meta">
+            <span class="post-date">{post.data.date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}</span>
+          </div>
+          {post.data.summary && <p class="post-summary">{post.data.summary}</p>}
+        </li>
+      ))}
+    </ul>
+  </section>
+
+  <style>
+    .page {
+      padding: 3rem 1.5rem 4rem;
+    }
+
+    .eyebrow {
+      font-size: 0.75rem;
+      color: var(--color-marquee);
+      letter-spacing: 1px;
+      font-weight: 700;
+      margin: 0 0 0.5rem;
+    }
+
+    h1 {
+      margin-top: 0;
+      margin-bottom: 2rem;
+    }
+
+    .empty {
+      color: var(--color-text-muted);
+    }
+
+    .post-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+
+    .post-entry {
+      padding: 1.25rem 0;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .post-entry:first-child {
+      border-top: 1px solid var(--color-border);
+    }
+
+    .post-title {
+      font-weight: 700;
+      font-size: 1rem;
+      color: var(--color-text);
+      text-decoration: none;
+    }
+
+    .post-title:hover {
+      color: var(--color-accent);
+      text-decoration: underline;
+    }
+
+    .post-meta {
+      margin-top: 0.3rem;
+    }
+
+    .post-date {
+      font-size: 0.75rem;
+      color: var(--color-text-muted);
+    }
+
+    .post-summary {
+      margin: 0.6rem 0 0;
+      color: var(--color-text-muted);
+      font-size: 0.9rem;
+    }
+  </style>
+</BaseLayout>

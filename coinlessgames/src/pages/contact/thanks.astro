@@ -1,0 +1,62 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+---
+
+<BaseLayout title="Message Sent" description="Thanks for reaching out.">
+  <section class="wrap page">
+    <div class="cabinet pixel-corners">
+      <p class="marquee-eyebrow">MESSAGE RECEIVED</p>
+      <h1>Thanks!</h1>
+      <p class="tagline">Your message made it through. I'll get back to you soon.</p>
+      <a href="/" class="back-btn">RETURN HOME</a>
+    </div>
+  </section>
+
+  <style>
+    .page {
+      padding: 3rem 1.5rem 4rem;
+    }
+
+    .cabinet {
+      background: var(--color-bg-raised);
+      border: 3px solid var(--color-border);
+      padding: 3rem 2rem;
+      text-align: center;
+    }
+
+    .marquee-eyebrow {
+      font-family: var(--font-display);
+      font-size: 0.65rem;
+      color: var(--color-marquee);
+      letter-spacing: 2px;
+      margin: 0 0 1.5rem;
+    }
+
+    h1 {
+      color: var(--color-accent);
+      margin: 0 0 1rem;
+    }
+
+    .tagline {
+      color: var(--color-text-muted);
+      margin: 0 0 2rem;
+    }
+
+    .back-btn {
+      display: inline-block;
+      font-family: var(--font-display);
+      font-size: 0.7rem;
+      background: var(--color-accent);
+      color: var(--color-bg);
+      padding: 0.8rem 1.5rem;
+      border-radius: var(--radius);
+      text-decoration: none;
+      letter-spacing: 1px;
+    }
+
+    .back-btn:hover {
+      background: var(--color-marquee);
+      color: var(--color-bg);
+    }
+  </style>
+</BaseLayout>
