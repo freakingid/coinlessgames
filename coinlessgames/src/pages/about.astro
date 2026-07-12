@@ -1,91 +1,37 @@
 ---
+import { getEntry } from 'astro:content';
 import BaseLayout from '../layouts/BaseLayout.astro';
+
+const page = await getEntry('pages', 'about');
+const { title, eyebrow, statClass, statTools, statStatus } = page.data;
+const { Content } = await page.render();
 ---
-
-<BaseLayout title="About" description="About Coinless Games.">
+<BaseLayout title={title} description="About Coinless Games.">
   <section class="wrap page">
-    <p class="eyebrow">// PLAYER PROFILE</p>
-    <h1>About</h1>
-
+    <p class="eyebrow">{eyebrow}</p>
+    <h1>{title}</h1>
     <div class="prose">
-      <p>
-        Replace this paragraph with your own story: who you are, why you make
-        games, and what "coinless" means to you. Keep it short — one or two
-        paragraphs reads better than a wall of text.
-      </p>
-      <p>
-        A second paragraph can cover what kind of games you make, the tools
-        you use, or what you're working on right now.
-      </p>
+      <Content />
     </div>
-
     <div class="stat-block">
       <h2>// STATS</h2>
       <ul class="stat-list">
-        <li><span class="stat-label">CLASS</span><span class="stat-value">Indie Developer</span></li>
-        <li><span class="stat-label">TOOLS</span><span class="stat-value">Replace with your engine/stack</span></li>
-        <li><span class="stat-label">STATUS</span><span class="stat-value">Currently building something</span></li>
+        {statClass && <li><span class="stat-label">CLASS</span><span class="stat-value">{statClass}</span></li>}
+        {statTools && <li><span class="stat-label">TOOLS</span><span class="stat-value">{statTools}</span></li>}
+        {statStatus && <li><span class="stat-label">STATUS</span><span class="stat-value">{statStatus}</span></li>}
       </ul>
     </div>
   </section>
-
   <style>
-    .page {
-      padding: 3rem 1.5rem 4rem;
-    }
-
-    .eyebrow {
-      font-size: 0.75rem;
-      color: var(--color-marquee);
-      letter-spacing: 1px;
-      font-weight: 700;
-      margin: 0 0 0.5rem;
-    }
-
-    h1 {
-      margin-top: 0;
-      margin-bottom: 1.5rem;
-    }
-
-    .prose p {
-      margin: 0 0 1rem;
-    }
-
-    .stat-block {
-      margin-top: 2.5rem;
-      background: var(--color-bg-raised);
-      border: 2px solid var(--color-border);
-      border-radius: var(--radius);
-      padding: 1.5rem;
-    }
-
-    .stat-list {
-      list-style: none;
-      padding: 0;
-      margin: 1rem 0 0;
-    }
-
-    .stat-list li {
-      display: flex;
-      justify-content: space-between;
-      gap: 1rem;
-      padding: 0.6rem 0;
-      border-bottom: 1px dashed var(--color-border);
-      font-size: 0.85rem;
-    }
-
-    .stat-list li:last-child {
-      border-bottom: none;
-    }
-
-    .stat-label {
-      color: var(--color-text-muted);
-      letter-spacing: 1px;
-      white-space: nowrap;
-    }
-
-    .stat-value {
-      text-align: right;
-    }
+    .page { padding: 3rem 1.5rem 4rem; }
+    .eyebrow { font-size: 0.75rem; color: var(--color-marquee); letter-spacing: 1px; font-weight: 700; margin: 0 0 0.5rem; }
+    h1 { margin-top: 0; margin-bottom: 1.5rem; }
+    .prose p { margin: 0 0 1rem; }
+    .stat-block { margin-top: 2.5rem; background: var(--color-bg-raised); border: 2px solid var(--color-border); border-radius: var(--radius); padding: 1.5rem; }
+    .stat-list { list-style: none; padding: 0; margin: 1rem 0 0; }
+    .stat-list li { display: flex; justify-content: space-between; gap: 1rem; padding: 0.6rem 0; border-bottom: 1px dashed var(--color-border); font-size: 0.85rem; }
+    .stat-list li:last-child { border-bottom: none; }
+    .stat-label { color: var(--color-text-muted); letter-spacing: 1px; white-space: nowrap; }
+    .stat-value { text-align: right; }
   </style>
 </BaseLayout>
