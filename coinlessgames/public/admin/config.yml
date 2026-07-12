@@ -28,17 +28,13 @@ collections:
     format: "frontmatter"
     fields:
       - { label: "Title", name: "title", widget: "string" }
-      - { label: "Hook", name: "hook", widget: "text", hint: "One-line pitch shown on the games index card." }
-      - label: "Status"
-        name: "status"
-        widget: "select"
-        options: ["In Development", "Alpha", "Beta", "Released"]
-        default: "In Development"
-      - { label: "Inspired By", name: "inspiredBy", widget: "string", required: false, hint: "e.g. Gauntlet, Asteroids Deluxe" }
-      - { label: "YouTube Trailer URL", name: "trailerUrl", widget: "string", required: false }
-      - { label: "Play Link", name: "playLink", widget: "string", required: false, hint: "e.g. /play/orbital-overhaul/" }
-      - { label: "Features", name: "features", widget: "list", required: false }
-      - { label: "Screenshots", name: "screenshots", widget: "list", required: false, field: { label: "Image", name: "image", widget: "image" } }
+      - { label: "Series", name: "series", widget: "string", required: false, hint: "e.g. Atomic Dustbin Dan" }
       - { label: "Sort Order", name: "order", widget: "number", default: 0, hint: "Lower numbers appear first on the games index." }
+      - { label: "Tagline", name: "tagline", widget: "string", required: false }
+      - { label: "Description", name: "description", widget: "text", required: false }
+      - { label: "Status", name: "status", widget: "string", required: false, hint: "e.g. Playable in browser, In Development" }
+      - { label: "Play URL", name: "playUrl", widget: "string", required: false, hint: "e.g. /play/orbital-overhaul/" }
       - { label: "Draft", name: "draft", widget: "boolean", default: false, hint: "Hide this game from the live site until it's ready." }
-      - { label: "Body", name: "body", widget: "markdown", hint: "Publisher's note — plain-voice description below Dan's in-world log." }
+      - { label: "Log Signature", name: "logSignature", widget: "string", required: false, hint: "Who signs the in-world log entry, e.g. Dan" }
+      - { label: "Log Entry", name: "logEntry", widget: "text", required: false, hint: "Dan's in-world log, shown in the terminal/CRT block on the game page." }
+      - { label: "Body", name: "body", widget: "markdown", hint: "Publisher's note — plain-voice description below Dan's log." }
