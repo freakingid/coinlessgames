@@ -158,6 +158,18 @@ const HIT_STUN_DURATION = 1.0;  // sec of hit-stun invulnerability granted after
 const LOW_HP_THRESHOLD = 100;   // PLAYTEST KNOB. HP at or below which the low-health warning
                                 // engages. 100 = 5 small hits / ~3 medium / 2 large — "five
                                 // bad seconds from dead." 40% of SHIP_MAX_HP. (FORK-8, confirmed; v3.4 P5)
+// v3.5 P3 PLAYTEST KNOBS — the low-health voice (AudioSys.lowhp/lowhpSet). Urgency t = 1 -
+// hp/LOW_HP_THRESHOLD (0 at the threshold, ~1 near death) scales pulse rate and gain between
+// these min/max pairs; the harmonic partner tracks the root at a fixed fraction.
+const LOWHP_ROOT_FREQ        = 220;   // Hz — unchanged root pitch of the old constant-tone voice
+const LOWHP_HARMONIC_RATIO   = 1.5;   // a fifth above the root (2.0 would be an octave)
+const LOWHP_HARMONIC_GAIN_FRAC = 0.35; // harmonic partner's level as a fraction of the root's
+const LOWHP_PULSE_RATE_MIN   = 0.9;   // Hz — gentle "hey" pulse at the threshold (t=0)
+const LOWHP_PULSE_RATE_MAX   = 2.4;   // Hz — real alarm pulse near death (t=1)
+const LOWHP_PULSE_DEPTH      = 0.5;   // amplitude-LFO depth/offset — pulseGain swings ~0..1
+const LOWHP_GAIN_MIN         = 0.08;  // peak root gain at t=0 — in thrust's (0.10) neighborhood
+const LOWHP_GAIN_MAX         = 0.13;  // peak root gain at t=1 — pulsing carries most of the urgency
+const LOWHP_PARAM_RAMP       = 0.15;  // s — click-free per-frame param ramp (matches MUSIC_DUCK_RAMP)
 const REPAIR_MILESTONE = 10000; // score interval that grants a hull-repair bonus (was: extra life)
 const REPAIR_AMOUNT = 25;       // +HP granted at each milestone (capped at max)
 const REPAIR_FULL_BONUS = 2500; // flat score awarded instead when already at full HP
@@ -520,29 +532,68 @@ const AudioSys = {
     o.start(t); o.stop(t + 0.21);
   },
 
-  // v3.4 P5: the low-health siren. Same persistent-voice shape as thrust()/saucer() — a stored
-  // oscillator torn down on false — but a GENTLE, SLOW warble (not a klaxon): a low sine LFO-swept
-  // over a low base frequency, quiet gain, so it reads as "you need health," not an alarm to mute.
+  // v3.5 P3: the low-health voice, rebuilt. The old build was a CONSTANT-amplitude 220Hz sine at
+  // gain 0.05 — the quietest voice on the bus, with no harmonics to cut through explosion (0.5) or
+  // thrust (0.10), and constant amplitude, which the ear adapts away the longer it plays (louder
+  // alone would only be more annoying, not more noticeable). Rebuilt as a PULSED cockpit-warning
+  // beep: two static-level oscillators (root + a soft harmonic partner, so it reads as an
+  // instrument panel and survives an explosion) summed into a shared amplitude-LFO gain node (the
+  // pulse). Same persistent-voice shape as thrust()/saucer() — stored nodes built on true, torn
+  // down on false. lowhpSet(t) (below) then ramps the pulse rate + gain from HP urgency; nothing
+  // here reads HP directly.
   lowhp(on) {
     if (!this.ctx) return;
     if (on && !this.lowhpOsc) {
-      const o = this.ctx.createOscillator();
+      const root = this.ctx.createOscillator();
+      const harm = this.ctx.createOscillator();
+      const rootLevel = this.ctx.createGain();
+      const harmLevel = this.ctx.createGain();
+      const pulseGain = this.ctx.createGain();
       const lfo = this.ctx.createOscillator();
       const lfoGain = this.ctx.createGain();
-      const g = this.ctx.createGain();
-      o.type = "sine";
-      o.frequency.value = 220;
-      lfo.frequency.value = 0.6;   // slow warble, ~1 cycle every 1.7s
-      lfoGain.gain.value = 18;
-      lfo.connect(lfoGain).connect(o.frequency);
-      g.gain.value = 0.05;
-      o.connect(g).connect(this.sfx);
-      o.start(); lfo.start();
-      this.lowhpOsc = { o, lfo }; this.lowhpGain = g;
+      root.type = "sine"; root.frequency.value = LOWHP_ROOT_FREQ;
+      harm.type = "sine"; harm.frequency.value = LOWHP_ROOT_FREQ * LOWHP_HARMONIC_RATIO;
+      rootLevel.gain.value = LOWHP_GAIN_MIN;
+      harmLevel.gain.value = LOWHP_GAIN_MIN * LOWHP_HARMONIC_GAIN_FRAC;
+      lfo.type = "sine"; lfo.frequency.value = LOWHP_PULSE_RATE_MIN;
+      lfoGain.gain.value = LOWHP_PULSE_DEPTH;
+      pulseGain.gain.value = LOWHP_PULSE_DEPTH;      // DC offset; lfo swings it ~0..2*depth (~0..1)
+      lfo.connect(lfoGain).connect(pulseGain.gain);
+      root.connect(rootLevel).connect(pulseGain);
+      harm.connect(harmLevel).connect(pulseGain);
+      pulseGain.connect(this.sfx);
+      root.start(); harm.start(); lfo.start();
+      this.lowhpOsc = { root, harm, lfo };
+      this.lowhpGain = { rootLevel, harmLevel, pulseGain, lfoGain };
+      this.lowhpT = null;   // forces lowhpSet's next call to actually ramp (idempotency guard)
     } else if (!on && this.lowhpOsc) {
-      this.lowhpOsc.o.stop(); this.lowhpOsc.lfo.stop();
-      this.lowhpOsc = null; this.lowhpGain = null;
+      this.lowhpOsc.root.stop(); this.lowhpOsc.harm.stop(); this.lowhpOsc.lfo.stop();
+      this.lowhpOsc = null; this.lowhpGain = null; this.lowhpT = null;
     }
+  },
+
+  // v3.5 P3: per-frame HP-urgency scaling for the live low-health voice. t = 1 - hp/LOW_HP_THRESHOLD
+  // (0 at the threshold, ~1 near death) — called every frame the state is engaged from update()'s
+  // single edge-detect site, right alongside the lowhp(true)/(false) calls. Safe no-op when the
+  // voice isn't live or ctx is null. Idempotent on t (same idiom as MusicSys.setDuck/setIntensity)
+  // so a steady-HP frame doesn't reschedule a ramp. Moves params via linearRampToValueAtTime, never
+  // a bare per-frame .value set — that zippers.
+  lowhpSet(t) {
+    if (!this.ctx || !this.lowhpOsc) return;
+    t = Math.max(0, Math.min(1, t || 0));
+    if (t === this.lowhpT) return;
+    this.lowhpT = t;
+    const now = this.now();
+    const rate = LOWHP_PULSE_RATE_MIN + (LOWHP_PULSE_RATE_MAX - LOWHP_PULSE_RATE_MIN) * t;
+    const gain = LOWHP_GAIN_MIN + (LOWHP_GAIN_MAX - LOWHP_GAIN_MIN) * t;
+    const ramp = (param, target) => {
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(target, now + LOWHP_PARAM_RAMP);
+    };
+    ramp(this.lowhpOsc.lfo.frequency, rate);
+    ramp(this.lowhpGain.rootLevel.gain, gain);
+    ramp(this.lowhpGain.harmLevel.gain, gain * LOWHP_HARMONIC_GAIN_FRAC);
   },
 
   pickup() {
@@ -777,7 +828,14 @@ function buildRetroTrack() {
 function buildAmbientTrack() {
   const STEPS = 16, stepDur = 0.5;
   const bass = mkSteps(STEPS), pulse = mkSteps(STEPS), harmony = mkSteps(STEPS), lead = mkSteps(STEPS);
-  putStep(bass, 0, 40, 16, 1.0); // E2 drone, whole loop
+  // Foundation (tier 1, always on): root/fifth pad swells offset every 2s across the 8s loop, each
+  // overlapping the next's attack as its own release fades — continuously present (no silent gap
+  // between notes), not one isolated blip. This is the ONLY layer a wave-1 player hears (tiers 2-4
+  // are gated by MUSIC_LAYER_THRESHOLD), so it alone must read as "music," not "paused."
+  putStep(bass, 0,  40, 6, 1.0);  // E2
+  putStep(bass, 4,  47, 6, 0.85); // B2 (fifth)
+  putStep(bass, 8,  40, 6, 0.9);  // E2
+  putStep(bass, 12, 47, 6, 0.8);  // B2
   putStep(pulse, 4, 64, 2, 0.7);  // E4 ping
   putStep(pulse, 12, 67, 2, 0.6); // G4 ping
   putStep(harmony, 0, 59, 8, 0.8); // B3 pad
@@ -785,10 +843,12 @@ function buildAmbientTrack() {
   putStep(lead, 6, 71, 2, 0.6);  // B4 twinkle
   putStep(lead, 14, 76, 2, 0.55); // E5 twinkle
   return { stepDur, steps: STEPS, layers: [
-    { name: "bass",    type: "sine",     gain: 0.06,  cutoff: 300, atk: 1.5, rel: 2.5, tier: 1, steps: bass },
-    { name: "pulse",   type: "triangle", gain: 0.035, atk: 0.3,   rel: 0.8,  tier: 2, steps: pulse },
-    { name: "harmony", type: "triangle", gain: 0.04,  cutoff: 800, atk: 1.0, rel: 1.6, tier: 3, steps: harmony },
-    { name: "lead",    type: "sine",     gain: 0.03,  atk: 0.4,   rel: 1.0,  tier: 4, steps: lead },
+    // Gains brought into family with retro (0.075 bass) / tense (0.08 bass) — calmest track, not the
+    // quietest; tiers 2-4 nudged up to match rather than left ~30% below their tense/retro siblings.
+    { name: "bass",    type: "sine",     gain: 0.075, cutoff: 300, atk: 1.0, rel: 2.0, tier: 1, steps: bass },
+    { name: "pulse",   type: "triangle", gain: 0.045, atk: 0.3,   rel: 0.8,  tier: 2, steps: pulse },
+    { name: "harmony", type: "triangle", gain: 0.05,  cutoff: 800, atk: 1.0, rel: 1.6, tier: 3, steps: harmony },
+    { name: "lead",    type: "sine",     gain: 0.045, atk: 0.4,   rel: 1.0,  tier: 4, steps: lead },
   ]};
 }
 
@@ -1087,6 +1147,11 @@ window.addEventListener("keydown", e => {
   // (2) A menu is open — route to menu navigation, do NOT record gameplay keys.
   if (menuActive()) {
     e.preventDefault();
+    // Browser key auto-repeat (~30/sec while held) would otherwise spam menu actions — e.g. spin
+    // the 3-value Music Track row back to its start and re-enter setState() nearly every frame,
+    // restarting the crossfade ramp and pinning the music near-silent. Matches the gamepad path
+    // (handleGamepadMenu -> menuNavEdges()), which is already strictly edge-detected.
+    if (e.repeat) return;
     handleMenuKey(k);
     return;
   }
@@ -2054,30 +2119,18 @@ class Particle {
 
 // Shared renderer for radioactive canisters (free-floating and chained). Low-mass scrap
 // (Hunter small-tier drops) renders in a paler tint so it's visibly the easier-to-tow bonus.
-function drawCanister(x, y, angle, alpha, color = COLOR.garbage) {
+// v3.5 P2: trailing `scale` param (default 1, so the two pre-existing call sites — the single
+// canister and chain nodes — stay byte-identical) lets a garbage clump draw as one larger canister.
+function drawCanister(x, y, angle, alpha, color = COLOR.garbage, scale = 1) {
   ctx.globalAlpha = alpha * (0.75 + Math.random() * 0.25); // radioactive flicker
-  const body = [[7, -5], [7, 5], [-7, 5], [-7, -5]];
+  const body = [[7 * scale, -5 * scale], [7 * scale, 5 * scale], [-7 * scale, 5 * scale], [-7 * scale, -5 * scale]];
   drawPoly(body, x, y, angle, color);
   ctx.save();
   ctx.translate(x, y); ctx.rotate(angle);
-  ctx.beginPath(); ctx.moveTo(-7, 0); ctx.lineTo(7, 0); // hazard stripe
+  ctx.beginPath(); ctx.moveTo(-7 * scale, 0); ctx.lineTo(7 * scale, 0); // hazard stripe
   glowStroke(color, 1, 5);
   ctx.restore();
   ctx.globalAlpha = 1;
-}
-
-// v3.3 P1: generate a clump's cached hull ONCE (constructor + every merge), never per frame. 7-9
-// vertices jittered around `radius` so each clump has a stable, distinctive silhouette instead of
-// the old per-frame mini-canister cluster. Unit-radius-relative jitter, rotated live by this.spin.
-function makeClumpHull(radius) {
-  const n = 7 + Math.floor(rand(0, 3)); // 7-9 vertices
-  const pts = [];
-  for (let i = 0; i < n; i++) {
-    const theta = (i / n) * TAU + rand(-0.15, 0.15);
-    const r = radius * rand(0.8, 1.15);
-    pts.push([Math.cos(theta) * r, Math.sin(theta) * r]);
-  }
-  return pts;
 }
 
 // Lerp between two "#rrggbb" hex colors, t clamped to [0,1].
@@ -2109,9 +2162,6 @@ class Garbage {
     this.coalesceDelay = GARBAGE_COALESCE_DELAY;
     this.pieces = 1;
     this.radius = 7 * Math.sqrt(this.pieces);
-    // v3.3 P1: cached clump hull, regenerated only here and at every merge (coalesceGarbage) — NOT
-    // per frame. Unused while pieces === 1 (that branch stays byte-identical to pre-P1 rendering).
-    this.hull = makeClumpHull(this.radius);
     this.dead = false;
   }
   static fromNode(n) { // chain node knocked loose -> free garbage (v3.2 P3: no decay)
@@ -2147,23 +2197,15 @@ class Garbage {
       drawCanister(this.x, this.y, this.spin, alpha, color);
       return;
     }
-    // v3.3 P1: a clump (pieces > 1) renders as ONE closed hull polygon — no inner lines, no mini-
-    // canisters — so it reads as "a target," not "a pile of pickups." The hull is generated once
-    // (constructor / merge) and cached on `this.hull`; here it's only rotated by this.spin and lerp-
-    // tinted from COLOR.garbage toward COLOR.clumpHot as pieces approaches HUNTER_COALESCE_COUNT, a
-    // free threat meter (the clump visibly reddens as it nears the Hunter transform).
+    // v3.5 P2 (reverses v3.3 P1): a clump (pieces > 1) draws as ONE ordinary canister scaled up by
+    // sqrt(pieces) (= this.radius / 7) — a larger canister, not a jittered-hull asteroid — so it
+    // reads as "a bigger pickup," not "a hazard." Scaling by radius/7 makes the drawn long half-axis
+    // exactly equal this.radius, so the visual and the (unchanged) collision radius agree by
+    // construction. The lerp from COLOR.garbage toward COLOR.clumpHot as pieces approaches
+    // HUNTER_COALESCE_COUNT is kept as the only tell that a clump is nearing the Hunter transform;
+    // the radioactive alpha flicker comes free from drawCanister.
     const color = lerpColor(COLOR.garbage, COLOR.clumpHot, this.pieces / HUNTER_COALESCE_COUNT);
-    ctx.globalAlpha = 0.75 + Math.random() * 0.25; // keep the radioactive flicker
-    ctx.save();
-    ctx.translate(this.x, this.y);
-    ctx.rotate(this.spin);
-    ctx.beginPath();
-    ctx.moveTo(this.hull[0][0], this.hull[0][1]);
-    for (let i = 1; i < this.hull.length; i++) ctx.lineTo(this.hull[i][0], this.hull[i][1]);
-    ctx.closePath();
-    glowStroke(color);
-    ctx.restore();
-    ctx.globalAlpha = 1;
+    drawCanister(this.x, this.y, this.spin, 0.9, color, this.radius / 7);
   }
 }
 
@@ -3058,7 +3100,6 @@ function coalesceGarbage(dt) {
         a.mass = mt;
         a.pieces += b.pieces;
         a.radius = 7 * Math.sqrt(a.pieces);
-        a.hull = makeClumpHull(a.radius); // v3.3 P1: regenerate the cached silhouette at every merge
         b.dead = true;
         if (a.pieces >= HUNTER_COALESCE_COUNT) {
           // Clump collapses into a new large Hunter core. Independent of game.hunterTimer (FORK-1).
@@ -3210,6 +3251,9 @@ function update(dt) {
   const lowHp = game.ship.hp <= LOW_HP_THRESHOLD && !game.ship.dead;
   if (lowHp && !game.lowHpSiren) { AudioSys.lowhp(true); game.lowHpSiren = true; }
   else if (!lowHp && game.lowHpSiren) { AudioSys.lowhp(false); game.lowHpSiren = false; }
+  // v3.5 P3: HP-scaled urgency for the pulsed voice — a per-frame call (not edge-detected), safe
+  // no-op via lowhpSet's own guards when the state isn't engaged or the voice isn't live.
+  if (lowHp) AudioSys.lowhpSet(1 - game.ship.hp / LOW_HP_THRESHOLD);
   // Achievements (F9): per-game clock (Speed Recycler's 60s window) + lifetime play time & periodic save
   game.stats.gameTime += dt;
   Achievements.tick(dt);
@@ -3281,13 +3325,12 @@ function update(dt) {
         if (take === g.pieces) {
           g.dead = true;  // whole clump fit — total mass conserved onto the chain
         } else {
-          // Leftover floats off: re-derive its size/mass, re-arm the coalesce delay, regenerate the
-          // cached hull, and kick it directly away from the ship so "the rest of the ball floats away".
+          // Leftover floats off: re-derive its size/mass, re-arm the coalesce delay, and kick it
+          // directly away from the ship so "the rest of the ball floats away".
           g.pieces -= take;
           g.mass  -= take * pMass;
           g.radius = 7 * Math.sqrt(g.pieces);
           g.coalesceDelay = GARBAGE_COALESCE_DELAY;
-          g.hull = makeClumpHull(g.radius);
           const [ax, ay] = shortDelta(game.ship.x, game.ship.y, g.x, g.y); // ship -> leftover (wrap-aware)
           const d = Math.hypot(ax, ay) || 0.0001;
           g.vx += (ax / d) * SCOOP_SPILL_KICK;
