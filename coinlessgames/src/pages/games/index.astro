@@ -1,0 +1,66 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+
+const games = (await getCollection('games', ({ data }) => !data.draft)).sort(
+  (a, b) => a.data.order - b.data.order
+);
+---
+
+<BaseLayout
+  title="Games — Coinless Games"
+  description="Arcade games with a twist. Free, playable in your browser. No coins required."
+>
+  <div class="wrap games">
+    <h1>Games</h1>
+    <p class="games__intro">No coins required — just press start.</p>
+
+    <ul class="games__list">
+      {
+        games.map((game) => (
+          <li class="games__item">
+            {game.data.series && <p class="games__series">{game.data.series}</p>}
+            <h2 class="games__title">
+              <a href={`/games/${game.slug}/`}>{game.data.title}</a>
+            </h2>
+            <p class="games__desc">{game.data.description}</p>
+            <p class="games__status">{game.data.status}</p>
+          </li>
+        ))
+      }
+    </ul>
+  </div>
+</BaseLayout>
+
+<style>
+  .games { padding: 3rem 1.5rem 5rem; }
+  .games__intro { color: var(--color-muted); margin: 1rem 0 3rem; }
+
+  .games__list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    gap: 2rem;
+  }
+
+  .games__item {
+    border: 1px solid rgba(74, 222, 128, 0.25);
+    padding: 1.75rem;
+    background: rgba(0, 0, 0, 0.25);
+  }
+
+  .games__series {
+    font-family: var(--font-display);
+    font-size: 0.55rem;
+    letter-spacing: 1px;
+    color: var(--color-marquee);
+    margin: 0 0 0.9rem;
+    text-transform: uppercase;
+  }
+
+  .games__title { font-family: var(--font-display); font-size: 1rem; margin: 0 0 1rem; }
+  .games__title a { text-decoration: none; }
+  .games__desc { margin: 0 0 1rem; line-height: 1.7; }
+  .games__status { margin: 0; font-size: 0.8rem; color: var(--color-accent); }
+</style>

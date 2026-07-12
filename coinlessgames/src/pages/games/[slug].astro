@@ -1,0 +1,175 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+
+export async function getStaticPaths() {
+  const games = await getCollection('games', ({ data }) => !data.draft);
+  return games.map((game) => ({
+    params: { slug: game.slug },
+    props: { game },
+  }));
+}
+
+const { game } = Astro.props;
+const { Content } = await game.render();
+const d = game.data;
+
+const logParagraphs = d.logEntry.trim().split(/\n\s*\n/);
+---
+
+<BaseLayout title={`${d.title} — Coinless Games`} description={d.description}>
+  <article class="game wrap">
+    <header class="game__head">
+      {d.series && <p class="game__series">{d.series}</p>}
+      <h1 class="game__title">{d.title}</h1>
+      <p class="game__tagline">{d.tagline}</p>
+    </header>
+
+    {
+      d.playUrl && (
+        <p class="game__cta-row">
+          <a class="game__cta" href={d.playUrl} target="_blank" rel="noopener">
+            ▶ Play in browser
+          </a>
+          <span class="game__status">{d.status} — no coins required</span>
+        </p>
+      )
+    }
+
+    <section class="log" aria-label={`Log entry from ${d.logSignature}`}>
+      <p class="log__header">// SALVAGE LOG</p>
+      {logParagraphs.map((para) => <p class="log__line">{para}</p>)}
+      <p class="log__sign">— {d.logSignature}</p>
+    </section>
+
+    <section class="note">
+      <Content />
+    </section>
+  </article>
+</BaseLayout>
+
+<style>
+  .game { padding: 3rem 1.5rem 5rem; }
+  .game__head { margin-bottom: 2rem; }
+
+  .game__series {
+    font-family: var(--font-display);
+    font-size: 0.6rem;
+    letter-spacing: 1px;
+    color: var(--color-marquee);
+    margin: 0 0 1rem;
+    text-transform: uppercase;
+  }
+
+  .game__title {
+    font-family: var(--font-display);
+    font-size: 1.5rem;
+    line-height: 1.5;
+    margin: 0;
+    color: var(--color-text);
+    text-shadow: 0 0 12px rgba(74, 222, 128, 0.35);
+  }
+
+  .game__tagline { color: var(--color-muted); margin: 1rem 0 0; }
+
+  .game__cta-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 1rem;
+    margin: 0 0 3rem;
+  }
+
+  .game__cta {
+    display: inline-block;
+    font-family: var(--font-display);
+    font-size: 0.7rem;
+    line-height: 1;
+    padding: 1rem 1.25rem;
+    color: var(--color-bg);
+    background: var(--color-marquee);
+    border: 2px solid var(--color-marquee);
+    text-decoration: none;
+    box-shadow: 0 0 16px rgba(251, 191, 36, 0.35);
+    transition: transform 0.12s ease, box-shadow 0.15s ease;
+  }
+
+  .game__cta:hover,
+  .game__cta:focus-visible {
+    color: var(--color-bg);
+    transform: translateY(-2px);
+    box-shadow: 0 0 26px rgba(251, 191, 36, 0.6);
+  }
+
+  .game__status { font-size: 0.8rem; color: var(--color-muted); }
+
+  .log {
+    position: relative;
+    background: #000;
+    border: 1px solid rgba(74, 222, 128, 0.45);
+    box-shadow:
+      0 0 0 1px rgba(74, 222, 128, 0.08),
+      0 0 28px rgba(74, 222, 128, 0.14),
+      inset 0 0 40px rgba(74, 222, 128, 0.06);
+    padding: 2rem 1.75rem;
+    margin: 0 0 3.5rem;
+    overflow: hidden;
+  }
+
+  .log::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(74, 222, 128, 0.05) 0px,
+      rgba(74, 222, 128, 0.05) 1px,
+      transparent 1px,
+      transparent 4px
+    );
+  }
+
+  .log__header {
+    font-family: var(--font-display);
+    font-size: 0.55rem;
+    letter-spacing: 1px;
+    color: rgba(74, 222, 128, 0.65);
+    margin: 0 0 1.5rem;
+  }
+
+  .log__line {
+    color: var(--color-accent);
+    font-family: var(--font-body);
+    font-size: 0.95rem;
+    line-height: 1.75;
+    margin: 0 0 1.25rem;
+    text-shadow: 0 0 8px rgba(74, 222, 128, 0.4);
+  }
+
+  .log__sign {
+    color: var(--color-accent);
+    font-size: 0.95rem;
+    margin: 1.75rem 0 0;
+    text-align: right;
+    text-shadow: 0 0 8px rgba(74, 222, 128, 0.4);
+  }
+
+  .note { max-width: 60ch; }
+
+  .note :global(p) {
+    color: var(--color-text);
+    font-size: 1rem;
+    line-height: 1.7;
+    margin: 0 0 1.25rem;
+  }
+
+  .note :global(p:last-child) {
+    margin-bottom: 0;
+    color: var(--color-muted);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .game__cta { transition: none; }
+  }
+</style>
