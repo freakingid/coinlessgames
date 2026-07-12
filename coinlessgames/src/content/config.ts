@@ -1,5 +1,4 @@
 import { defineCollection, z } from 'astro:content';
-
 const blog = defineCollection({
   type: 'content',
   schema: z.object({
@@ -10,7 +9,6 @@ const blog = defineCollection({
     draft: z.boolean().optional(),
   }),
 });
-
 const games = defineCollection({
   type: 'content',
   schema: z.object({
@@ -26,5 +24,14 @@ const games = defineCollection({
     draft: z.boolean().default(false),
   }),
 });
-
-export const collections = { blog, games };
+const pages = defineCollection({
+  type: 'content',
+  schema: z.object({
+    title: z.string(),
+    eyebrow: z.string().default('// PLAYER PROFILE'),
+    statClass: z.string().optional(),
+    statTools: z.string().optional(),
+    statStatus: z.string().optional(),
+  }),
+});
+export const collections = { blog, games, pages };
