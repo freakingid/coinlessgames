@@ -22,3 +22,26 @@ collections:
       - { label: "Thumbnail", name: "thumbnail", widget: "image", required: false }
       - { label: "Draft", name: "draft", widget: "boolean", default: false, hint: "Hide this post from the live site until it's ready." }
       - { label: "Body", name: "body", widget: "markdown" }
+- name: "games"
+    label: "Games"
+    folder: "src/content/games"
+    create: true
+    slug: "{{slug}}"
+    extension: "md"
+    format: "frontmatter"
+    fields:
+      - { label: "Title", name: "title", widget: "string" }
+      - { label: "Hook", name: "hook", widget: "text", hint: "One-line pitch shown on the games index card." }
+      - label: "Status"
+        name: "status"
+        widget: "select"
+        options: ["In Development", "Alpha", "Beta", "Released"]
+        default: "In Development"
+      - { label: "Inspired By", name: "inspiredBy", widget: "string", required: false, hint: "e.g. Gauntlet, Asteroids Deluxe" }
+      - { label: "YouTube Trailer URL", name: "trailerUrl", widget: "string", required: false }
+      - { label: "Play Link", name: "playLink", widget: "string", required: false, hint: "e.g. /play/orbital-overhaul/" }
+      - { label: "Features", name: "features", widget: "list", required: false }
+      - { label: "Screenshots", name: "screenshots", widget: "list", required: false, field: { label: "Image", name: "image", widget: "image" } }
+      - { label: "Sort Order", name: "order", widget: "number", default: 0, hint: "Lower numbers appear first on the games index." }
+      - { label: "Draft", name: "draft", widget: "boolean", default: false, hint: "Hide this game from the live site until it's ready." }
+      - { label: "Body", name: "body", widget: "markdown", hint: "Publisher's note — plain-voice description below Dan's in-world log." }
