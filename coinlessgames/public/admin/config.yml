@@ -38,3 +38,16 @@ collections:
       - { label: "Log Signature", name: "logSignature", widget: "string", required: false, hint: "Who signs the in-world log entry, e.g. Dan" }
       - { label: "Log Entry", name: "logEntry", widget: "text", required: false, hint: "Dan's in-world log, shown in the terminal/CRT block on the game page." }
       - { label: "Body", name: "body", widget: "markdown", hint: "Publisher's note — plain-voice description below Dan's log." }
+  - name: "pages"
+    label: "Pages"
+    files:
+      - label: "About Page"
+        name: "about"
+        file: "coinlessgames/src/content/pages/about.md"
+        fields:
+          - { label: "Title", name: "title", widget: "string" }
+          - { label: "Eyebrow", name: "eyebrow", widget: "string", hint: "Small label above the title, e.g. // PLAYER PROFILE" }
+          - { label: "Stat: Class", name: "statClass", widget: "string", required: false }
+          - { label: "Stat: Tools", name: "statTools", widget: "string", required: false }
+          - { label: "Stat: Status", name: "statStatus", widget: "string", required: false }
+          - { label: "Body", name: "body", widget: "markdown", hint: "Main About copy." }
