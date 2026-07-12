@@ -1,12 +1,9 @@
 backend:
   name: git-gateway
   branch: main
-
 media_folder: "public/uploads"
 public_folder: "/uploads"
-
 publish_mode: simple
-
 collections:
   - name: "blog"
     label: "Devlog Posts"
@@ -22,7 +19,7 @@ collections:
       - { label: "Thumbnail", name: "thumbnail", widget: "image", required: false }
       - { label: "Draft", name: "draft", widget: "boolean", default: false, hint: "Hide this post from the live site until it's ready." }
       - { label: "Body", name: "body", widget: "markdown" }
-- name: "games"
+  - name: "games"
     label: "Games"
     folder: "src/content/games"
     create: true
