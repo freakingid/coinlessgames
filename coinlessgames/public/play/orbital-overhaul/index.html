@@ -68,8 +68,8 @@
    (and split), the core bounces; Hunters still sever the tow chain.
    v1.7: Powerups — five free-floating pickups (each a distinct vector-glow icon). Health spawns
    ambiently on a saucer-like timer and instantly repairs +25 HP (capped); Rapid Fire, Triple Shot,
-   Magnet and Engine drop from small-tier Debris/Hunter kills at POWERUP_DROP_CHANCE and last
-   POWERUP_DURATION seconds. Rapid Fire doubles the bullet cap (4->8); Triple Shot fires a 3-bullet
+   Magnet and Engine drop from small-tier Debris/Hunter kills at a per-kill chance and last
+   POWERUP_DURATION seconds (drop rule superseded by three deterministic sources, v3.6 P3). Rapid Fire doubles the bullet cap (4->8); Triple Shot fires a 3-bullet
    spread and triples the cap (4->12) — both active uses the higher cap (12), not 24. Magnet pulls
    free garbage toward the ship inside an extended radius (and widens the pickup radius); Engine
    halves the effective towed-mass sum (chainMass) so thrust/top-speed/tug all lighten. Same-type
@@ -140,6 +140,12 @@ const HUNTER_SPEED_CEIL = { 3: 70, 2: 120, 1: 175 };  // full-difficulty px/s: l
 const HUNTER_TURN_CEIL  = { 3: 0, 2: 1.6, 1: 2.6 };   // full-difficulty homing turn rate (rad/s); large never turns (passive drift)
 const HUNTER_FLOOR_FRAC = 0.58;   // wave-1 speeds & turn rates = this × ceiling (THE knob for early-game Hunter calm)
 const HUNTER_SCATTER    = 0.6;    // sec a freshly-split homer scatters outward before homing engages
+// v3.6 P2b: "last stand" — once no Debris remain (game.debris.length === 0), a large core slowly steers
+// toward the ship instead of drifting forever. Both PLAYTEST KNOBS, deliberately under-specified.
+const HUNTER_LAST_STAND_SPEED = 50;    // px/s — slower than a medium homer at ANY wave (medium ranges
+                                       // HUNTER_SPEED_CEIL[2]*HUNTER_FLOOR_FRAC≈70 at wave 1 up to 120 at
+                                       // ceiling); a search-ender, not a second homing tier.
+const HUNTER_LAST_STAND_TURN  = 0.5;   // rad/s — well below HUNTER_TURN_CEIL[2] (1.6); a slow, inevitable turn.
 // PLAYTEST KNOB (v3.4 P1): canisters per Hunter KILL, by tier — was a flat HUNTER_GARBAGE=3 for
 // both large/medium plus a separate HUNTER_SMALL_GARBAGE=6 for the small tier; now one per-tier
 // table shaped like HUNTER_RADII/HUNTER_SCORE/HUNTER_DAMAGE.
@@ -173,6 +179,29 @@ const LOWHP_PARAM_RAMP       = 0.15;  // s — click-free per-frame param ramp (
 const REPAIR_MILESTONE = 10000; // score interval that grants a hull-repair bonus (was: extra life)
 const REPAIR_AMOUNT = 25;       // +HP granted at each milestone (capped at max)
 const REPAIR_FULL_BONUS = 2500; // flat score awarded instead when already at full HP
+
+// v3.6 P5 — the death spectacle. killShip() enters a new "dying" state for DEATH_DURATION seconds
+// instead of freezing straight to "gameover": the field keeps simulating (updateDeath) while an
+// expanding shockwave ring chain-detonates nearby bodies nearest-first (awardScore=false — no score,
+// no achievement counters), the screen shakes, and a white flash washes the first frames. deathT
+// reaching 0 hands off to "gameover". ALL PLAYTEST KNOBS — re-picked once it can be flown, not agonised
+// over here.
+const DEATH_DURATION        = 2.5;  // s the spectacle runs before the GAME OVER screen freezes it
+const DEATH_SHOCKWAVE_SPEED = 700;  // px/s the ring expands from the death point. It is ALSO the
+                                    // detonation front: a body detonates the frame the ring reaches it,
+                                    // so "nearest-first" falls out for free. Reach ≈ SPEED × DURATION.
+const DEATH_SHOCKWAVE_WIDTH = 4;    // px stroke width of the ring at birth (thins/fades as it expands)
+const DEATH_SHAKE_INIT      = 16;   // px initial screen-shake amplitude at the instant of death
+const DEATH_SHAKE_DECAY     = 24;   // px/s linear decay of the shake amplitude toward 0
+const DEATH_FLASH_TIME      = 0.22; // s the white flash takes to fade from full to nothing
+const DEATH_FLASH_ALPHA     = 0.8;  // peak alpha of the frame-one white flash
+
+// v3.6 P6 — top-10 local high scores. SCORES_CHARSET is the initials-entry alphabet (up/down cycles
+// through this one string per slot); SCORES_MAX caps the persisted table. GAME_VERSION is stamped
+// into every record's `build` field (the wire shape's provenance tag — see the HighScores object).
+const SCORES_MAX = 10;
+const SCORES_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
+const GAME_VERSION = "3.6";
 
 // Radioactive salvage / tow chain / recycling dock
 // v3.3 P4 (9a): loose SINGLE canisters decay again (GARBAGE_DECAY) — decay is the GOVERNOR that keeps
@@ -240,6 +269,8 @@ const DOCK_BASE_SCORE = 50;     // 1st canister of a visit
 const DOCK_BONUS_STEP = 25;     // each additional canister: +25 over the last
 const DOCK_OFFLOAD_INTERVAL = 0.05; // PLAYTEST KNOB (v3.4 P1; was a bare literal 0.13). sec between
                                      // canisters peeling off at the dock.
+const DOCK_POWERUP_SPEED = 120;     // PLAYTEST KNOB (v3.6 P3): launch speed of the hub's per-visit
+                                     // powerup drop, random direction from the dock's own position.
 
 // Larger world & scrolling camera (v1.2)
 const CULL_MARGIN = 100;        // px beyond the viewport edge still worth drawing
@@ -254,14 +285,6 @@ const STAR_BRIGHT_MAX = 1.0;
 const STAR_NEAR_DENSITY = 22;   // near parallax layer: sparse, per viewport-sized screen area
 const STAR_NEAR_BRIGHT_MIN = 0.55; // near layer reads brighter (closer) than the far layer
 const STAR_NEAR_BRIGHT_MAX = 1.0;
-
-// World-boundary visibility line (v2.1) — a dim dashed rectangle at the wrap seam so the
-// player can see the wrap-around coming. Purely cosmetic (no collision); drawn in world
-// space beneath entities, at the seam's nearest wrapped image relative to the camera.
-const BOUNDARY_DASH  = 16;      // dash segment length (world units)
-const BOUNDARY_GAP   = 24;      // gap between dashes (world units)
-const BOUNDARY_WIDTH = 2;       // stroke width
-const BOUNDARY_GLOW  = 5;       // shadowBlur — kept low so it reads as a boundary, not a hazard
 
 // Difficulty ramp & early-game pacing (F10) — one shared curve scales every wave-driven
 // threat parameter from an easy wave-1 floor up to a full-intensity ceiling (see §2.6/§2.13).
@@ -288,8 +311,9 @@ const SAUCER_SMALL_CHANCE_FLOOR = 0.15; // wave-1: mostly the harmless random-fi
 const SAUCER_SMALL_CHANCE_CEIL  = 0.60; // full difficulty: the dangerous aimed 1000-pt saucer common
 
 // Powerups (F6) — five free-floating pickups. Health spawns ambiently on a saucer-like timer
-// and is instant; the other four (rapid/triple/magnet/engine) are timed effects that drop from
-// small-tier Debris/Hunter kills. Same-type pickups refresh the timer (no magnitude stacking);
+// and is instant; the other four (rapid/triple/magnet/engine) are timed effects, dropped by
+// three deterministic sources (v3.6 P3): every UFO kill, every large Hunter kill, and the
+// recycle hub every 10th canister. Same-type pickups refresh the timer (no magnitude stacking);
 // different types run independently. Icons/labels/colors live with COLOR (below the helpers).
 const POWERUP_DURATION = 15;        // sec a timed effect (rapid/triple/magnet/engine) stays active — SHARED
 const MAGNET_DURATION = POWERUP_DURATION * 2;   // 30 s — Magnet is the one long effect (v3.4 P4). Do NOT
@@ -299,11 +323,11 @@ const POWERUP_RADIUS = 15;          // pickup icon radius = its collision radius
 // baseline as difficulty ramps. Ships DISABLED (pinned at start=2.0). See DIFFICULTY-LEVERS.md.
 const LEVER_POWERUP_SIZE = { enabled: false, start: 2.0, floor: 1.0 };
 const POWERUP_DECAY = 26;           // sec an uncollected powerup lingers before fading (v3.3 P3: 14->26, playtest knob — shot powerups should linger longer)
-const POWERUP_DROP_CHANCE = 0.16;   // chance a small-tier kill drops a powerup (v3.3 P3: 0.10->0.16, playtest knob — drop more often)
 const POWERUP_DROP_TYPES = ["rapid", "triple", "magnet", "engine"]; // TIMED effects the HUD/powerActive/powerBudget machinery understands — Health & Scoop are NOT here (see POWERUP_DROP_WEIGHTS)
 // v3.3 P3: what can actually DROP (weighted), a SEPARATE structure from POWERUP_DROP_TYPES above.
 // Favors the shot powerups; Scoop is droppable but is a persistent, non-timed upgrade, so it is
 // deliberately absent from POWERUP_DROP_TYPES (the timed-effect list). Weights are the playtest knob.
+// v3.6 P3: this is now the type-roll table for THREE unconditional emitters (dropPowerup) — see below.
 const POWERUP_DROP_WEIGHTS = { rapid: 3, triple: 3, scoop: 2, magnet: 1, engine: 1 };
 const POWERUP_HEALTH_GAP = [18, 26]; // sec between ambient Health spawns (saucer-like cadence)
 const POWERUP_HEALTH_AMOUNT = 25;    // +HP on Health pickup, capped at max (matches the F2 milestone repair)
@@ -320,8 +344,23 @@ const MAGNET_RANGE = 380;   // PLAYTEST KNOB. px from ship center. Deliberately 
                             // 54 px — a ~7x buff (v3.4 P4).
 const MAGNET_PICKUP_MULT = 1.6;     // effective pickup radius grows this much while the magnet is active
 const MAGNET_PULL     = 520;   // PLAYTEST KNOB. px/s^2 at zero distance (was a flat 360)
-const MAGNET_PULL_MIN = 60;    // PLAYTEST KNOB. px/s^2 floor at MAGNET_RANGE — a subtle pull so the top of the screen still visibly moves
-const MAGNET_DAMP = 0.06;           // per-sec velocity damping inside range so the pull glides, not jitters
+const MAGNET_PULL_MIN = 150;   // PLAYTEST KNOB (v3.6 P2a: 60->150). px/s^2 floor at MAGNET_RANGE — governs
+                                // the far field by construction; 60 made the top of the screen nearly inert.
+const MAGNET_FALLOFF_POW = 1.0; // PLAYTEST KNOB (v3.6 P2a: new, was a hardcoded t*t). 1.0 = linear falloff.
+                                 // The old quadratic was a near-field yank; the near field was never weak —
+                                 // the mid-field was. Linear roughly doubles accel at half range.
+const MAGNET_DAMP = 0.35;      // PLAYTEST KNOB (v3.6 P2a: 0.06->0.35). Per-sec velocity retention inside
+                                // range — counter-intuitively, a LARGER value damps LESS (applied as
+                                // Math.pow(MAGNET_DAMP, dt)). At 0.06 a piece lost ~4.6%/frame, which turns
+                                // this pull into a terminal-velocity governor rather than an acceleration:
+                                // solving the steady state (vx' = vx*damp^dt + accel*dt each frame, damp^dt
+                                // constant) gives v_terminal ≈ accel·dt / (1 - MAGNET_DAMP^dt). At 0.06 that
+                                // capped a piece near accel/2.7 — a piece 190px out (accel~175 under the old
+                                // quadratic) topped out near 65 px/s, ~3s to arrive. At 0.35 the retention is
+                                // ~0.983/frame, v_terminal ≈ accel/1.0 — pieces arrive ~2.7x faster for the
+                                // same accel. Biggest single lever here; risks overshoot/orbiting the ship,
+                                // so if pieces jitter around the ship instead of landing, THIS is the knob
+                                // to pull back first — not MAGNET_PULL.
 // Engine: lightens the effective towed mass so thrust/top-speed/tug (all fed by chainMass) ease.
 const ENGINE_MASS_MULT = 0.5;       // Engine halves the effective towed-mass sum while active
 // Count-based expiry budgets (v3.0 P5, B-4/B-5). Used only when the matching Difficulty mode is the
@@ -341,11 +380,13 @@ const SHIP_DRAW_W = 18;    // the drawn hull's width (see Ship's draw poly) - th
 // size curve can be tuned with tools/scoop-lab.html instead of eyeballing raw px arrays. Edit these five
 // numbers (from the lab), not the arrays below.
 const SCOOP_CONFIG = {
-  maxWidthMult: 3.0,   // L5 mouth width as a multiple of SHIP_DRAW_W  (SET FROM THE LAB)
+  maxWidthMult: 5.0,   // v3.6 P1c: 3.0 -> 5.0 (L5 mouth 54px -> 90px). Playtest starting point, not a
+                        // decision — re-pick in tools/scoop-lab.html.
   minWidthMult: 1.2,   // L1 mouth width, same units
   curve:        1.0,   // step distribution: 1.0 = linear; >1 = weighted toward the LARGE end
   minDepth:     20,    // px forward of ship center at L1
-  maxDepth:     36,    // px forward of ship center at L5
+  maxDepth:     60,    // v3.6 P1c: 36 -> 60, proportional to the width bump. Playtest starting point,
+                        // not a decision — re-pick in tools/scoop-lab.html.
 };
 // Build a SCOOP_MAX_LEVEL+1-length step table: index 0 is ALWAYS 0 (byte-identical to the pre-scoop
 // build at scoopLevel 0 — see inScoopBox); indices 1..SCOOP_MAX_LEVEL interpolate min->max via `curve`
@@ -1213,11 +1254,31 @@ window.addEventListener("keydown", e => {
   // (3) Normal play/title/gameover keyboard input.
   if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
   keys[k] = true;
-  if (bindings.confirm.keys.includes(k) && (game.state === "title" || game.state === "gameover")) startGame();
+
+  // v3.6 P6: high-score initials entry (live only on "gameover", armed at the "dying"->"gameover"
+  // seam) intercepts nav/confirm here — and returns, so a confirm that just committed the entry
+  // (clearing game.entry) can't fall through to the startGame() check below in the SAME keypress.
+  // e.repeat guard matches the v3.5 P1 menu-nav fix (a held key must not spin the letter).
+  if (game.entry) {
+    if (!e.repeat) {
+      if (k === "arrowup" || k === "w") entryInput("up");
+      else if (k === "arrowdown" || k === "s") entryInput("down");
+      else if (k === "arrowleft" || k === "a") entryInput("left");
+      else if (k === "arrowright" || k === "d") entryInput("right");
+      else if (bindings.confirm.keys.includes(k)) entryInput("confirm");
+    }
+    return;
+  }
+
+  // THE LOAD-BEARING GUARD (v3.6 P6, §10): without `&& !game.entry`, confirm would restart the run
+  // instead of committing the initials — belt-and-suspenders alongside the early return above, in
+  // case entry-handling is ever restructured.
+  if (bindings.confirm.keys.includes(k) && (game.state === "title" || game.state === "gameover") && !game.entry) startGame();
   if (bindings.pause.keys.includes(k) && game.state === "playing") openPause();
   // "O" opens the Options/Achievements system menu from title/gameover (v3.0 P4; replaces the old
   // P->options path). No game to pause here — openPause() picks the system-menu root off game.state.
-  if (k === "o" && (game.state === "title" || game.state === "gameover")) openPause();
+  // Guarded off during initials entry so O can't pop the menu mid-entry.
+  if (k === "o" && (game.state === "title" || game.state === "gameover") && !game.entry) openPause();
 });
 window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
 
@@ -1252,6 +1313,20 @@ function handleGamepadMenu() {
     if (pressedConfirm) menuInput("confirm");
     if (pressedBack)    menuInput("back");
     if (pressedStart)   menuInput("pause");   // Start fully resumes from any menu screen
+    return;
+  }
+
+  // (2.5) v3.6 P6: high-score initials entry — same edge-detected latch as real menu nav
+  // (menuNavEdges is already strictly edge-detected; gpPressed(confirm) already excludes held-button
+  // repeats), so a held stick/button can't spin the letter or double-commit. Swallows Start/B too —
+  // nothing should interrupt entry — mirroring the keyboard path's early guard on "o".
+  if (game.entry) {
+    const nav = menuNavEdges();
+    if (nav.up)    entryInput("up");
+    if (nav.down)  entryInput("down");
+    if (nav.left)  entryInput("left");
+    if (nav.right) entryInput("right");
+    if (pressedConfirm) entryInput("confirm");
     return;
   }
 
@@ -1317,7 +1392,7 @@ function firstPressedButton() {
 // game.state: pausing mid-game keeps state "playing"; the system menu opened from title/gameover keeps
 // state "title"/"gameover" (update() skips the sim in both, so game.paused is safe in any state).
 const MENU_ROOT_PLAY = ["Continue", "Options", "Quit"];      // paused mid-game
-const MENU_ROOT_SYS  = ["Options", "Achievements", "Back"];  // system menu from title/gameover
+const MENU_ROOT_SYS  = ["Options", "Achievements", "High Scores", "Back"];  // system menu from title/gameover (v3.6 P6 added "High Scores")
 function rootItems() { return game.state === "playing" ? MENU_ROOT_PLAY : MENU_ROOT_SYS; }
 // v3.4 P6: "Music Track" inserted after "Master Volume". menuOptions()/drawOptionsMenu() dispatch by
 // LABEL (like menuRoot), not by hardcoded index, so adding a row here is purely additive and can't
@@ -1395,6 +1470,7 @@ function menuInput(action) {
     case "controls":     menuControls(action); break;
     case "difficulty":   menuDifficulty(action); break;
     case "achievements": menuAchievements(action); break;
+    case "highscores":   menuHighScores(action); break;
   }
 }
 
@@ -1408,6 +1484,7 @@ function menuRoot(a) {
     if (label === "Continue")          closePause();
     else if (label === "Options")      gotoScreen("options");
     else if (label === "Achievements") { gotoScreen("achievements"); m.achReturn = "root"; }
+    else if (label === "High Scores")  gotoScreen("highscores"); // v3.6 P6: browsable top-10 table
     else if (label === "Quit")         quitToTitle();
     else if (label === "Back")         closePause(); // system menu: close overlay -> underlying title/gameover
   }
@@ -1454,6 +1531,13 @@ function menuAchievements(a) {
     if (game.menu.achReturn === "root") gotoScreen("root", rootItems().indexOf("Achievements"));
     else gotoScreen("options", 4);
   }
+}
+
+// High Scores viewer (v3.6 P6): read-only top-10 table reachable only from the system-menu root
+// (title/gameover) — mirrors menuAchievements' shape, but has no nested Options path to return to.
+function menuHighScores(a) {
+  if (a === "pause") closePause();
+  else if (a === "confirm" || a === "back") gotoScreen("root", rootItems().indexOf("High Scores"));
 }
 
 // Difficulty screen (v3.0 P5, B-4/B-5): two left/right mode toggles + Back. Left picks the timed
@@ -1684,15 +1768,11 @@ const COLOR = {
   dim: "#3a5a80",
   garbage: "#c8ff50",
   garbageLight: "#b8ffb0",   // low-mass Hunter scrap: a paler, mintier tint so it reads as "lighter / easier to tow" (F4)
-  clumpHot: "#ff5a2a",       // v3.3 P1: a pieces>1 clump lerps toward this as it nears the Hunter
-                             // transform (12 pieces) — a free threat meter. Clear of every other
-                             // hazard hue (ship/debris blue, Hunter teal, dock green, rapid amber,
-                             // health red) — FLAG A-7b, look-call, tune on sight.
   chain: "#8aa0ff",
   dock: "#70ffa0",
   hp: "#5fe08a",
-  lowhp: "#ff4040",         // v3.4 P5: the low-health pointer chevron — distinct from COLOR.hp, from
-                            // clumpHot (#ff5a2a), and from the low-HP bar fill (#ff7060)
+  lowhp: "#ff4040",         // v3.4 P5: the low-health pointer chevron — distinct from COLOR.hp and
+                            // from the low-HP bar fill (#ff7060)
   ach: "#ffcf5a"            // achievement gold — the unlock toast + earned-achievement highlight (F9)
 };
 
@@ -1805,12 +1885,29 @@ class Ship {
     if (this.dead) return;
     const blink = this.invuln > 0 && Math.floor(this.invuln * 10) % 2 === 0;
     if (!blink) {
-      // Scoop mouth (v3.3 P3): two prongs flaring from the nose out to +/-width/2 at the mouth depth,
-      // drawn BEFORE the hull in COLOR.dock green so it reads as a collector's throat. At level 5 the
-      // mouth spans 54 px = 3x the ship's 18 px width. Hidden at level 0.
+      // Scoop mouth (v3.3 P3; box render v3.6 P1c): drawn BEFORE the hull in COLOR.dock green so it
+      // reads as a collector's throat. This is the EXACT capture region inScoopBox() tests — a
+      // rectangle from forward=-SHIP_RADIUS (behind the nose) to forward=SCOOP_DEPTH[lvl], within
+      // +/-SCOOP_WIDTH[lvl]/2 laterally — not an approximation, so what's drawn is what captures.
+      // Corners are derived, never hardcoded. Filled translucent (a deliberate exception to GDD
+      // §3.2's no-fills rule — a HUD-ish capture-region affordance, not an entity) with the usual
+      // glowStroke outline on top. Hidden at level 0.
       if (game.scoopLevel > 0) {
         const lvl = game.scoopLevel, hw = SCOOP_WIDTH[lvl] / 2, d = SCOOP_DEPTH[lvl];
-        drawPoly([[d, -hw], [16, 0], [d, hw]], this.x, this.y, this.angle, COLOR.dock, false);
+        const box = [[-SHIP_RADIUS, -hw], [d, -hw], [d, hw], [-SHIP_RADIUS, hw]];
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.angle);
+        ctx.beginPath();
+        ctx.moveTo(box[0][0], box[0][1]);
+        for (let i = 1; i < box.length; i++) ctx.lineTo(box[i][0], box[i][1]);
+        ctx.closePath();
+        ctx.globalAlpha = 0.15; // look-call knob
+        ctx.fillStyle = COLOR.dock;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        glowStroke(COLOR.dock);
+        ctx.restore();
       }
       const pts = [[16, 0], [-11, -9], [-6, 0], [-11, 9]];
       drawPoly(pts, this.x, this.y, this.angle, COLOR.ship);
@@ -2064,7 +2161,22 @@ class HunterSatellite {
       this.vx = Math.cos(this.heading) * this.speed;
       this.vy = Math.sin(this.heading) * this.speed;
     } else {
-      this.angle += this.spinRate * dt;   // large core tumbles; keeps its fixed spawn-time drift velocity
+      this.angle += this.spinRate * dt;   // large core tumbles; keeps its fixed spawn-time drift velocity...
+      // ...UNLESS it's the last satellite standing (v3.6 P2b): once Debris is cleared, a large core slowly
+      // steers toward the ship — a search-ender for late-wave stalling, not a second homing tier. Do NOT
+      // flip this.homing: shape/inner and draw()'s angle-vs-heading pick are baked off it at construction,
+      // so that would silently swap the diamond for the kite silhouette and freeze the tumble. Evaluated
+      // inline instead of a stored flag — the tumble is the unchanged visual, the steering is the tell.
+      if (game.debris.length === 0 && !game.ship.dead) {
+        const target = angleTo(this, game.ship);          // wrap-aware — a naive angle is ~180° wrong across a seam
+        let diff = target - this.heading;
+        while (diff > Math.PI) diff -= TAU;
+        while (diff < -Math.PI) diff += TAU;
+        const maxTurn = HUNTER_LAST_STAND_TURN * dt;
+        this.heading += Math.max(-maxTurn, Math.min(maxTurn, diff));
+        this.vx = Math.cos(this.heading) * HUNTER_LAST_STAND_SPEED;
+        this.vy = Math.sin(this.heading) * HUNTER_LAST_STAND_SPEED;
+      }
     }
     this.x += this.vx * dt; this.y += this.vy * dt;
     wrap(this);
@@ -2186,16 +2298,6 @@ function drawCanister(x, y, angle, alpha, color = COLOR.garbage, scale = 1) {
   ctx.globalAlpha = 1;
 }
 
-// Lerp between two "#rrggbb" hex colors, t clamped to [0,1].
-function lerpColor(c1, c2, t) {
-  t = Math.max(0, Math.min(1, t));
-  const a = parseInt(c1.slice(1), 16), b = parseInt(c2.slice(1), 16);
-  const ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
-  const br = (b >> 16) & 255, bg = (b >> 8) & 255, bb = b & 255;
-  const r = Math.round(ar + (br - ar) * t), g = Math.round(ag + (bg - ag) * t), bl = Math.round(ab + (bb - ab) * t);
-  return "#" + ((1 << 24) + (r << 16) + (g << 8) + bl).toString(16).slice(1);
-}
-
 class Garbage {
   // v3.3 P4 (9a): a loose SINGLE decays again on GARBAGE_DECAY (see update()). Not a ctor param — every
   // piece is born a single with a full life; a clump (pieces > 1) simply never counts it down (FORK-4).
@@ -2254,10 +2356,10 @@ class Garbage {
     // sqrt(pieces) (= this.radius / 7) — a larger canister, not a jittered-hull asteroid — so it
     // reads as "a bigger pickup," not "a hazard." Scaling by radius/7 makes the drawn long half-axis
     // exactly equal this.radius, so the visual and the (unchanged) collision radius agree by
-    // construction. The lerp from COLOR.garbage toward COLOR.clumpHot as pieces approaches
-    // HUNTER_COALESCE_COUNT is kept as the only tell that a clump is nearing the Hunter transform;
-    // the radioactive alpha flicker comes free from drawCanister.
-    const color = lerpColor(COLOR.garbage, COLOR.clumpHot, this.pieces / HUNTER_COALESCE_COUNT);
+    // construction. v3.6 P1a: colour now follows the same per-piece-mass rule as a single (the red
+    // proximity-to-Hunter lerp is gone) — size (radius = 7*sqrt(pieces)) is the only remaining tell
+    // that a clump is nearing the Hunter transform.
+    const color = (this.mass / this.pieces) < 1 ? COLOR.garbageLight : COLOR.garbage;
     drawCanister(this.x, this.y, this.spin, 0.9, color, this.radius / 7);
   }
 }
@@ -2323,7 +2425,6 @@ class Powerup {
   }
   update(dt) {
     this.x += this.vx * dt; this.y += this.vy * dt;
-    this.vx *= Math.pow(0.4, dt); this.vy *= Math.pow(0.4, dt); // drop kick settles quickly
     this.spin += this.spinRate * dt;
     this.pulse += dt * 4;
     wrap(this);
@@ -2430,8 +2531,12 @@ function resetGameStats() {
 }
 
 const game = {
-  state: "title",   // title | playing | gameover
+  state: "title",   // title | playing | dying | gameover  ("dying" = the v3.6 P5 death spectacle)
   paused: false,    // true iff a pause-menu screen is open (F8)
+  deathT: 0,        // v3.6 P5: seconds left in the "dying" spectacle (DEATH_DURATION → 0 → "gameover")
+  shake: 0,         // v3.6 P5: current screen-shake amplitude (px), decayed in updateDeath()
+  entry: null,      // v3.6 P6: { initials:[i,i,i], idx } while the initials-entry UI is live on "gameover"
+  lastScoreId: null,// v3.6 P6: id of the just-committed HighScores record, for the table highlight
   stats: resetGameStats(), // per-game achievement counters/flags (F9)
   toasts: [],       // active achievement-unlock toasts { name, life } (F9)
   // Pause-menu state machine (F8): screen = null | "root" | "options" | "controls";
@@ -2464,6 +2569,8 @@ const game = {
 function startGame() {
   game.state = "playing";
   game.paused = false;
+  game.deathT = 0; game.shake = 0;   // v3.6 P5: a fresh run never carries death-spectacle state over
+  game.entry = null; game.lastScoreId = null; // v3.6 P6: nor any stale initials-entry/highlight state
   game.menu = { screen: null, index: 0, row: 0, col: 0, rebinding: null, achReturn: "options" }; // ensure no menu carries in
   game.stats = resetGameStats();  // fresh per-game achievement tracking (F9)
   game.toasts = [];               // clear any lingering unlock toasts
@@ -2561,8 +2668,6 @@ function destroyDebris(a, awardScore = true) {
     for (let i = 0; i < 3; i++) {
       game.debris.push(new DebrisSatellite(a.x, a.y, a.size - 1, speedMul));
     }
-  } else {
-    maybeDropPowerup(a.x, a.y); // finishing off a lineage's smallest tier can drop a powerup (F6)
   }
 }
 
@@ -2571,14 +2676,21 @@ function destroyDebris(a, awardScore = true) {
 // fan-out mirrors that pattern. Called both when shot and when a homer dies on the shield.
 function destroyHunter(h, awardScore = true) {
   h.dead = true;
-  if (awardScore) addScore(HUNTER_SCORE[h.size]);
-  // Achievement stats (F9): every Hunter death (bullet OR shield-kill) is a player kill. Lineage
-  // count -> Hunter's Bane (a full 13-member line from one spawn); large cores -> Diamond Cutter;
-  // all tiers -> Ghost Protocol (lifetime).
-  game.stats.hunterLineageKills++;
-  if (game.stats.hunterLineageKills >= ACH_LINEAGE_FULL) game.stats.hunterLineComplete = true;
-  if (h.size === 3) game.stats.largeHunterKills++;
-  Achievements.lifetime.hunterKills++;
+  if (awardScore) {
+    addScore(HUNTER_SCORE[h.size]);
+    // Achievement stats (F9): every Hunter death (bullet OR shield-kill) is a player kill. Lineage
+    // count -> Hunter's Bane (a full 13-member line from one spawn); large cores -> Diamond Cutter;
+    // all tiers -> Ghost Protocol (lifetime).
+    // v3.6 P5: these counters are now gated on `awardScore` (mirroring destroyDebris, which already
+    // gated its debrisKills/bestDebrisGame the same way) so the "dying"-state chain detonations —
+    // the ONLY caller that ever passes awardScore=false — move NO score AND NO achievement counters.
+    // Both real gameplay callers (player bullet, shield-kill) pass true, so their behaviour is
+    // unchanged; before this, awardScore=false would have leaked lifetime hunterKills on every death.
+    game.stats.hunterLineageKills++;
+    if (game.stats.hunterLineageKills >= ACH_LINEAGE_FULL) game.stats.hunterLineComplete = true;
+    if (h.size === 3) game.stats.largeHunterKills++;
+    Achievements.lifetime.hunterKills++;
+  }
   boom(h.x, h.y, h.size, COLOR.satellite);
   // v3.3 P4 (9b, reverses v3.2 P3's FORK-B/B1): EVERY Hunter drops garbage at its tier counts,
   // regardless of origin. This reopens the 12-in/66-out amplifier a coalesced lineage represents —
@@ -2592,7 +2704,6 @@ function destroyHunter(h, awardScore = true) {
         h.vy * 0.25 + Math.sin(spread) * kick,
         HUNTER_SMALL_MASS));
     }
-    maybeDropPowerup(h.x, h.y); // finishing off a Hunter line can drop a powerup (F6)
   } else {
     // Large/medium: normal-mass canisters (tiered), then a 3-way split into actively-homing children.
     for (let i = 0; i < HUNTER_GARBAGE[h.size]; i++) {
@@ -2605,7 +2716,24 @@ function destroyHunter(h, awardScore = true) {
       const scatterAngle = (i / 3) * TAU + rand(-0.3, 0.3);
       game.hunters.push(new HunterSatellite(h.x, h.y, h.size - 1, scatterAngle));
     }
+    // v3.6 P3 (Source 2): the large core — not its medium/small children — always drops one
+    // powerup on its own velocity, as if spitting out its cargo along its spawn-time drift.
+    if (h.size === 3) dropPowerup(h.x, h.y, h.vx, h.vy);
   }
+}
+
+// Destroy a Saucer: score + achievement counters + boom + sound, then always drop one powerup
+// on the saucer's own velocity (v3.6 P3, Source 1 — every UFO, large or small). The single choke
+// point for both saucer-kill sites (player bullet, shield body contact), which were previously
+// copy-pasted.
+function destroySaucer(s) {
+  s.dead = true;
+  addScore(SAUCER_SCORE[s.small ? "small" : "big"]);
+  Achievements.lifetime.saucerKills++;                 // Saucer Hunter (F9)
+  if (s.small) { game.stats.smallSaucerKills++; Achievements.lifetime.smallSaucerKills++; } // Small Ball (F9) + Sharpshooter (lifetime, P8)
+  boom(s.x, s.y, 2, COLOR.saucer);
+  AudioSys.saucer(false);
+  dropPowerup(s.x, s.y, s.vx, s.vy);
 }
 
 // Shatter a garbage clump (v3.2 P2): the tool that reopens what Phase 1 made un-hookable. One
@@ -2673,19 +2801,18 @@ function maxBullets() {
   return MAX_BULLETS;                                    // 4
 }
 
-// A modest chance for a small-tier kill (Debris or Hunter) to drop one random weapon/utility
-// powerup, tying powerup access to finishing off a lineage. Health is NOT in this pool — it
-// spawns ambiently. The single choke point for both destroy paths.
-function maybeDropPowerup(x, y) {
-  if (Math.random() >= POWERUP_DROP_CHANCE) return;
-  // v3.3 P3: weighted roll over POWERUP_DROP_WEIGHTS (favors the shot powerups), NOT a flat pick over
+// v3.6 P3: unconditionally roll a random weapon/utility powerup and launch it on the given
+// vector. No chance gate here — the three emitters (destroySaucer, destroyHunter's large core,
+// the recycle hub) each decide WHEN to call this; this only decides WHAT drops. Health is NOT in
+// this pool — it spawns ambiently via spawnHealthPowerup.
+function dropPowerup(x, y, vx = 0, vy = 0) {
+  // weighted roll over POWERUP_DROP_WEIGHTS (favors the shot powerups), NOT a flat pick over
   // POWERUP_DROP_TYPES — the two structures are deliberately separate (Scoop drops but isn't a timed effect).
   let total = 0;
   for (const k in POWERUP_DROP_WEIGHTS) total += POWERUP_DROP_WEIGHTS[k];
   let r = Math.random() * total, type;
   for (const k in POWERUP_DROP_WEIGHTS) { r -= POWERUP_DROP_WEIGHTS[k]; if (r < 0) { type = k; break; } }
-  const a = rand(0, TAU), kick = rand(20, 50);
-  game.powerups.push(new Powerup(x, y, type, Math.cos(a) * kick, Math.sin(a) * kick));
+  game.powerups.push(new Powerup(x, y, type, vx, vy));
 }
 
 // Ambient Health powerup — floats into the field in a reachable ring around the ship, one at a
@@ -2696,8 +2823,9 @@ function spawnHealthPowerup() {
   game.powerups.push(new Powerup(p.x, p.y, "health"));
 }
 
-// Collect a powerup. Health is instant (repair, capped). The four timed effects REFRESH their
-// duration (no magnitude stacking); different types run independently. A floater confirms the grab.
+// Collect a powerup. Health is instant (repair, capped). The four timed effects BANK — a same-type
+// pickup ADDS duration/shots rather than refreshing (v3.6 P4); magnitude never stacks (no double fire
+// rate). Different types run independently. A floater confirms the grab.
 function applyPowerup(type) {
   if (type === "scoop") {
     // Scoop is a PERSISTENT, non-timed upgrade (v3.3 P3) — it lives on game.scoopLevel, NOT in
@@ -2719,9 +2847,10 @@ function applyPowerup(type) {
   if (type === "health") {
     game.ship.hp = Math.min(SHIP_MAX_HP, game.ship.hp + POWERUP_HEALTH_AMOUNT);
   } else if (powerMode(type) === "time") {
-    game.powerFx[type] = powerDuration(type);      // refresh, not add — same-type pickups refresh, never stack (magnet gets 30 s)
+    game.powerFx[type] += powerDuration(type);      // BANKS (v3.6 P4, reverses the old refresh rule) —
+                                                      // same-type pickups add duration; magnitude still never stacks
   } else {
-    game.powerBudget[type] = POWERUP_BUDGET[type]; // count mode: refresh the shots/pieces budget to full (same rule)
+    game.powerBudget[type] += POWERUP_BUDGET[type]; // count mode: banks the shots/pieces budget too (same rule)
   }
   // Achievement stats (F9): any pickup counts for "No Powerups Needed"; Health picks gate "Glass
   // Cannon"; the four drop types feed "Powered Up" (use all four).
@@ -3004,6 +3133,88 @@ const Achievements = {
     this.deriveLifetime();
   }
 };
+
+// ---------- High Scores (v3.6 P6) ----------
+// Local top-10 table, its own localStorage key. The two other keys — settings' STORAGE_KEY
+// ("afd_settings_v1") and Achievements.STORAGE_KEY ("afd_achievements_v2") — are FROZEN and this
+// system never reads or writes either; it reuses only the shared guarded storageOK() helper. Each
+// record is a WIRE shape a future remote leaderboard can accept verbatim, no migration: `id` is a
+// stable client-generated dedupe key, `v` versions the record independently of the store's own `v`,
+// and a `playerId`/`name` field is purely additive whenever login lands. Add fields later; never
+// rename or repurpose one.
+const HighScores = {
+  STORAGE_KEY: "afd_scores_v1",
+  entries: [],
+
+  // Unique id for a fresh record — the future sync dedupe key. crypto.randomUUID isn't guaranteed
+  // (older browsers, non-secure origins), so fall back to a random hex string.
+  makeId() {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+    return Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+  },
+  // Would `score` earn a table slot? entries is kept sorted score-desc and capped at SCORES_MAX, so
+  // entries[SCORES_MAX-1] is always the current cutoff once the table is full.
+  qualifies(score) {
+    if (score <= 0) return false;
+    return this.entries.length < SCORES_MAX || score > this.entries[SCORES_MAX - 1].score;
+  },
+  // Build + insert the wire-shape record for a just-committed run, then persist. Returns the record
+  // so the caller can remember its id (the gameover table's fresh-entry highlight).
+  add({ initials, score, wave, delivered }) {
+    const rec = { v: 1, id: this.makeId(), initials, score, wave, delivered, ts: Date.now(), build: GAME_VERSION };
+    this.entries.push(rec);
+    this.entries.sort((a, b) => b.score - a.score);
+    this.entries.length = Math.min(this.entries.length, SCORES_MAX);
+    this.save();
+    return rec;
+  },
+
+  // --- Persistence (own key; same guarded pattern as Settings/Achievements — never crash on storage
+  // failure). ---
+  save() {
+    const ls = storageOK(); if (!ls) return;
+    try { ls.setItem(this.STORAGE_KEY, JSON.stringify({ v: 1, entries: this.entries })); }
+    catch (e) { /* quota / privacy mode / disabled — ignore */ }
+  },
+  load() {
+    const ls = storageOK(); if (!ls) return;
+    try {
+      const raw = ls.getItem(this.STORAGE_KEY);
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      if (data && Array.isArray(data.entries)) {
+        this.entries = data.entries.filter(r => r && typeof r.score === "number" && typeof r.initials === "string");
+        this.entries.sort((a, b) => b.score - a.score);
+        this.entries.length = Math.min(this.entries.length, SCORES_MAX);
+      }
+    } catch (e) { /* corrupt / unreadable — start fresh, don't crash */ }
+  }
+};
+HighScores.load();
+
+// Shared dispatcher for BOTH input paths (keyboard's normal branch + gamepad's edge-detected nav)
+// driving the initials entry live on "gameover" (game.entry). Deliberately not routed through
+// menuInput/menuActive — this isn't a paused menu screen, the field keeps rendering behind it.
+function entryInput(action) {
+  const e = game.entry;
+  if (!e) return;
+  if (action === "left")       { e.idx = (e.idx + 2) % 3; AudioSys.ui(false); }
+  else if (action === "right") { e.idx = (e.idx + 1) % 3; AudioSys.ui(false); }
+  else if (action === "up")    { e.initials[e.idx] = (e.initials[e.idx] + 1) % SCORES_CHARSET.length; AudioSys.ui(false); }
+  else if (action === "down")  { e.initials[e.idx] = (e.initials[e.idx] + SCORES_CHARSET.length - 1) % SCORES_CHARSET.length; AudioSys.ui(false); }
+  else if (action === "confirm") commitEntry();
+}
+// Turn the entry's charset indices into the 3-letter record and hand it to HighScores, then clear
+// game.entry so the gameover screen falls through to the (now highlighted) table.
+function commitEntry() {
+  const e = game.entry;
+  const initials = e.initials.map(i => SCORES_CHARSET[i]).join("");
+  const rec = HighScores.add({ initials, score: game.score, wave: game.wave, delivered: game.stats.delivered });
+  game.lastScoreId = rec.id;
+  game.entry = null;
+  AudioSys.ui(true);
+}
+
 // Count of the four drop-powerup types used this game (Powered Up).
 function powerTypesUsed(s) {
   return (s.powerUsed.rapid ? 1 : 0) + (s.powerUsed.triple ? 1 : 0) +
@@ -3064,7 +3275,13 @@ function killShip() { // hull destroyed (0 HP): a true, permanent game over — 
   AudioSys.lowhp(false); game.lowHpSiren = false;
   boom(game.ship.x, game.ship.y, 3, COLOR.ship);
   scatterChain();
-  game.state = "gameover";
+  // v3.6 P5: enter the "dying" spectacle instead of freezing straight to "gameover" — updateDeath()
+  // keeps the field alive for DEATH_DURATION, then flips state to "gameover". Only this state
+  // assignment changed; the boom/scatter/audio teardowns above and the achievement flush below all
+  // stay HERE so achievement timing is byte-identical to before.
+  game.state = "dying";
+  game.deathT = DEATH_DURATION;
+  game.shake = DEATH_SHAKE_INIT;
   AudioSys.saucer(false);
   // Achievements (F9): a game just ended — flag it so end-of-game checks (Waste Not) can fire,
   // run a final evaluation, and flush lifetime progress to storage.
@@ -3287,7 +3504,73 @@ function drawChain() {
 }
 
 // ---------- Update ----------
+// v3.6 P5: the death spectacle. Runs in place of the normal sim while game.state === "dying", so the
+// field doesn't freeze under the GAME OVER text. It keeps the world moving — but takes NO ship input,
+// spawns nothing on the timers, runs no pickup pass and no ship/chain collisions. An expanding
+// shockwave ring (radius = elapsed × DEATH_SHOCKWAVE_SPEED) is the detonation front: any live
+// debris/Hunter it has reached this frame detonates via the real destroy helpers with awardScore=false
+// (nearest-first falls out, since nearer bodies are reached first). awardScore=false means no score
+// and — post the destroyHunter gating fix — no achievement counters move; achievements were already
+// evaluated once, at killShip. At deathT<=0 the spectacle ends and state becomes "gameover" (Phase 6
+// hangs the high-score flow off that seam). The tow chain isn't advanced here: killShip's scatterChain()
+// already emptied it into free garbage, which IS advanced below.
+function updateDeath(dt) {
+  AudioSys.thrust(false);   // the ship is gone — make sure a lingering thrust voice never drones on
+
+  // World stays alive: advance every free-moving body and effect (but not the dead ship).
+  game.debris.forEach(a => a.update(dt));
+  game.hunters.forEach(h => h.update(dt));
+  game.saucers.forEach(s => s.update(dt));
+  game.garbage.forEach(g => g.update(dt));
+  game.particles.forEach(p => p.update(dt));
+  game.floaters.forEach(f => f.update(dt));
+  game.powerups.forEach(p => p.update(dt));
+
+  // Camera holds on the death point (the dead ship no longer moves).
+  game.camera.x = game.ship.x;
+  game.camera.y = game.ship.y;
+
+  // Screen shake decays linearly to 0.
+  game.shake = Math.max(0, game.shake - DEATH_SHAKE_DECAY * dt);
+
+  // Expanding shockwave = the detonation front. Reuse the real destroy helpers (awardScore=false): the
+  // explosion / garbage / split is the spectacle and costs no new code. Wrap-aware distance (dist2).
+  const ringR = (DEATH_DURATION - game.deathT) * DEATH_SHOCKWAVE_SPEED;
+  const ringR2 = ringR * ringR;
+  const center = game.ship;   // death point == the dead ship's frozen position
+  for (const a of game.debris)  if (!a.dead && dist2(center, a) <= ringR2) destroyDebris(a, false);
+  for (const h of game.hunters) if (!h.dead && dist2(center, h) <= ringR2) destroyHunter(h, false);
+
+  // Cleanup — mirror update()'s filter pass so detonated bodies leave the field. No wave-clear, no
+  // heartbeat, no collision passes: those don't run during the death.
+  game.debris    = game.debris.filter(a => !a.dead);
+  game.hunters   = game.hunters.filter(h => !h.dead);
+  game.saucers   = game.saucers.filter(s => !s.dead);
+  game.garbage   = game.garbage.filter(g => !g.dead);
+  game.particles = game.particles.filter(p => !p.dead);
+  game.floaters  = game.floaters.filter(f => !f.dead);
+  game.powerups  = game.powerups.filter(p => !p.dead);
+
+  // Advance the death clock; hand off to the frozen GAME OVER screen when it runs out.
+  game.deathT -= dt;
+  if (game.deathT <= 0) {
+    game.deathT = 0;
+    game.state = "gameover";
+    // v3.6 P6: the "dying" -> "gameover" seam. Arm initials entry iff the run earned a top-10 slot;
+    // otherwise the gameover screen goes straight to the (unhighlighted) table.
+    game.lastScoreId = null;
+    game.entry = HighScores.qualifies(game.score) ? { initials: [0, 0, 0], idx: 0 } : null;
+    if (game.entry) resetMenuNav(); // a stick held through the spectacle mustn't fire a phantom first move
+  }
+}
+
 function update(dt) {
+  // v3.6 P5: the death spectacle runs its own reduced sim. This branch sits BEFORE the general
+  // early-return so "dying" isn't swallowed by the `state !== "playing"` gate below.
+  if (game.state === "dying" && !game.paused) {
+    updateDeath(dt);
+    return;
+  }
   if (game.state !== "playing" || game.paused) {
     AudioSys.thrust(false);
     return;
@@ -3332,7 +3615,7 @@ function update(dt) {
         const [dx, dy] = shortDelta(g.x, g.y, game.ship.x, game.ship.y); // vector toward the ship (wrap-aware)
         const d = Math.hypot(dx, dy) || 0.0001;
         const t = 1 - (d / MAGNET_RANGE);                                    // 1 at ship, 0 at max range
-        let accel = MAGNET_PULL_MIN + (MAGNET_PULL - MAGNET_PULL_MIN) * t * t; // quadratic ease: near-field yank, far-field nudge
+        let accel = MAGNET_PULL_MIN + (MAGNET_PULL - MAGNET_PULL_MIN) * Math.pow(t, MAGNET_FALLOFF_POW); // v3.6 P2a: falloff exponent hoisted to a constant (was hardcoded t*t)
         accel /= Math.sqrt(g.mass);     // FORK-6: sqrt, not linear mass. The 0.5 exponent is a PLAYTEST KNOB.
                                         // A mass-1 single is UNAFFECTED (sqrt(1)=1); a mass-11 clump pulls at ~30%.
         const damp = Math.pow(MAGNET_DAMP, dt);   // light in-range damping so the pull glides (not jitters)
@@ -3431,6 +3714,15 @@ function update(dt) {
           game.floaters.push(new FloatText("TOW +1", game.ship.x, game.ship.y - 22, COLOR.dock));
         }
         game.stats.bestCombo = Math.max(game.stats.bestCombo, game.deliveryCount);
+        // v3.6 P3 (Source 3, FORK-2): the recycle hub emits one powerup per visit, the first time
+        // a visit's deliveryCount passes through 10 — same "exactly once per visit" idiom as the
+        // deliveryCount===12 Heavy Hauler latch just below. Launched from the dock's own position
+        // on a fresh random vector so it clears the dock's footprint before it's collectable.
+        if (game.deliveryCount === 10) {
+          const a = rand(0, TAU);
+          dropPowerup(game.dock.x, game.dock.y, Math.cos(a) * DOCK_POWERUP_SPEED, Math.sin(a) * DOCK_POWERUP_SPEED);
+          game.floaters.push(new FloatText("SALVAGE BONUS", game.dock.x, game.dock.y - 22, COLOR.dock));
+        }
         // Salvage King (lifetime MAX): best canisters delivered in one game. game.stats.delivered only
         // climbs within a run, so Math.max here tracks the per-game best and keeps the all-time record.
         Achievements.lifetime.bestDeliveredGame = Math.max(Achievements.lifetime.bestDeliveredGame, game.stats.delivered);
@@ -3507,12 +3799,7 @@ function update(dt) {
       if (b.dead) continue;
       for (const s of game.saucers) {
         if (!s.dead && dist2(b, s) < s.radius * s.radius) {
-          b.dead = true; s.dead = true;
-          addScore(SAUCER_SCORE[s.small ? "small" : "big"]);
-          Achievements.lifetime.saucerKills++;                 // Saucer Hunter (F9)
-          if (s.small) { game.stats.smallSaucerKills++; Achievements.lifetime.smallSaucerKills++; } // Small Ball (F9) + Sharpshooter (lifetime, P8)
-          boom(s.x, s.y, 2, COLOR.saucer);
-          AudioSys.saucer(false);
+          b.dead = true; destroySaucer(s);
           break;
         }
       }
@@ -3588,13 +3875,8 @@ function update(dt) {
       const r = (game.ship.shieldOn ? SHIELD_RADIUS : SHIP_RADIUS) + s.radius;
       if (dist2(s, game.ship) < r * r) {
         if (game.ship.shieldOn) {
-          s.dead = true;
-          addScore(SAUCER_SCORE[s.small ? "small" : "big"]);
-          Achievements.lifetime.saucerKills++;              // Saucer Hunter (F9)
-          if (s.small) { game.stats.smallSaucerKills++; Achievements.lifetime.smallSaucerKills++; } // Small Ball (F9) + Sharpshooter (lifetime, P8)
           game.stats.deflects++;                            // Shield Surfer (F9): saucer rammed into the shield
-          boom(s.x, s.y, 2, COLOR.saucer);
-          AudioSys.saucer(false);
+          destroySaucer(s);
         } else damageShip(s.damage, s.x, s.y);
       }
     }
@@ -3696,6 +3978,7 @@ function drawMenu() {
   else if (s === "controls") drawControlsMenu();
   else if (s === "difficulty") drawDifficulty();
   else if (s === "achievements") drawAchievements();
+  else if (s === "highscores") drawHighScores();
 }
 
 function menuPanel(w, h, title) {
@@ -3880,6 +4163,56 @@ function drawAchRow(ach, x, ry, w) {
   drawText(ach.desc, x, ry + 15, 10, COLOR.dim, "left");
 }
 
+// ---------- High Scores rendering (v3.6 P6) ----------
+// Shared top-10 table renderer — used by both the gameover screen (fresh entry highlighted in
+// COLOR.ach) and the browsable system-menu "High Scores" screen (highlightId null, nothing lit).
+// Crash-free on an empty, partial, or full HighScores.entries: a missing row just shows a bare dim
+// rank number instead of a record.
+function drawScoreTable(cx, topY, highlightId) {
+  const colRank = cx - 230, colInit = cx - 170, colScore = cx + 10, colWave = cx + 130, colDeliv = cx + 230;
+  drawText("#", colRank, topY, 13, COLOR.dim, "left");
+  drawText("INITIALS", colInit, topY, 13, COLOR.dim, "left");
+  drawText("SCORE", colScore, topY, 13, COLOR.dim, "right");
+  drawText("LEVEL", colWave, topY, 13, COLOR.dim, "right");
+  drawText("DELIVERED", colDeliv, topY, 13, COLOR.dim, "right");
+  for (let i = 0; i < SCORES_MAX; i++) {
+    const r = HighScores.entries[i], ry = topY + 22 + i * 18;
+    if (!r) { drawText((i + 1) + ".", colRank, ry, 13, COLOR.dim, "left"); continue; }
+    const col = r.id === highlightId ? COLOR.ach : COLOR.text;
+    drawText((i + 1) + ".", colRank, ry, 13, col, "left");
+    drawText(r.initials, colInit, ry, 13, col, "left");
+    drawText(fmtCommas(r.score), colScore, ry, 13, col, "right");
+    drawText(String(r.wave), colWave, ry, 13, col, "right");
+    drawText(String(r.delivered), colDeliv, ry, 13, col, "right");
+  }
+}
+
+// Three-slot arcade initials entry, live only while game.entry is set (a top-10-qualifying run at
+// the "dying"->"gameover" seam). Deliberately not a menu screen — game.paused stays false, so the
+// field keeps rendering behind it like the rest of the (unpaused) gameover screen.
+function drawEntrySlots(cy) {
+  drawText("NEW HIGH SCORE — ENTER YOUR INITIALS", VIEW_W / 2, cy - 46, 20, COLOR.ach);
+  const e = game.entry, slotW = 70, x0 = VIEW_W / 2 - slotW;
+  for (let i = 0; i < 3; i++) {
+    const sx = x0 + i * slotW, sel = e.idx === i;
+    const ch = SCORES_CHARSET[e.initials[i]];
+    if (sel) {
+      ctx.strokeStyle = COLOR.shield; ctx.lineWidth = 2;
+      ctx.strokeRect(sx - 24, cy - 30, 48, 56);
+    }
+    drawText(ch === " " ? "_" : ch, sx, cy + 14, 40, sel ? COLOR.text : COLOR.dim);
+  }
+  drawText("↑↓ letter    ←→ move    ENTER confirm", VIEW_W / 2, cy + 60, 12, COLOR.dim);
+}
+
+// Browsable top-10 table reachable from the system menu (title/gameover -> "High Scores"). Read-only,
+// like drawAchievements — reuses drawScoreTable with no highlight.
+function drawHighScores() {
+  const { y } = menuPanel(640, 460, "HIGH SCORES");
+  drawScoreTable(VIEW_W / 2, y + 90, null);
+  drawText("ESC / B / ENTER  return", VIEW_W / 2, y + 420, 12, COLOR.dim);
+}
+
 // Non-blocking unlock banners at top-center. Fade in then out; stack downward if several land at once.
 function drawToasts() {
   if (!game.toasts.length) return;
@@ -3951,24 +4284,6 @@ function drawStarfield() {
   }
 }
 
-// Dim dashed rectangle at the world edges so the wrap seam is visible as it's approached.
-// Called inside the camera transform. The rectangle is drawn at the world-origin corner's
-// nearest wrapped image relative to the camera (ox/oy), so whichever seam the ship is near
-// — x≈0 or x≈WORLD_W, y≈0 or y≈WORLD_H — renders at the right place and stays continuous
-// as the ship crosses it. Cosmetic only.
-function drawWorldBoundary() {
-  const cam = game.camera;
-  const ox = wrapOffset(0, cam.x, WORLD_W);
-  const oy = wrapOffset(0, cam.y, WORLD_H);
-  ctx.save();
-  ctx.setLineDash([BOUNDARY_DASH, BOUNDARY_GAP]);
-  ctx.beginPath();
-  ctx.rect(ox, oy, WORLD_W, WORLD_H);
-  glowStroke(COLOR.dim, BOUNDARY_WIDTH, BOUNDARY_GLOW);
-  ctx.setLineDash([]);
-  ctx.restore();
-}
-
 // Is a world-space entity within the viewport (plus a margin)? Wrap-aware.
 function onScreen(e, margin = CULL_MARGIN) {
   const [dx, dy] = shortDelta(game.camera.x, game.camera.y, e.x, e.y);
@@ -3985,6 +4300,20 @@ function drawEntity(e) {
   const oy = wrapOffset(e.y, cam.y, WORLD_H);
   if (ox || oy) { ctx.save(); ctx.translate(ox, oy); e.draw(); ctx.restore(); }
   else e.draw();
+}
+
+// v3.6 P5: the expanding shockwave ring of the death spectacle — a stroked arc (no fill, stays inside
+// GDD §3.2's vector-glow rule), centred on the death point, fading and thinning as it grows. Drawn in
+// world space (inside the camera transform) so it stays pinned to the death location as bodies drift.
+function drawShockwave() {
+  const r = (DEATH_DURATION - game.deathT) * DEATH_SHOCKWAVE_SPEED;
+  if (r <= 0) return;
+  const frac = Math.max(0, game.deathT / DEATH_DURATION); // 1 at the instant of death -> 0 at handoff
+  ctx.globalAlpha = frac;
+  ctx.beginPath();
+  ctx.arc(game.ship.x, game.ship.y, r, 0, TAU);
+  glowStroke(COLOR.ship, DEATH_SHOCKWAVE_WIDTH * frac + 0.5, 16);
+  ctx.globalAlpha = 1;
 }
 
 function draw() {
@@ -4015,9 +4344,13 @@ function draw() {
   }
 
   // --- World space: translate so the camera (the ship) sits at screen center ---
+  // v3.6 P5: a decaying screen-shake offset is added during the death spectacle. game.shake is 0 in
+  // normal play (only set at killShip, decayed in updateDeath), so this is a byte-identical translate
+  // then. Jitter uses Math.random (a pure visual — never the game RNG).
+  const shX = game.shake ? (Math.random() * 2 - 1) * game.shake : 0;
+  const shY = game.shake ? (Math.random() * 2 - 1) * game.shake : 0;
   ctx.save();
-  ctx.translate(VIEW_W/2 - game.camera.x, VIEW_H/2 - game.camera.y);
-  drawWorldBoundary();              // wrap-seam guide, beneath all entities (cosmetic)
+  ctx.translate(VIEW_W/2 - game.camera.x + shX, VIEW_H/2 - game.camera.y + shY);
   if (game.dock) drawEntity(game.dock);
   game.particles.forEach(drawEntity);
   game.garbage.forEach(drawEntity);
@@ -4029,7 +4362,21 @@ function draw() {
   game.bullets.forEach(drawEntity);
   game.ship.draw();                 // always at the camera center
   game.floaters.forEach(drawEntity);
+  if (game.state === "dying") drawShockwave();  // v3.6 P5: expanding ring from the death point (world space)
   ctx.restore();
+
+  // v3.6 P5: white flash over the world on the first frames of death — drawn AFTER the world (in
+  // screen space), under the HUD so score/etc. stay legible. Decays from DEATH_FLASH_ALPHA to 0 over
+  // DEATH_FLASH_TIME.
+  if (game.state === "dying") {
+    const flash = Math.max(0, (game.deathT - (DEATH_DURATION - DEATH_FLASH_TIME)) / DEATH_FLASH_TIME);
+    if (flash > 0) {
+      ctx.globalAlpha = flash * DEATH_FLASH_ALPHA;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      ctx.globalAlpha = 1;
+    }
+  }
 
   // --- HUD (screen space, drawn after restoring the untranslated context) ---
   // Capture tools (P/O/H — see the block comment above the Capture object) toggle visibility
@@ -4039,9 +4386,16 @@ function draw() {
   if (game.state === "gameover") {
     drawText("GAME OVER", VIEW_W/2, VIEW_H/2 - 20, 56);
     drawText("FINAL SCORE  " + game.score, VIEW_W/2, VIEW_H/2 + 36, 26);
-    if (Math.floor(performance.now() / 600) % 2 === 0)
-      drawText("PRESS ENTER TO PLAY AGAIN", VIEW_W/2, VIEW_H/2 + 90, 22);
-    drawText("OPTIONS / ACHIEVEMENTS: O    (controller: B)", VIEW_W/2, VIEW_H/2 + 130, 14, COLOR.ach);
+    // v3.6 P6: a qualifying run shows the 3-slot initials entry first; once committed (or immediately,
+    // for a non-qualifying run) the top-10 table takes over, fresh entry highlighted.
+    if (game.entry) {
+      drawEntrySlots(VIEW_H/2 + 110);
+    } else {
+      drawScoreTable(VIEW_W/2, VIEW_H/2 + 60, game.lastScoreId);
+      if (Math.floor(performance.now() / 600) % 2 === 0)
+        drawText("PRESS ENTER TO PLAY AGAIN", VIEW_W/2, VIEW_H/2 + 280, 22);
+      drawText("OPTIONS / ACHIEVEMENTS: O    (controller: B)", VIEW_W/2, VIEW_H/2 + 312, 14, COLOR.ach);
+    }
   }
 
   // Drawn after the gameover text so the system menu overlays it (v3.0 P4); for a mid-game pause the
@@ -4058,58 +4412,77 @@ function draw() {
 // modal or transient.
 function drawHUD() {
   drawText(String(game.score).padStart(6, "0"), 30, 46, 30, COLOR.text, "left");
-  // hull HP bar (replaces the old life-ship icons; same stroke/fill style as the shield bar)
-  const hpw = 140, hph = 8, hpx = 92, hpy = 62;
-  ctx.strokeStyle = COLOR.dim;
-  ctx.lineWidth = 1;
-  ctx.strokeRect(hpx, hpy, hpw, hph);
-  const hpFrac = Math.max(0, game.ship.hp) / SHIP_MAX_HP;
-  ctx.fillStyle = hpFrac > 0.3 ? COLOR.hp : "#ff7060";
-  ctx.fillRect(hpx + 1, hpy + 1, (hpw - 2) * hpFrac, hph - 2);
-  drawText("HULL", hpx - 12, hpy + 8, 13, COLOR.dim, "right");
   // v3.3 P1 (spec §7): "LEVEL" is the player-facing label for game.wave — moved from the dim,
   // easy-to-miss top-right corner into the left column, lit like the other HUD readouts. game.wave /
   // nextWave() / difficultyFactor() / every achievement keying off game.wave are UNCHANGED — this is
   // a display label only ("level" is player-facing vocabulary, "wave" stays the code term).
-  drawText("LEVEL " + game.wave, 30, 104, 22, COLOR.text, "left");
-  drawText("CARGO " + game.chain.length + "/" + game.cargoMax, 30, 126, 16,
-    game.chain.length ? COLOR.garbage : COLOR.dim, "left");
-  // v3.0 P3 (B-7): targets remaining = debris + hunters (the exact wave-clear gate).
-  // Can rise mid-wave (a Debris split, or a Hunter lineage arriving on its own timer from
-  // wave 2 on) — that's intentional, not a bug; see PLANNED-FEATURES-v3.md B-7-a/b.
-  const targetsLeft = game.debris.length + game.hunters.length;
-  drawText("TARGETS " + targetsLeft, 30, 146, 16,
-    targetsLeft ? COLOR.text : COLOR.dim, "left");
+  drawText("LEVEL " + game.wave, 30, 62, 22, COLOR.text, "left");
+
+  // v3.6 P4: HUD left column, top to bottom — Score, Level, Hull, Shield, Cargo, Powerups. A local
+  // layout cursor replaces the old bare-literal row offsets.
+  let row = 104;
+
+  // hull HP bar. At max HP a Health pickup would be wasted, so full hull gets an unmistakable gold
+  // fill + MAX tag instead of reading as "just another full bar" (FLAG-E).
+  const hpw = 140, hph = 8, hpx = 92, hpy = row - 6;
+  ctx.strokeStyle = COLOR.dim;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hpx, hpy, hpw, hph);
+  const hp = Math.max(0, game.ship.hp), hpFrac = hp / SHIP_MAX_HP;
+  const hpMax = game.ship.hp >= SHIP_MAX_HP;
+  ctx.fillStyle = hpMax ? COLOR.ach : (hpFrac > 0.3 ? COLOR.text : "#ff7060");
+  ctx.fillRect(hpx + 1, hpy + 1, (hpw - 2) * hpFrac, hph - 2);
+  drawText("HULL", hpx - 12, hpy + 8, 13, COLOR.dim, "right");
+  if (hpMax) drawText("MAX", hpx + hpw + 10, hpy + 8, 13, COLOR.ach, "left");
+  row += 26;
+
+  // shield energy bar — moved out of the top-right corner into the left column, beneath hull (v3.6 P4).
+  const shw = 140, shh = 8, shx = 92, shy = row - 6;
+  ctx.strokeStyle = COLOR.dim;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(shx, shy, shw, shh);
+  ctx.fillStyle = game.ship.energy > 0.25 ? COLOR.text : "#ff7060";
+  ctx.fillRect(shx + 1, shy + 1, (shw - 2) * game.ship.energy, shh - 2);
+  drawText("SHIELD", shx - 12, shy + 8, 13, COLOR.dim, "right");
+  row += 22;
+
+  drawText("CARGO " + game.chain.length + "/" + game.cargoMax, 30, row, 16,
+    game.chain.length ? COLOR.text : COLOR.dim, "left");
+  row += 26;
+
   // active-powerup row (F6): one row per running effect — a small type glyph + a shield-bar-style
   // remaining bar. Health is instant, so it never appears here. v3.0 P5: one renderer, two data
-  // sources — in count mode ("shots"/"pieces") the bar reads remaining/budget and a numeric count
-  // labels it; in time mode it's the remaining-duration fraction as before.
-  let prow = 172;
+  // sources — in count mode ("shots"/"pieces") budgets bank (v3.6 P4) with no ceiling to draw a bar
+  // against, so it's glyph + plain number only; in time mode it's the remaining-duration fraction,
+  // already clamp01'd so a banked surplus is simply invisible (accepted behaviour).
   for (const t of POWERUP_DROP_TYPES) {          // rapid / triple / magnet / engine (stable order)
     if (!powerActive(t)) continue;
     const c = POWERUP_COLOR[t];
     const counted = powerMode(t) !== "time";
-    const frac = counted ? game.powerBudget[t] / POWERUP_BUDGET[t] : game.powerFx[t] / powerDuration(t);
-    drawPowerupGlyph(t, 40, prow, 9, c);
-    const pw = 96, ph = 6, ppx = 58, ppy = prow - 3;
-    ctx.strokeStyle = COLOR.dim; ctx.lineWidth = 1;
-    ctx.strokeRect(ppx, ppy, pw, ph);
-    ctx.fillStyle = c;
-    ctx.fillRect(ppx + 1, ppy + 1, (pw - 2) * clamp01(frac), ph - 2);
-    if (counted) drawText(String(game.powerBudget[t]), ppx + pw + 14, prow + 4, 13, c, "left"); // shots/pieces left
-    prow += 20;
+    drawPowerupGlyph(t, 40, row, 9, c);
+    if (counted) {
+      drawText(String(game.powerBudget[t]), 58, row + 4, 16, c, "left"); // shots/pieces left, no bar
+    } else {
+      const frac = game.powerFx[t] / powerDuration(t);
+      const pw = 96, ph = 6, ppx = 58, ppy = row - 3;
+      ctx.strokeStyle = COLOR.dim; ctx.lineWidth = 1;
+      ctx.strokeRect(ppx, ppy, pw, ph);
+      ctx.fillStyle = c;
+      ctx.fillRect(ppx + 1, ppy + 1, (pw - 2) * clamp01(frac), ph - 2);
+    }
+    row += 20;
   }
   // SCOOP level pips (v3.3 P3) — a PERSISTENT upgrade, NOT a timed bar, so it's deliberately drawn
   // OUTSIDE the powerActive/POWERUP_DROP_TYPES loop above. Filled pips = current level; hidden at 0.
   if (game.scoopLevel > 0) {
-    drawText("SCOOP", 40, prow + 4, 13, POWERUP_COLOR.scoop, "left");
+    drawText("SCOOP", 40, row + 4, 13, POWERUP_COLOR.scoop, "left");
     for (let i = 0; i < SCOOP_MAX_LEVEL; i++) {
       ctx.beginPath();
-      ctx.arc(108 + i * 16, prow, 4, 0, TAU);
+      ctx.arc(108 + i * 16, row, 4, 0, TAU);
       if (i < game.scoopLevel) { ctx.fillStyle = POWERUP_COLOR.scoop; ctx.fill(); }
       else { ctx.strokeStyle = COLOR.dim; ctx.lineWidth = 1; ctx.stroke(); }
     }
-    prow += 20;
+    row += 20;
   }
   // when hauling, a chevron orbiting screen-center points toward the (maybe off-screen) dock
   if (game.chain.length && game.dock && !game.ship.dead) {
@@ -4136,14 +4509,6 @@ function drawHUD() {
         VIEW_W/2 + Math.cos(a) * 58, VIEW_H/2 + Math.sin(a) * 58, a, COLOR.lowhp);
     }
   }
-  // shield energy bar
-  const bw = 140, bh = 8, bx = VIEW_W - 30 - bw, by = 60;
-  ctx.strokeStyle = COLOR.dim;
-  ctx.lineWidth = 1;
-  ctx.strokeRect(bx, by, bw, bh);
-  ctx.fillStyle = game.ship.energy > 0.25 ? COLOR.shield : "#ff7060";
-  ctx.fillRect(bx + 1, by + 1, (bw - 2) * game.ship.energy, bh - 2);
-  drawText("SHIELD", bx - 12, by + 8, 13, COLOR.dim, "right");
 }
 
 // title screen decoration
@@ -4183,6 +4548,13 @@ const Capture = {
     return game.state === "playing" && !game.paused;
   },
 
+  // v3.6 P5 (FLAG-I): P (screenshot) is ALSO allowed during the "dying" death spectacle — plausibly
+  // the single frame most worth capturing. O (slow-mo) and H (HUD toggle) deliberately stay
+  // live-play only: slow-mo would stretch the fixed death window and the HUD toggle is pointless mid-death.
+  canShoot() {
+    return this.active() || game.state === "dying";
+  },
+
   cycleSlowMo() {
     this._rateIdx = (this._rateIdx + 1) % this._rates.length;
     this.timeScale = this._rates[this._rateIdx];
@@ -4220,10 +4592,11 @@ const Capture = {
 };
 
 window.addEventListener("keydown", e => {
-  if (!Capture.active()) return;
   const k = e.key.toLowerCase();
-  if (k === "p") { Capture.requestShot(); e.preventDefault(); }
-  else if (k === "o") { Capture.cycleSlowMo(); e.preventDefault(); }
+  // P works during live play AND the death spectacle (v3.6 P5, FLAG-I); O/H stay live-play only.
+  if (k === "p" && Capture.canShoot()) { Capture.requestShot(); e.preventDefault(); return; }
+  if (!Capture.active()) return;
+  if (k === "o") { Capture.cycleSlowMo(); e.preventDefault(); }
   else if (k === "h") { Capture.toggleHud(); e.preventDefault(); }
 });
 
