@@ -103,7 +103,16 @@ const WORLD_W = 2560, WORLD_H = 1440;   // simulation space (the wrap boundary)
 const VIEW_W = 1280, VIEW_H = 720;      // visible viewport = canvas size
 const TAU = Math.PI * 2;
 
-const SHIP_TURN = 4.2;          // rad/sec
+const SHIP_TURN = 4.2;          // rad/sec — the design-default turn rate (before the player scale)
+// Player rotation-speed preference (CS010 §10b): a multiplier over SHIP_TURN, adjustable on the
+// Controls screen and persisted ADDITIVELY in afd_settings_v1. It is a player PREFERENCE, not a
+// balance change — SHIP_TURN stays the design default. Deliberately NOT reset by the Controls
+// screen's "Return to Defaults" (FLAG-10a — Paul's call: the player returns to 100% manually via
+// the slider). Both turn sites read it through shipTurnRate() so they can never diverge.
+const SHIP_TURN_SCALE_MIN = 0.5;      // 50%
+const SHIP_TURN_SCALE_MAX = 1.5;      // 150%
+const SHIP_TURN_SCALE_STEP = 0.10;    // 10% per ◄/► nudge -> 11 positions (0.5 .. 1.5)
+const SHIP_TURN_SCALE_DEFAULT = 1.0;  // 100% — design default; a corrupt/out-of-range save clamps here
 const SHIP_THRUST = 340;        // px/sec^2
 const SHIP_DRAG = 0.35;         // fraction of velocity lost per second
 const SHIP_MAX_SPEED = 520;
@@ -119,6 +128,7 @@ const SHIELD_DRAIN = 0.55;      // energy/sec while on
 const SHIELD_RECHARGE = 0.12;   // energy/sec while off
 const SHIELD_HIT_COST = 0.22;   // energy per deflection
 const SHIELD_RADIUS = 26;
+const AUTO_SHIELD_SCORE_PENALTY = 500; // PLAYTEST KNOB — score lost per auto-save. Flat (FLAG-4d).
 
 const DEBRIS_SPEEDS = { 3: 70, 2: 110, 1: 160 };  // base drift speed by size
 const DEBRIS_RADII  = { 3: 46, 2: 26, 1: 13 };
@@ -176,6 +186,28 @@ const LOWHP_PULSE_DEPTH      = 0.5;   // amplitude-LFO depth/offset — pulseGai
 const LOWHP_GAIN_MIN         = 0.08;  // peak root gain at t=0 — in thrust's (0.10) neighborhood
 const LOWHP_GAIN_MAX         = 0.13;  // peak root gain at t=1 — pulsing carries most of the urgency
 const LOWHP_PARAM_RAMP       = 0.15;  // s — click-free per-frame param ramp (matches MUSIC_DUCK_RAMP)
+// CS010 P3: the ONE shared low-health pulse-rate formula (Hz), ramped by HP urgency t = 1 -
+// hp/LOW_HP_THRESHOLD (0 at the threshold → 1 near death). Read by BOTH AudioSys.lowhpSet (the siren's
+// LFO) AND update()'s game.lowHpPhase accumulator (the critical-hull ring + corner-glow pulse), so the
+// audio alarm and the two visual alarms are ONE instrument driven by ONE interpolation — never two that
+// can drift. Pure linear interp, deliberately NOT clamped here (callers pass an in-range t; lowhpSet
+// clamps first). RATE IS SHARED BY TRIGGER, NOT BY WIDGET: only elements keyed on LOW_HP_THRESHOLD use
+// this; cargo-gold and the powerup low-timer keep the flat HUD_PULSE_HZ (a distinct rate is how the ear
+// and eye tell a hull alarm apart from a timer running out).
+function lowhpPulseRate(t) { return LOWHP_PULSE_RATE_MIN + (LOWHP_PULSE_RATE_MAX - LOWHP_PULSE_RATE_MIN) * t; }
+// CS010 P3 §5 — the low-health CORNER GLOW + RELIEF POP knobs. The glow is a NAMED GDD §3.2
+// fills-exception (FORK-3 = FILL, Paul signed off; see drawHUD's block comment for the why): a
+// peripheral-vision alarm is low-frequency, large-area and EDGELESS by definition — that is what makes
+// it readable out of the corner of the eye without competing with the two red rings for focus, and it
+// costs no shadowBlur. Intensity scales with BOTH the HP-urgency t (brighter near death) and the shared
+// pulse (game.lowHpPhase), so near death it is BRIGHTER, not merely FASTER. All PLAYTEST KNOBS — sized by
+// eye in a browser (STATUS.md carries the ask: which values, and does the synced ring/glow/siren read as
+// one alarm).
+const LOWHP_GLOW_ALPHA_MIN = 0.10;  // peak corner-glow alpha at the threshold (t=0) — a soft breath
+const LOWHP_GLOW_ALPHA_MAX = 0.26;  // peak corner-glow alpha near death (t=1) — brighter, not just faster
+const LOWHP_GLOW_RADIUS     = 280;  // px reach of each corner's radial gradient (FRAME the screen, don't fill it — two corners are occupied by the HULL/CARGO rings)
+const LOWHP_GLOW_RGB        = "255,64,64";  // corner-glow color channels — mirrors COLOR.lowhp (#ff4040); kept as a triple so a radial-gradient stop can carry the pulsing alpha
+const LOWHP_RELIEF_FLASH    = 0.5;  // sec — the geometry-only hull-ring "exhale" when low-health CLEARS with the ship alive (§5 relief cue, FLAG-CS010-a). HUD_CAP_FLASH's neighbourhood.
 const REPAIR_MILESTONE = 10000; // score interval that grants a hull-repair bonus (was: extra life)
 const REPAIR_AMOUNT = 25;       // +HP granted at each milestone (capped at max)
 const REPAIR_FULL_BONUS = 2500; // flat score awarded instead when already at full HP
@@ -201,7 +233,57 @@ const DEATH_FLASH_ALPHA     = 0.8;  // peak alpha of the frame-one white flash
 // into every record's `build` field (the wire shape's provenance tag — see the HighScores object).
 const SCORES_MAX = 10;
 const SCORES_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
-const GAME_VERSION = "3.6";
+
+// CS010 P0 — version scheme: Major.Minor.Patch.Changeset (unprefixed — no "v" in the string itself;
+// that's added only where it's displayed, e.g. the title-screen stamp). Major = new mechanics/levels.
+// Minor = tweaks to existing systems. Patch = bug fixes, where "bug" includes the game not doing what
+// the design intends. Changeset = the CS### number, monotonically increasing, never resets — the 4th
+// segment IS the changeset number (this build shipped in CS010).
+const GAME_VERSION = "1.0.0.12";
+const VERSION_STAMP_INSET_X = 16; // px in from the right edge of the viewport (title screen only)
+const VERSION_STAMP_INSET_Y = 16; // px in from the bottom edge of the viewport (title screen only)
+
+// CS009 — HUD rebuild ("Corner Standard": HULL/CARGO rings top-right, powerup rows bottom-left).
+// ALL look-call knobs, tuned in the browser — see PLANNED-FEATURES-CS009.md §2/§3/§5 for the mockup
+// this was derived from. No literals in draw code; every size/timing value here has a name.
+const HUD_RING_R = 30;          // outer radius of the HULL/CARGO rings
+const HUD_RING_W = 4;           // stroke width of the value arc
+const HUD_RING_TRACK_W = 2;     // stroke width of the full-circle track underneath the arc (no glow)
+const HUD_RING_BLUR = 12;       // glowStroke blur radius for ring arcs
+const HUD_HULL_CX = 1156;       // HULL ring center x
+const HUD_CARGO_CX = 1232;      // CARGO ring center x (76px right of HULL — 16px air between edges)
+const HUD_RING_CY = 74;         // both rings share this center y
+const HUD_RING_LABEL_Y = 122;   // y of the "HULL"/"CARGO" text labels beneath the rings
+const HUD_SHIELD_R_GAP = 9;     // shield arc radius = HUD_RING_R - this (concentric, inside HULL ring)
+// The HULL ring's center glyph — the player's own ship, so the ring is unmistakably theirs. This is the
+// L1949 hull poly [[16,0],[-11,-9],[-6,0],[-11,9]] scaled to 55% (drawPoly takes no scale, and scaling
+// the context would scale the glow blur too — CS009 P2, spec §3). Drawn nose-up via angle -Math.PI/2.
+const HUD_SHIP_GLYPH = [[8.8, 0], [-6.05, -4.95], [-3.3, 0], [-6.05, 4.95]];
+const HUD_FX_BASE_Y = 640;      // baseline y powerup rows stack upward from (row 0 = bottom)
+const HUD_FX_ROW_H = 40;        // vertical spacing between stacked powerup rows
+const HUD_FX_RING_R = 16;       // radius of each powerup row's ring
+const HUD_RING_SEG_GAP = 0.12;  // CS012 P2: radians of empty gap between adjacent wedges in
+                                 // drawRingSegments (the Scoop segmented-ring primitive). PLAYTEST KNOB.
+const HUD_FX_GLYPH_R = 9;       // radius of the glyph drawn inside a powerup row's ring
+const HUD_FX_LOW = 3;           // sec remaining at/under which a timed powerup row shows the low warning
+const HUD_PULSE_HZ = 1.2;       // CS010 P3: the FLAT pulse rate for NON-HP alarms ONLY — the cargo-gold
+                                 // ring and the powerup low-timer row. Anything keyed on LOW_HP_THRESHOLD
+                                 // (the critical-hull ring, the corner glow, the audio siren) instead
+                                 // pulses at lowhpPulseRate(t) via game.lowHpPhase, so those three are ONE
+                                 // HP-ramped instrument. A distinct flat rate is CORRECT here, not a
+                                 // compromise: it's how the player tells a hull alarm from a timer running
+                                 // out. (Pre-CS010 all three were flat, on CS009's "the siren already ramps,
+                                 // so the visual deliberately doesn't" reasoning; §5 reverses that for the
+                                 // hull ring — Paul signed off — and keeps it for these two. NOTE: max-hull
+                                 // is gold-only, NOT pulsed, so it's not on this list.)
+const HUD_EASE = 0.002;         // per-sec retention the eased hull fraction chases the true value with
+                                 // (Math.pow(HUD_EASE, dt) idiom — see MAGNET_DAMP, L352 — counter-
+                                 // intuitively, a LARGER constant here means LESS damping/faster chase).
+                                 // ~0.35s to close 95% of the gap.
+const HUD_BANK_FLASH = 0.6;     // sec a "+Ns" bank badge / ring pop stays visible after a banked pickup
+const HUD_BANK_POP = 0.25;      // fractional radius pop (25%) a powerup ring gets on a bank, settling
+                                 // back to normal over HUD_BANK_FLASH
+const HUD_CAP_FLASH = 0.5;      // sec — reserved flash duration for a cap-related HUD feedback event
 
 // Radioactive salvage / tow chain / recycling dock
 // v3.3 P4 (9a): loose SINGLE canisters decay again (GARBAGE_DECAY) — decay is the GOVERNOR that keeps
@@ -251,15 +333,29 @@ const CARGO_BASE = 12;          // starting tow cap (was CHAIN_MAX)
 const CARGO_CAP_MAX = 24;       // ceiling (v3.4 P1: 20->24); the physics retune below targets "full chain here" ≈ old 12-node feel
 const CARGO_GROW_PER = 30;      // +1 cap per this many canisters recycled (delivered) in the current run
 const CHAIN_TUG = 26;           // ship pull-back accel per px of chain stretch
-// Mass-penalty coefficients (B-8 retune). With a 20-node ceiling, the per-node penalty is SOFTENED
-// so a full chain at CARGO_CAP_MAX lands near the old 12-node feel (~45% thrust / ~63% top speed)
-// instead of the "broken" ~33%/50% a naive m=20 gave under the old 0.10/0.05 (§2.10.1). Solved so
-// 1/(1+20·k)=old-12 value: thrust k=0.06 (1/2.2), top-speed k=0.03 (1/1.6). Tug coeff dropped
-// 0.12→0.07 so its 1.4 cap is reached at m≈20 (was m≈12) — the tug scales down in lock-step, so a
-// base 12-chain is genuinely lighter across ALL three penalties, with headroom to grow into.
-const CARGO_MASS = 0.07;        // tug mass-factor grows by this per unit of towed mass (F5: mass sum, not count)
-const CARGO_THRUST = 0.06;      // thrust divisor grows by this per unit of towed mass
-const CARGO_MAXSPD = 0.03;      // max-speed divisor grows by this per unit of towed mass
+// Towed-mass penalty coefficients — ALL FOUR ARE PLAYTEST KNOBS (CS010 §3). The complaint they
+// address: a typical mid-sized haul (~6-12 towed mass) didn't "feel heavy." Background: v3.0 P6 grew
+// the tow cap from a fixed 12 to a growing CARGO_BASE 12 -> CARGO_CAP_MAX 24 and softened the three
+// divisors in lock-step so a FULL chain (mass ~24) would land near the old full-12 feel — which left
+// the low-to-mid range far too light. (The old comment here still solved 1/(1+20·k) for a *20*-node
+// ceiling; the ceiling has been 24 since v3.4 P1 — that comment was stale and is corrected here.)
+//
+// The divisor shape 1/(1+m·k) ASYMPTOTES, so raising CARGO_THRUST/CARGO_MAXSPD can never make the
+// mid range bite hard without over-penalizing the full chain. So the CS010 first pass leans on the
+// TUG (CARGO_MASS), which strengthens the mid-range momentum pull-back WITHOUT moving the full-chain
+// endpoint (its 1.4 cap is unchanged — see updateChain), and ships CARGO_TURN as the real structural
+// fix for "inertia" (mass resisting ROTATION), dormant at 0.0 so enabling it is Paul's one-number call.
+// See STATUS.md (CS010 P2) for the before/after and candidate tables.
+const CARGO_MASS = 0.10;        // PLAYTEST KNOB (CS010: 0.07->0.10). Tug mass-factor per unit towed mass
+                                // (F5: mass sum, not count) via min(1.4, m·this): the 1.4 cap is now reached
+                                // at m=14 (was m≈20), so a mid chain feels the momentum tug sooner; full-24 tug unchanged (capped).
+const CARGO_THRUST = 0.07;      // PLAYTEST KNOB (CS010: 0.06->0.07). Thrust divisor per unit towed mass. full-24 accel 40.9%->37.3%
+const CARGO_MAXSPD = 0.035;     // PLAYTEST KNOB (CS010: 0.03->0.035). Max-speed divisor per unit towed mass. full-24 top speed 58.1%->54.3%
+const CARGO_TURN = 0.0;         // PLAYTEST KNOB (CS010 §3, the proposed "inertia" fix — SHIPPED DORMANT).
+                                // Turn-rate divisor per unit towed mass in shipTurnRate(): SHIP_TURN·scale/(1+m·this).
+                                // At 0.0, rotation is UNAFFECTED by cargo (byte-identical to pre-CS010 turn × the player scale).
+                                // Raise it to make a heavy chain resist turning — the missing half of "mass = inertia".
+                                // Candidate values + turn-mult table: STATUS.md (CS010 P2).
 
 const DOCK_RADIUS = 44;
 // v3.4 P2: difficulty lever — scales DOCK_RADIUS from 2x at wave 1 down to the shipped 1x
@@ -305,6 +401,8 @@ const SAUCER_FIRE_MULT_CEIL  = 1.0;   // full difficulty: shipped cadence
 // Small-saucer aim error (rad): wide barely-aimed spray early, tightening to precise late.
 const SAUCER_AIM_ERR_FLOOR = 0.35;    // wave-1 aim error
 const SAUCER_AIM_ERR_CEIL  = 0.09;    // full-difficulty aim error (shipped precision)
+const SAUCER_ACCURACY_RAMP_SCALE = 0.5;  // <1: saucer aim sharpens slower than the global difficulty
+                                         // ramp. Pins the wave-1 floor exactly. PLAYTEST KNOB.
 // Small-saucer appearance chance: rare early, common late. Folds in the old >8000-pt gate
 // so there's one wave-driven escalation system instead of two (F10 cleanup).
 const SAUCER_SMALL_CHANCE_FLOOR = 0.15; // wave-1: mostly the harmless random-fire big saucer
@@ -446,8 +544,8 @@ const AudioSys = {
   // Gain routing (F8). vol holds the three slider values (0..1, 1 = unity = pre-F8 loudness);
   // master/sfx/music are the gain nodes built in init(). Volumes persist even before the audio
   // graph exists (no user gesture yet) so loadSettings() can set them and init() apply them.
-  vol: { master: 1, sfx: 1, music: 1 },
-  master: null, sfx: null, music: null,
+  vol: { master: 1, sfx: 1, music: 1, voice: 1 }, // CS010 P9: `voice` is Dan's speech bus (VoiceSys)
+  master: null, sfx: null, music: null, voice: null,
   init() {
     if (this.ctx) return;
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -457,11 +555,15 @@ const AudioSys = {
     this.master = this.ctx.createGain(); this.master.gain.value = this.vol.master; this.master.connect(this.ctx.destination);
     this.sfx    = this.ctx.createGain(); this.sfx.gain.value    = this.vol.sfx;    this.sfx.connect(this.master);
     this.music  = this.ctx.createGain(); this.music.gain.value  = this.vol.music;  this.music.connect(this.master);
+    // CS010 P9: Dan's speech bus, mirroring sfx/music. VoiceSys builds its radio chain onto this node.
+    this.voice  = this.ctx.createGain(); this.voice.gain.value  = this.vol.voice;  this.voice.connect(this.master);
   },
   // Set a category volume and, if the graph is live, push it to the node immediately (F8 sliders).
   setVol(cat, v) {
     this.vol[cat] = v;
-    const node = cat === "master" ? this.master : cat === "sfx" ? this.sfx : this.music;
+    // CS010 P9: the bus nodes are named by category, so a lookup can't silently misroute a new bus —
+    // the old master/sfx/music ternary would have written setVol("voice",…) to the MUSIC gain.
+    const node = this[cat];
     if (node) node.gain.value = v;
   },
   resume() { if (this.ctx && this.ctx.state === "suspended") this.ctx.resume(); },
@@ -625,7 +727,7 @@ const AudioSys = {
     if (t === this.lowhpT) return;
     this.lowhpT = t;
     const now = this.now();
-    const rate = LOWHP_PULSE_RATE_MIN + (LOWHP_PULSE_RATE_MAX - LOWHP_PULSE_RATE_MIN) * t;
+    const rate = lowhpPulseRate(t);   // CS010 P3: the shared rate formula — same one game.lowHpPhase reads, so siren + hull ring + glow can't drift
     const gain = LOWHP_GAIN_MIN + (LOWHP_GAIN_MAX - LOWHP_GAIN_MIN) * t;
     const ramp = (param, target) => {
       param.cancelScheduledValues(now);
@@ -868,20 +970,29 @@ function buildDerelictTrack() {
   ]};
 }
 
-/* --- DRIFT (approved @w2) — organ pulse, sub, pad, hymn lead. No percussion. 88 BPM, 21.8 s. */
+/* --- DRIFT (approved @w2; B-section added CS010 P6) — organ pulse, sub, pad, hymn lead. No
+       percussion. 88 BPM. 16 bars now, A→B: bars 0-7 are the original Am F C G Am F Dm E; bars
+       8-15 are a brighter C-major turn (C G Am Em F C Dm E) with the arp an octave up and a fuller
+       lead — the chorus lift, resolving on E back into the A section. 43.5 s. */
 function buildDriftTrack() {
-  const BARS = 8, SPB = 16, STEPS = BARS * SPB, stepDur = 0.17;
+  const BARS = 16, SPB = 16, STEPS = BARS * SPB, stepDur = 0.17;
   const sub = mk(STEPS), pad = mk(STEPS), org = mk(STEPS), lead = mk(STEPS);
-  const CH  = [[45,60],[41,57],[48,55],[43,59],[45,60],[41,57],[38,57],[40,56]];   // Am F C G Am F Dm E
-  const ARP = [[57,60,64,69],[53,57,60,65],[55,60,64,67],[55,59,62,67],
-               [57,60,64,69],[53,57,60,65],[57,62,65,69],[56,59,64,68]];
+  const CH  = [[45,60],[41,57],[48,55],[43,59],[45,60],[41,57],[38,57],[40,56],   // A: Am F C G Am F Dm E
+               [48,64],[43,62],[45,64],[40,59],[41,60],[48,64],[38,57],[40,56]];  // B: C G Am Em F C Dm E
+  const ARP = [[57,60,64,69],[53,57,60,65],[55,60,64,67],[55,59,62,67],           // A arp
+               [57,60,64,69],[53,57,60,65],[57,62,65,69],[56,59,64,68],
+               [60,64,67,72],[55,59,62,67],[57,60,64,69],[52,55,59,64],           // B arp — an octave up
+               [53,57,60,65],[60,64,67,72],[50,53,57,62],[52,56,59,64]];
   for (let b = 0; b < BARS; b++) {
     const s0 = b * SPB, r = CH[b][0], t3 = CH[b][1], a = ARP[b];
     put(sub, s0, r - 12, 16, 1.0);
     put(pad, s0, t3, 16, 0.9);
     for (let i = 0; i < SPB; i++) put(org, s0 + i, a[i % 4], 1, i % 4 === 0 ? 0.95 : 0.62);
   }
-  for (const [s, m, d] of [[0,69,10],[16,77,10],[32,76,10],[48,74,12],[64,81,10],[80,84,10],[96,83,10],[112,79,14]])
+  // A: the original hymn (bars 0-7). B: a fuller melodic hook rising to C6 in bar 13, then resolving.
+  for (const [s, m, d] of [[0,69,10],[16,77,10],[32,76,10],[48,74,12],[64,81,10],[80,84,10],[96,83,10],[112,79,14],
+                           [128,72,8],[136,76,8],[144,79,10],[160,81,8],[168,79,8],[176,76,10],
+                           [192,77,8],[200,81,8],[208,84,12],[224,81,10],[240,80,8],[248,76,10]])
     put(lead, s, m, d, 0.95);
   return { stepDur, steps: STEPS, layers: [
     { name:"organ", type:"square",   cutoff:600, cutoffTo:2200, cutoffTime:0.09, q:5, gain:0.045, atk:0.006, rel:0.09, steps:org },
@@ -891,20 +1002,38 @@ function buildDriftTrack() {
   ]};
 }
 
-/* --- WAREHOUSE (approved @w2) — kick, melodic bass, 16th hat, two 7th-chord stabs. No clap, and
-       deliberately NO melodic hook: in house the groove is the tune. 125 BPM, 23.0 s. */
+/* --- WAREHOUSE (approved @w2; B-section added CS010 P6) — kick, melodic bass, 16th hat, two
+       7th-chord stabs, and now a HOOK. 125 BPM. 16 bars, an 8-bar Am7 Dm7 Fmaj7 G vamp played
+       twice: bars 0-7 are groove only (A), bars 8-15 add the sawtooth-pluck hook riff (B). The hook
+       was cut from the round-2 track for being too present as a *constant* element — which is exactly
+       what makes it a chorus payload. It sits on the offbeats (steps 2/6/10/14) so it never collides
+       with kick/bass/hat/stabs and never lifts the per-step node count. 30.7 s. */
 function buildWarehouseTrack() {
-  const BARS = 12, SPB = 16, STEPS = BARS * SPB, stepDur = 0.12;
-  const kick = mk(STEPS), hat = mk(STEPS), bass = mk(STEPS), stA = mk(STEPS), stB = mk(STEPS);
-  const CH = [[45,60,64],[45,60,64],[38,60,65],[38,60,65],[41,60,64],[41,60,64],[43,59,62],[43,59,62],
-              [45,60,64],[38,60,65],[41,60,64],[43,59,62]];   // Am7 Dm7 Fmaj7 G ...
+  const BARS = 16, SPB = 16, STEPS = BARS * SPB, stepDur = 0.12;
+  const kick = mk(STEPS), hat = mk(STEPS), bass = mk(STEPS), stA = mk(STEPS), stB = mk(STEPS), hook = mk(STEPS);
+  const CH = [[45,60,64],[45,60,64],[38,60,65],[38,60,65],[41,60,64],[41,60,64],[43,59,62],[43,59,62]]; // Am7 Dm7 Fmaj7 G
   const WALK = [0, 0, 12, 0, 7, 0, 12, 3];
   for (let b = 0; b < BARS; b++) {
-    const s0 = b * SPB, c = CH[b], r = c[0];
+    const s0 = b * SPB, c = CH[b % 8], r = c[0];
     for (const s of [0, 4, 8, 12]) put(kick, s0 + s, 50, 1, 1.0);
     for (let i = 1; i < SPB; i += 2) hit(hat, s0 + i, 1, i % 4 === 3 ? 0.8 : 0.42);
     for (let i = 0; i < 8; i++) put(bass, s0 + i * 2 + 1, r + WALK[i], 1, i % 2 === 0 ? 0.95 : 0.75);
     for (const s of [3, 7, 11, 15]) { put(stA, s0 + s, c[1], 1, 0.9); put(stB, s0 + s, c[2], 1, 0.8); }
+  }
+  // The restored hook — B section only (bars 8-15). Per-bar offbeat riff, lifting to C6 in bar 12.
+  const HOOK_BARS = [
+    [[2,69],[6,72],[10,76],[14,72]],   // Am7
+    [[2,74],[6,72],[10,69]],           // Am7
+    [[2,74],[6,77],[10,81],[14,77]],   // Dm7
+    [[2,76],[6,74],[10,69]],           // Dm7
+    [[2,72],[6,77],[10,81],[14,84]],   // Fmaj7 — lift
+    [[2,81],[6,77],[10,72]],           // Fmaj7
+    [[2,74],[6,79],[10,83],[14,79]],   // G
+    [[2,74],[6,71],[10,67]],           // G — descend, resolve to A
+  ];
+  for (let b = 0; b < 8; b++) {
+    const s0 = (8 + b) * SPB;
+    for (const [s, m] of HOOK_BARS[b]) put(hook, s0 + s, m, 2, 0.85);
   }
   return { stepDur, steps: STEPS, layers: [
     { name:"kick",  type:"triangle", drop:14, dropTime:0.05, gain:0.125, atk:0.002, rel:0.16, steps:kick },
@@ -912,20 +1041,58 @@ function buildWarehouseTrack() {
     { name:"hat",   noise:true, hp:8500, gain:0.018, atk:0.001, rel:0.03, steps:hat },
     { name:"stabA", type:"sawtooth", cutoff:2600, cutoffTo:900, cutoffTime:0.10, q:5, gain:0.042, atk:0.004, rel:0.13, steps:stA },
     { name:"stabB", type:"sawtooth", cutoff:2600, cutoffTo:900, cutoffTime:0.10, q:5, gain:0.038, atk:0.004, rel:0.13, steps:stB },
+    { name:"hook",  type:"sawtooth", cutoff:1200, cutoffTo:2800, cutoffTime:0.05, q:4, gain:0.052, atk:0.004, rel:0.13, steps:hook },
+  ]};
+}
+
+/* --- HIGH SCORE: FANFARE (CS010 P7) — the celebration cue for the High Scores screen. Bright C
+       major, an anthemic I–V–vi–IV lifted upward: a 16th bell arpeggio, a soft four-on-the-floor
+       kick, a light shaker, and a triumphant triangle lead that climbs to E6 at the peak and
+       resolves back into C. Plays ONLY while the High Scores screen is open — musicStateFor()
+       returns "highscore" there; it is CONTEXTUAL like `title`, not a value of settings.musicTrack,
+       so it is absent from MUSIC_TRACK_VALUES. 100 BPM. 8 bars, 19.2 s. */
+function buildHighScoreTrack() {
+  const BARS = 8, SPB = 16, STEPS = BARS * SPB, stepDur = 0.15;
+  const sub = mk(STEPS), pad = mk(STEPS), bell = mk(STEPS), lead = mk(STEPS), kick = mk(STEPS), shk = mk(STEPS);
+  const CH  = [[48,64],[43,59],[45,60],[41,57],[48,64],[43,62],[41,57],[43,59]]; // C G Am F C G F G
+  const ARP = [[60,64,67,72],[59,62,67,71],[57,60,64,69],[60,65,69,72],
+               [60,64,67,72],[62,67,71,74],[60,65,69,72],[59,62,67,71]];
+  for (let b = 0; b < BARS; b++) {
+    const s0 = b * SPB, r = CH[b][0], t3 = CH[b][1], a = ARP[b];
+    put(sub, s0, r - 12, 16, 1.0);
+    put(pad, s0, t3, 16, 0.9);
+    for (let i = 0; i < SPB; i++) put(bell, s0 + i, a[i % 4], 1, i % 4 === 0 ? 0.95 : 0.6);
+    for (const s of [0, 4, 8, 12]) put(kick, s0 + s, 48, 1, s === 0 ? 1.0 : 0.8);
+    for (const s of [2, 6, 10, 14]) hit(shk, s0 + s, 1, 0.4);
+  }
+  // The fanfare lead — every onset sits OFF the bar downbeat (steps ≡ 2 or 10 mod 16), so it never
+  // stacks with sub+pad+kick; the loop's worst-case per-step node count stays on the downbeat (12).
+  for (const [s, m, d] of [[2,76,6],[10,79,6],[18,81,8],[26,79,6],[34,84,10],[50,81,8],
+                           [66,79,8],[74,83,8],[82,88,12],[98,84,8],[106,81,8],[114,79,8],[122,76,10]])
+    put(lead, s, m, d, 0.95);
+  return { stepDur, steps: STEPS, layers: [
+    { name:"bell", type:"square",   cutoff:900, cutoffTo:3200, cutoffTime:0.08, q:4, gain:0.040, atk:0.005, rel:0.10, steps:bell },
+    { name:"sub",  type:"sawtooth", cutoff:320, gain:0.068, atk:0.4, rel:1.0, steps:sub },
+    { name:"pad",  type:"sawtooth", cutoff:1000, cutoffTo:2000, detune:11, gain:0.048, atk:0.5, rel:1.2, steps:pad },
+    { name:"lead", type:"triangle", detune:7, gain:0.078, atk:0.02, rel:0.8, steps:lead },
+    { name:"kick", type:"triangle", drop:12, dropTime:0.06, gain:0.070, atk:0.003, rel:0.22, steps:kick },
+    { name:"shk",  noise:true, hp:6000, gain:0.014, atk:0.002, rel:0.06, steps:shk },
   ]};
 }
 
 // State -> track. "off" (game over) is silence. No track carries tiers (v3.5 freeze — every layer is
 // always on). The four gameplay tracks are keyed by NAME (not "play") so musicStateFor() can route
 // settings.musicTrack straight through, and switching tracks becomes a normal setState() crossfade
-// for free — no separate track-switch code path. `title` is what musicStateFor() returns on the
-// title screen; the other four are the values of settings.musicTrack.
+// for free — no separate track-switch code path. `title` and `highscore` are CONTEXTUAL — what
+// musicStateFor() returns on the title / High Scores screens respectively — not values of
+// settings.musicTrack; the four gameplay names in between are.
 const MUSIC_TRACKS = {
   title:     buildBeaconTitle(),
   zen:       buildZenTrack(),
   derelict:  buildDerelictTrack(),
   drift:     buildDriftTrack(),
   warehouse: buildWarehouseTrack(),
+  highscore: buildHighScoreTrack(),   // CS010 P7: celebration cue, High Scores screen only (contextual)
   off:       null,   // game over / silence
 };
 
@@ -1110,6 +1277,685 @@ const MusicSys = {
   },
 };
 
+// ---------- Voice (Dan — Klatt-style formant synth, CS010 P9) ----------
+// Ported from tools/voice-lab.html (FLAG-11a signed off). The ACOUSTIC ENGINE below (PH table,
+// parsePhonTokens / buildUtterance / buildPitch, and VoiceSys._schedule's scheduler) is PORT-ME BLOCK A,
+// VERBATIM — same standing rule as MusicSys/music-lab: audition in the lab, port the engine unchanged.
+// The lab's g2p text→ARPAbet authoring layer (WORDS dictionary + rule guesser) is DELIBERATELY not
+// ported: it only derives phon strings from typed text, and every shipping line's phon is already
+// baked into VOICE_LINES below — so g2p is dead code here. It stays in the lab, which is where a NEW
+// line's phon is composed before its {text,phon} pair is pasted into VOICE_LINES (a one-line data edit).
+//
+// PH — ARPAbet phoneme table. Classes: v vowel, g glide/liquid, n nasal, f fricative, p stop,
+//   a affricate, h aspirate. f:[F1,F2,F3] Hz; stops/frics carry LOCUS targets (the b/d/g cue).
+const PH = {
+  IY:{c:"v",f:[270,2290,3010],d:120}, IH:{c:"v",f:[390,1990,2550],d:100},
+  EH:{c:"v",f:[530,1840,2480],d:110}, AE:{c:"v",f:[660,1720,2410],d:130},
+  AA:{c:"v",f:[730,1090,2440],d:130}, AO:{c:"v",f:[570,840,2410],d:130},
+  AH:{c:"v",f:[640,1190,2390],d:88},  UH:{c:"v",f:[440,1020,2240],d:95},
+  UW:{c:"v",f:[300,870,2240],d:120},  ER:{c:"v",f:[490,1350,1690],d:110},
+  EY:{c:"v",f:[530,1840,2480],f2nd:[330,2200,2900],d:150},
+  AY:{c:"v",f:[730,1090,2440],f2nd:[330,2200,2900],d:170},
+  OY:{c:"v",f:[570,840,2410], f2nd:[330,2200,2900],d:175},
+  AW:{c:"v",f:[730,1090,2440],f2nd:[430,1020,2240],d:170},
+  OW:{c:"v",f:[570,900,2410], f2nd:[330,870,2240], d:140},
+  W:{c:"g",f:[290,610,2150],d:65},  Y:{c:"g",f:[270,2290,3010],d:60},
+  R:{c:"g",f:[420,1300,1600],d:75}, L:{c:"g",f:[360,1300,2700],d:70},
+  M:{c:"n",f:[250,950,2200],d:70},  N:{c:"n",f:[250,1650,2600],d:70},
+  NG:{c:"n",f:[250,2000,2600],d:85},
+  S:{c:"f",f:[320,1700,2600],fric:{cf:5800,q:0.9,g:0.55},d:110},
+  SH:{c:"f",f:[320,1900,2500],fric:{cf:2900,q:1.1,g:0.50},d:110},
+  F:{c:"f",f:[340,1100,2400],fric:{cf:1400,q:0.25,g:0.13},d:95},
+  TH:{c:"f",f:[320,1500,2500],fric:{cf:5200,q:0.4,g:0.12},d:90},
+  Z:{c:"f",f:[320,1700,2600],fric:{cf:5800,q:0.9,g:0.35},d:95,v:0.4},
+  ZH:{c:"f",f:[320,1900,2500],fric:{cf:2900,q:1.1,g:0.32},d:90,v:0.4},
+  V:{c:"f",f:[340,1100,2400],fric:{cf:1400,q:0.25,g:0.10},d:60,v:0.5},
+  DH:{c:"f",f:[340,1500,2500],fric:{cf:4800,q:0.4,g:0.08},d:50,v:0.5},
+  HH:{c:"h",d:75},
+  P:{c:"p",f:[400,900,2300], burst:{cf:900,q:0.6,g:0.50}, clo:70,asp:60},
+  B:{c:"p",f:[400,900,2300], burst:{cf:900,q:0.6,g:0.35}, clo:60,asp:0,v:0.12},
+  T:{c:"p",f:[400,1750,2700],burst:{cf:4200,q:0.7,g:0.60},clo:70,asp:65},
+  D:{c:"p",f:[400,1750,2700],burst:{cf:4200,q:0.7,g:0.40},clo:55,asp:0,v:0.12},
+  K:{c:"p",f:[400,1900,2500],burst:{cf:1900,q:1.6,g:0.60},clo:75,asp:70,velar:true},
+  G:{c:"p",f:[400,1900,2500],burst:{cf:1900,q:1.6,g:0.42},clo:60,asp:0,v:0.12,velar:true},
+  CH:{c:"a",f:[400,1900,2500],fric:{cf:2900,q:1.1,g:0.55},clo:60,fdur:90},
+  JH:{c:"a",f:[400,1900,2500],fric:{cf:2900,q:1.1,g:0.40},clo:45,fdur:70,v:0.4},
+};
+
+// Utterance compiler — PURE (no Web Audio): phoneme string -> {segs, frics, asps, pitch, dur}.
+function parsePhonTokens(str) {
+  const toks = [], errs = [];
+  for (const t of String(str).trim().split(/\s+/)) {
+    if (!t || t === "/") continue;
+    if (t === "," || t === ".") { toks.push({ pause: t }); continue; }
+    const m = t.match(/^([A-Z]+)([012])?$/);
+    const ph = m && PH[m[1]];
+    if (!ph) { errs.push(t); continue; }
+    toks.push({ base: m[1], ph, stress: m[2] === "1" });
+  }
+  return { toks, errs };
+}
+
+function buildUtterance(phonStr, P) {
+  const { toks, errs } = parsePhonTokens(phonStr);
+  const segs = [], frics = [], asps = [];
+  const rate = P.rate, cd = P.consDur;
+  const scaleF = f => [f[0] * P.f1Scale, f[1] * P.f2Scale, f[2] * P.f3Scale];
+  // lookahead: next token with formant targets — for HH borrowing and the velar F2 locus
+  const nextF = i => {
+    for (let k = i + 1; k < toks.length; k++) {
+      const p = toks[k].ph;
+      if (p && p.f && "vgn".includes(p.c)) return p.f;
+    }
+    return [500, 1500, 2500];
+  };
+  let t = 0.06, voiceDelay = 0;
+  for (let i = 0; i < toks.length; i++) {
+    const tk = toks[i];
+    if (tk.pause) {
+      const d = (tk.pause === "," ? 0.16 : 0.30) / rate;
+      segs.push({ t0: t, dur: d, label: tk.pause, F: null, amp: 0 });
+      t += d; voiceDelay = 0; continue;
+    }
+    const ph = tk.ph, cls = ph.c;
+    if (cls === "v" || cls === "g" || cls === "n") {
+      let d = ph.d / 1000 * (tk.stress ? 1.28 : 1) / rate;
+      if (cls === "v") {          // phrase-final lengthening
+        let fin = true;
+        for (let k = i + 1; k < toks.length; k++) {
+          if (toks[k].pause) break;
+          if (toks[k].ph && toks[k].ph.c === "v") { fin = false; break; }
+        }
+        if (fin) d *= 1.18;
+      }
+      segs.push({ t0: t, dur: d, label: tk.base + (tk.stress ? "1" : ""),
+        F: scaleF(ph.f), F2nd: ph.f2nd ? scaleF(ph.f2nd) : null,
+        amp: cls === "v" ? 1 : cls === "g" ? 0.85 : 0.6,
+        hiDamp: cls === "n" ? 0.35 : 1, trans: 0.05,
+        voiceDelay, stress: !!tk.stress, vowel: cls === "v" });
+      t += d; voiceDelay = 0;
+    } else if (cls === "f") {
+      const d = ph.d / 1000 * cd / rate;
+      segs.push({ t0: t, dur: d, label: tk.base, F: scaleF(ph.f), amp: ph.v || 0, trans: 0.04, voiceDelay });
+      frics.push({ t, dur: d, cf: ph.fric.cf, q: ph.fric.q, g: ph.fric.g * P.fricGain, burst: false });
+      t += d; voiceDelay = 0;
+    } else if (cls === "h") {
+      const d = ph.d / 1000 * cd / rate;
+      segs.push({ t0: t, dur: d, label: tk.base, F: scaleF(nextF(i)), amp: 0, trans: 0.05 });
+      asps.push({ t, dur: d, g: 0.5 });
+      t += d; voiceDelay = 0;
+    } else if (cls === "p") {
+      const clo = ph.clo / 1000 * cd / rate;
+      const F = ph.f.slice();
+      if (ph.velar) F[1] = nextF(i)[1] > 1400 ? 2300 : 1300;   // front vs back velar locus
+      segs.push({ t0: t, dur: clo, label: tk.base, F: scaleF(F), amp: ph.v || 0, trans: 0.035, voiceDelay });
+      t += clo;
+      frics.push({ t, dur: 0.018, cf: ph.burst.cf, q: ph.burst.q, g: ph.burst.g * P.burstGain, burst: true });
+      if (ph.asp) {               // VOT: aspiration, and the next vowel's voicing onset waits
+        const ad = ph.asp / 1000 * cd / rate;
+        asps.push({ t: t + 0.008, dur: ad, g: 0.45 });
+        voiceDelay = ad * 0.75;
+      } else voiceDelay = 0.01;
+    } else if (cls === "a") {     // affricate: closure + frication tail
+      const clo = ph.clo / 1000 * cd / rate, fd = ph.fdur / 1000 * cd / rate;
+      segs.push({ t0: t, dur: clo, label: tk.base, F: scaleF(ph.f), amp: ph.v ? 0.12 : 0, trans: 0.035, voiceDelay });
+      t += clo;
+      segs.push({ t0: t, dur: fd, label: "", F: scaleF(ph.f), amp: ph.v || 0, trans: 0.03 });
+      frics.push({ t, dur: fd, cf: ph.fric.cf, q: ph.fric.q, g: ph.fric.g * P.fricGain, burst: false });
+      t += fd; voiceDelay = 0;
+    }
+  }
+  const dur = t + 0.12;
+  return { segs, frics, asps, dur, errs, pitch: buildPitch(segs, dur, P) };
+}
+
+// F0 contour: declination + accents on stressed vowels + a phrase-final fall.
+function buildPitch(segs, dur, P) {
+  const base = P.basePitch, pts = [];
+  if (P.contour === "flat") return [[0, base], [dur, base]];
+  const lively = P.contour === "lively";
+  const dS = base * (lively ? 1.06 : 1.10), dE = base * (lively ? 1.00 : 0.92);
+  const baseAt = tt => dS + (dE - dS) * (tt / dur);
+  const accent = Math.pow(2, (P.pitchRange * (lively ? 1.4 : 1)) / 12);
+  pts.push([0, baseAt(0)]);
+  for (const s of segs) {
+    if (!s.stress || !s.vowel) continue;
+    const pk = s.t0 + s.dur * 0.35;
+    pts.push([pk - 0.09, baseAt(pk - 0.09)], [pk, baseAt(pk) * accent], [pk + 0.13, baseAt(pk + 0.13)]);
+  }
+  const fallT = Math.max(0, dur - 0.20);
+  pts.push([fallT, baseAt(fallT)], [dur, base * Math.pow(2, -P.finalFall / 12)]);
+  pts.sort((a, b) => a[0] - b[0]);
+  const out = []; let last = -1;
+  for (const p of pts) { if (p[0] - last < 0.03) continue; out.push([Math.max(0, p[0]), Math.max(40, p[1])]); last = p[0]; }
+  return out;
+}
+
+// PORT-ME BLOCK B — synthesis params + the shipping lines, VERBATIM from the lab dumps (Paul's phrasing).
+// VOICE_STYLES (CS011) is the selectable-voice table: six FULL VOICE_PARAMS-shaped objects, each with an
+// added top-level ring:{on,freq,mix}. Ported from tools/voice-robot-lab.html PRESETS — the "Comms robot
+// (announcer)", "Flat monotone" and "Vintage computer (DECtalk)" pairs (♂ then ♀). Those lab presets are
+// Object.assign DIFFS over the lab's base P, so every field a diff did NOT restate — pitchRange, finalFall,
+// srcType, richness, breath, bwScale, fricGain, burstGain, and the unstated radio fields — is expanded here
+// from that base P (pitchRange 4, finalFall 5, srcType "pulse", richness 0.85, breath 0.12, bwScale 1.0,
+// fricGain 1.0, burstGain 1.0; radio hp 320 / lp 3200 / drive 2.5 / static 0.018) so buildUtterance never
+// reads undefined. The lab's robot.ring is flattened to `ring`; robot.flange and robot.crush do NOT ship
+// and are dropped. Do not re-tune any value — this is a verbatim port.
+const VOICE_STYLES = {
+  comms: {
+    basePitch: 115, pitchRange: 4, finalFall: 5, contour: "flat",
+    rate: 0.95, wobble: 0, srcType: "pulse", richness: 0.85, breath: 0.12,
+    f1Scale: 1.0, f2Scale: 1.0, f3Scale: 1.0, bwScale: 1.0,
+    fricGain: 1.0, burstGain: 1.0, consDur: 1.0,
+    radio: { on: true, hp: 320, lp: 3400, drive: 2.0, static: 0.018 },
+    ring:  { on: true, freq: 55, mix: 0.25 }
+  },
+  comms_f: {
+    basePitch: 190, pitchRange: 4, finalFall: 5, contour: "flat",
+    rate: 0.95, wobble: 0, srcType: "pulse", richness: 0.85, breath: 0.12,
+    f1Scale: 1.14, f2Scale: 1.18, f3Scale: 1.16, bwScale: 1.0,
+    fricGain: 1.0, burstGain: 1.0, consDur: 1.0,
+    radio: { on: true, hp: 320, lp: 3400, drive: 2.0, static: 0.018 },
+    ring:  { on: true, freq: 55, mix: 0.25 }
+  },
+  flat: {
+    basePitch: 108, pitchRange: 4, finalFall: 5, contour: "flat",
+    rate: 0.9, wobble: 0, srcType: "pulse", richness: 0.85, breath: 0.12,
+    f1Scale: 1.0, f2Scale: 1.0, f3Scale: 1.0, bwScale: 1.0,
+    fricGain: 1.0, burstGain: 1.0, consDur: 1.15,
+    radio: { on: true, hp: 320, lp: 3200, drive: 2.5, static: 0.018 },
+    ring:  { on: false, freq: 40, mix: 0.5 }
+  },
+  flat_f: {
+    basePitch: 190, pitchRange: 4, finalFall: 5, contour: "flat",
+    rate: 0.9, wobble: 0, srcType: "pulse", richness: 0.85, breath: 0.12,
+    f1Scale: 1.14, f2Scale: 1.18, f3Scale: 1.16, bwScale: 1.0,
+    fricGain: 1.0, burstGain: 1.0, consDur: 1.15,
+    radio: { on: true, hp: 320, lp: 3200, drive: 2.5, static: 0.018 },
+    ring:  { on: false, freq: 40, mix: 0.5 }
+  },
+  vintage: {
+    basePitch: 120, pitchRange: 4, finalFall: 5, contour: "flat",
+    rate: 1.0, wobble: 0, srcType: "pulse", richness: 0.85, breath: 0.12,
+    f1Scale: 1.0, f2Scale: 1.0, f3Scale: 1.0, bwScale: 1.0,
+    fricGain: 1.0, burstGain: 1.0, consDur: 1.0,
+    radio: { on: false, hp: 320, lp: 3200, drive: 2.5, static: 0.018 },
+    ring:  { on: false, freq: 40, mix: 0.5 }
+  },
+  vintage_f: {
+    basePitch: 200, pitchRange: 4, finalFall: 5, contour: "flat",
+    rate: 1.0, wobble: 0, srcType: "pulse", richness: 0.85, breath: 0.12,
+    f1Scale: 1.14, f2Scale: 1.18, f3Scale: 1.16, bwScale: 1.0,
+    fricGain: 1.0, burstGain: 1.0, consDur: 1.0,
+    radio: { on: false, hp: 320, lp: 3200, drive: 2.5, static: 0.018 },
+    ring:  { on: false, freq: 40, mix: 0.5 }
+  }
+};
+
+// VOICE_PARAMS is a LIVE binding (let, not const): VoiceSys.setStyle() re-points it at a VOICE_STYLES entry
+// and every consumer (buildUtterance, applyRadio, applyRing, _schedule) reads it fresh. It starts at the
+// shipped default (comms). "off" NEVER reassigns it, so the engine always has a valid full object to read.
+let VOICE_PARAMS = VOICE_STYLES.comms;
+const VOICE_STYLE_VALUES = ["off", "comms", "comms_f", "flat", "flat_f", "vintage", "vintage_f"];
+
+// LINES ARE DATA: VOICE_LINES is keyed by EVENT, each holding an ARRAY of alternatives; adding a line
+// later (Paul wants variety) is a ONE-LINE edit here. Selection is a PLAIN RANDOM PICK (§11d), not a bag.
+const VOICE_LINES = {
+  health_low: [
+    { text: "Aw, man, we are taking a beating.",
+      phon: "AO1 , M AE1 N , W IY / AA1 R / T EY1 K IH NG / AH / B IY1 T IH NG ." },
+    { text: "Hull integrity is critical.",
+      phon: "HH AH1 L / IH N T EH1 G R IH T IY / IH Z / K R IH1 T IH K AH L ." },
+    { text: "Somebody patch that hole.",
+      phon: "S AH1 M B AA D IY / P AE1 CH / DH AE1 T / HH OW1 L ." },
+  ],
+  health_relief: [
+    { text: "We're okay for now.",
+      phon: "W IH1 R / OW K EY1 / F ER / N AW1 ." },
+    { text: "Crisis averted.",
+      phon: "K R AY1 S IH S / AH V ER1 T IH D ." },
+    { text: "Nothing a little Duct Tape can't handle.",
+      phon: "N AH1 TH IH NG / AH / L IH1 T AH L / D AH1 K T / T EY1 P / K AE1 N T / HH AE1 N D AH L ." },
+  ],
+  health_full: [
+    { text: "Like a brand new ship.",
+      phon: "L AY1 K / AH / B R AE1 N D / N UW1 / SH IH1 P ." },
+    { text: "It doesn't get any better than this.",
+      phon: "IH T / D AH1 Z AH N T / G EH1 T / EH1 N IY / B EH1 T ER / DH AH N / DH IH1 S ." },
+    { text: "Not a scratch on it.",
+      phon: "N AA1 T / AH / S K R AE1 CH / AA1 N / IH T ." },
+  ],
+  collect_triple: [
+    { text: "We got a triple shot.",
+      phon: "W IY / G AA1 T / AH / T R IH1 P AH L / SH AA1 T ." },
+  ],
+  collect_rapid: [
+    { text: "Rapid shot acquired.",
+      phon: "R AE1 P IH D / SH AA1 T / AH K W AY1 ER D ." },
+  ],
+  collect_scoop: [
+    { text: "A bigger pooper scooper.",
+      phon: "AH / B IH1 G ER / P UW1 P ER / S K UW1 P ER ." },
+  ],
+  collect_magnet: [
+    { text: "Now we're more attractive.",
+      phon: "N AW1 / W IH1 R / M AO1 R / AH T R AE1 K T IH V ." },
+  ],
+  collect_engine: [
+    { text: "A few more horsepower.",
+      phon: "AH / F Y UW1 / M AO1 R / HH AO1 R S P AW ER ." },
+  ],
+  expire_triple: [
+    { text: "Triple shot is gone.",
+      phon: "T R IH1 P AH L / SH AA1 T / IH Z / G AO1 N ." },
+  ],
+  expire_rapid: [
+    { text: "Rapid shot is gone.",
+      phon: "R AE1 P IH D / SH AA1 T / IH Z / G AO1 N ." },
+  ],
+  expire_scoop: [
+    { text: "Garbage scoop got smaller.",
+      phon: "G AA1 R B IH JH / S K UW1 P / G AA1 T / S M AO1 L ER ." },
+  ],
+  expire_magnet: [
+    { text: "Magnet power is gone.",
+      phon: "M AE1 G N IH T / P AW1 ER / IH Z / G AO1 N ." },
+  ],
+  expire_engine: [
+    { text: "Engine's a little less peppy.",
+      phon: "EH1 N JH IH N Z / AH / L IH1 T AH L / L EH1 S / P EH1 P IY ." },
+  ],
+  dock_5: [
+    { text: "There's at least 5 good pieces in there.",
+      phon: "DH EH1 R Z / AE T / L IY1 S T / F AY1 V / G UH1 D / P IY1 S IH Z / IH N / DH EH1 R ." },
+  ],
+  dock_10: [
+    { text: "That's somewhere around a dozen.",
+      phon: "DH AE1 T S / S AH1 M W EH R / AH R AW1 N D / AH / D AH1 Z AH N ." },
+  ],
+  dock_15: [
+    { text: "Special delivery.",
+      phon: "S P EH1 SH AH L / D IH L IH1 V ER IY ." },
+  ],
+  dock_20: [
+    { text: "I'm not sure I can count that high.",
+      phon: "AY1 M / N AA1 T / SH UH1 R / AY1 / K AE N / K AW1 N T / DH AE1 T / HH AY1 ." },
+  ],
+  cargo_full: [
+    { text: "Truck is full, let's go.",
+      phon: "T R AH1 K / IH Z / F UH1 L , L EH1 T S / G OW1 ." },
+  ],
+  chain_broken: [
+    { text: "Junk is gone!", phon: "JH AH1 NG K / IH Z / G AO1 N ." },
+    { text: "Lost my scrap!", phon: "L AO1 S T / M AY1 / S K R AE1 P ." },
+    { text: "Trash is loose!", phon: "T R AE1 SH / IH Z / L UW1 S ." },
+    { text: "There goes the garbage!", phon: "DH EH1 R / G OW1 Z / DH AH / G AA1 R B IH JH ." },
+    { text: "There goes my junk!", phon: "DH EH1 R / G OW1 Z / M AY1 / JH AH1 NG K ." },
+  ],
+};
+
+// CS011 P4 — level announcement. LEVEL_PHON/NUM_PHON are ported VERBATIM from
+// tools/voice-robot-lab.html's P0 audited output (do not re-compose phon here).
+const LEVEL_PHON = "L EH1 V AH L";
+const NUM_PHON = {
+  zero: "Z IH1 R OW", one: "W AH1 N", two: "T UW1", three: "TH R IY1", four: "F AO1 R",
+  five: "F AY1 V", six: "S IH1 K S", seven: "S EH1 V AH N", eight: "EY1 T", nine: "N AY1 N",
+  ten: "T EH1 N", eleven: "IH L EH1 V AH N", twelve: "T W EH1 L V",
+  thirteen: "TH ER T IY1 N", fourteen: "F AO R T IY1 N", fifteen: "F IH F T IY1 N",
+  sixteen: "S IH K S T IY1 N", seventeen: "S EH V AH N T IY1 N", eighteen: "EY T IY1 N",
+  nineteen: "N AY N T IY1 N",
+  twenty: "T W EH1 N T IY", thirty: "TH ER1 T IY", forty: "F AO1 R T IY",
+  fifty: "F IH1 F T IY", sixty: "S IH1 K S T IY", seventy: "S EH1 V AH N T IY",
+  eighty: "EY1 T IY", ninety: "N AY1 N T IY",
+};
+const DIGIT_WORD = {
+  "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+  "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
+};
+
+// Pure: n -> word tokens ("twenty-three" -> ["twenty","three"]). n < 20 is a single ones/teens
+// word; otherwise a tens word plus an ones word only if there's a remainder.
+function numberToWords(n) {
+  if (n < 20) return [numberToWords.ONES[n]];
+  const tens = numberToWords.TENS[(n / 10) | 0];
+  const ones = n % 10;
+  return ones ? [tens, numberToWords.ONES[ones]] : [tens];
+}
+numberToWords.ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+  "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+  "eighteen", "nineteen"];
+numberToWords.TENS = [null, null, "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+  "eighty", "ninety"];
+
+// Pure: n -> full phon string for "Level n". n <= 99 speaks natural words; n >= 100 falls back
+// to digit-by-digit (no "level two hundred" composition — out of scope, see phase doc FLAG).
+function levelPhon(n) {
+  if (n <= 99) return LEVEL_PHON + " / " + numberToWords(n).map(w => NUM_PHON[w]).join(" / ");
+  return LEVEL_PHON + " / " + String(n).split("").map(d => NUM_PHON[DIGIT_WORD[d]]).join(" / ");
+}
+
+// §11e cooldown/priority — PLAYTEST KNOBS. VOICE_COOLDOWN: no line starts while one plays, or within
+// this many seconds of the last one ENDING. VOICE_PRIORITY (default 1): a higher-priority line PRE-EMPTS
+// a lower one that is currently playing; an equal/lower one is DROPPED (never queued — a queue would have
+// Dan narrating events that finished ten seconds ago). 3 = hull critical, 2 = health milestones, 1 = rest.
+const VOICE_COOLDOWN = 1.2;
+const VOICE_PRIORITY = { health_low: 3, health_relief: 2, health_full: 2, level: 2, chain_broken: 2 };
+
+// CS011 P2 — on-screen caption look/timing knobs (LOOK-CALL). The caption is Dan's VISIBLE echo, shown
+// whenever settings.captions is on — even with voice audio OFF — and gated by the SAME cooldown/priority
+// as the audio, so a dropped line is never captioned late. LINGER: seconds a fully-shown caption holds
+// after the utterance ends. FADE: seconds of linear alpha fade-out at the end of its life. Y: px up from
+// the viewport bottom. SIZE: font px. All four are pure presentation, tuned by eye, no gameplay effect.
+const CAPTION_LINGER = 1.5, CAPTION_FADE = 0.4, CAPTION_Y = 64, CAPTION_SIZE = 20;
+
+// VoiceSys — Dan's speech. A SEPARATE module alongside AudioSys/MusicSys (NOT folded into AudioSys, a
+// flat bag of one-shots): it owns a small sequencer + a radio-processing chain that feeds AudioSys.voice
+// (the volume bus). Every entry point no-ops when AudioSys.ctx is null (the headless-safe guard idiom).
+const VoiceSys = {
+  voiceBus: null, dry: null, rIn: null, rLP: null, rShaper: null, rComp: null, rGain: null,
+  ringCarrier: null, ringMult: null, ringWet: null, ringDry: null, ringOut: null, // CS011 ring-mod stage
+  staticGain: null, noiseBuf: null,
+  cur: null,               // the currently-playing utterance's source handles, or null
+  busyUntil: -Infinity,    // AudioSys-clock time the current utterance ends; also the cooldown anchor.
+                           // -Infinity = "nothing has ever played" so the FIRST line (and any line in the
+                           // AudioContext's first VOICE_COOLDOWN seconds) isn't swallowed by a phantom gap.
+  curPriority: -Infinity,  // priority of the line occupying the channel (for pre-emption)
+
+  // Build the noise bed + radio chain once the audio graph exists (first user gesture). Idempotent;
+  // no-ops until AudioSys.init() has created AudioSys.voice. Mirrors MusicSys.ensureGraph().
+  ensure() {
+    if (this.voiceBus || !AudioSys.ctx || !AudioSys.voice) return;
+    const ctx = AudioSys.ctx;
+    const n = ctx.sampleRate * 2, b = ctx.createBuffer(1, n, ctx.sampleRate), d = b.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    this.noiseBuf = b;
+    // voice bus -> ring-modulation stage (CS011) -> dry / radio fan-out. The ring stage sits BETWEEN the
+    // bus and the dry+radio split so a robot voice (ring on) and a plain one (ring off) share one graph.
+    this.voiceBus = ctx.createGain();
+    // ring mod: out = signal * carrier (carrier drives a 0-baseline gain, i.e. multiply), mixed with dry.
+    // Ring off (applyRing → wet 0 / dry 1) makes ringOut a transparent pass-through of voiceBus, so a
+    // non-ring style behaves exactly as the pre-CS011 direct voiceBus->{dry,rIn} fan-out did.
+    this.ringCarrier = ctx.createOscillator(); this.ringCarrier.type = "sine";
+    this.ringMult = ctx.createGain(); this.ringMult.gain.value = 0; this.ringCarrier.connect(this.ringMult.gain);
+    this.voiceBus.connect(this.ringMult);
+    this.ringWet = ctx.createGain(); this.ringDry = ctx.createGain();
+    this.ringMult.connect(this.ringWet); this.voiceBus.connect(this.ringDry);
+    this.ringOut = ctx.createGain(); this.ringWet.connect(this.ringOut); this.ringDry.connect(this.ringOut);
+    this.ringCarrier.start();
+    // fan-out now taps ringOut (not voiceBus): dry path / radio path — both land on AudioSys.voice
+    this.dry = ctx.createGain(); this.ringOut.connect(this.dry); this.dry.connect(AudioSys.voice);
+    this.rIn = ctx.createBiquadFilter(); this.rIn.type = "highpass";
+    this.rLP = ctx.createBiquadFilter(); this.rLP.type = "lowpass";
+    this.rShaper = ctx.createWaveShaper();
+    this.rComp = ctx.createDynamicsCompressor();
+    this.rComp.threshold.value = -28; this.rComp.ratio.value = 8;
+    this.rComp.attack.value = 0.003; this.rComp.release.value = 0.12;
+    this.rGain = ctx.createGain();
+    this.ringOut.connect(this.rIn); this.rIn.connect(this.rLP); this.rLP.connect(this.rShaper);
+    this.rShaper.connect(this.rComp); this.rComp.connect(this.rGain); this.rGain.connect(AudioSys.voice);
+    // squelch-gated static bed, colored through the same radio chain (feeds rIn DIRECTLY, not via the ring)
+    const st = ctx.createBufferSource(); st.buffer = this.noiseBuf; st.loop = true;
+    const sf = ctx.createBiquadFilter(); sf.type = "bandpass"; sf.frequency.value = 1700; sf.Q.value = 0.4;
+    this.staticGain = ctx.createGain(); this.staticGain.gain.value = 0;
+    st.connect(sf); sf.connect(this.staticGain); this.staticGain.connect(this.rIn);
+    st.start();
+    this.applyRadio();
+    this.applyRing();
+  },
+
+  applyRadio() {
+    if (!AudioSys.ctx || !this.rIn) return;
+    const R = VOICE_PARAMS.radio;
+    this.rIn.frequency.value = R.hp;
+    this.rLP.frequency.value = R.lp;
+    const k = Math.max(1.001, R.drive), N = 1024, curve = new Float32Array(N), th = Math.tanh(k);
+    for (let i = 0; i < N; i++) { const x = i / (N - 1) * 2 - 1; curve[i] = Math.tanh(k * x) / th; }
+    this.rShaper.curve = curve;
+    this.dry.gain.value = R.on ? 0 : 1;
+    this.rGain.gain.value = R.on ? 1.4 : 0;
+  },
+
+  // CS011: apply the current style's ring-modulation settings to the ring stage built in ensure(). Off
+  // styles set wet 0 / dry 1 (transparent). freq is set unconditionally — the carrier always runs, so it
+  // must never receive undefined (every VOICE_STYLES entry carries a full ring:{on,freq,mix}).
+  applyRing() {
+    if (!AudioSys.ctx || !this.ringOut) return;
+    const R = VOICE_PARAMS.ring;
+    this.ringCarrier.frequency.value = R.freq;
+    this.ringWet.gain.value = R.on ? R.mix : 0;
+    this.ringDry.gain.value = R.on ? (1 - R.mix) : 1;
+  },
+
+  // CS011: switch Dan's voice to a VOICE_STYLES entry (re-points the live VOICE_PARAMS) and re-apply the
+  // radio + ring graph. "off" is NOT a style: it never reassigns VOICE_PARAMS (buildUtterance and the
+  // graph must always have a valid full object), because silencing is handled by voiceEnabled()/say()
+  // gating, not by tearing down the params. An unknown id is ignored (params/graph left as they are).
+  setStyle(id) {
+    if (id === "off") return;
+    if (VOICE_STYLES[id]) VOICE_PARAMS = VOICE_STYLES[id];
+    this.applyRadio();
+    this.applyRing();
+  },
+
+  // Stop the current utterance immediately (pre-emption / reset). Ramps the static bed down.
+  _stop() {
+    if (this.cur) {
+      for (const s of this.cur.sources) { try { s.onended = null; s.stop(); } catch (e) {} }
+      try { this.cur.utterG.disconnect(); } catch (e) {}
+      this.cur = null;
+    }
+    if (AudioSys.ctx && this.staticGain) {
+      const now = AudioSys.ctx.currentTime, g = this.staticGain.gain;
+      g.cancelScheduledValues(now); g.setValueAtTime(g.value, now); g.linearRampToValueAtTime(0, now + 0.05);
+    }
+  },
+
+  // Fresh run: silence Dan and clear the cooldown/priority so a new game never inherits a stale gate.
+  reset() { this._stop(); this.busyUntil = -Infinity; this.curPriority = -Infinity; },
+
+  // Speak a random alternative for `event`, subject to §11e cooldown/priority. Returns the chosen line
+  // (or null if dropped/unavailable). Selection is a plain random pick; the gate + caption + scheduling
+  // all live in _emit, so an event maps to a line here and the channel logic is shared with any future
+  // direct caller (e.g. CS011's coming sayLevel()).
+  say(event) {
+    const lines = VOICE_LINES[event];
+    if (!lines || !lines.length) return null;
+    const line = lines[(Math.random() * lines.length) | 0];
+    return this._emit(line, VOICE_PRIORITY[event] || 1);
+  },
+
+  // CS011 P4: announce the wave number. Speaks natural words via levelPhon(); the caption (shown
+  // by _emit) shows the numeral ("Level 23") since it's built from `line.text`, not `line.phon`.
+  sayLevel(n) {
+    return this._emit({ text: "Level " + n, phon: levelPhon(n) }, VOICE_PRIORITY.level);
+  },
+
+  // The voice CHANNEL (CS011 P2): run the §11e cooldown/priority gate for one already-chosen `line` at
+  // priority `p`, and for a line that PASSES, show its caption (if settings.captions) and speak it (if a
+  // voice style is selected). Captions and audio are INDEPENDENT outputs that SHARE this one gate, so a
+  // caption obeys the same drop-not-queue rule as the audio — a superseded/in-cooldown line is dropped,
+  // never shown late. The gate arithmetic (busyUntil/curPriority + VOICE_COOLDOWN) is BYTE-IDENTICAL to
+  // the pre-split say(): buildUtterance moved up here from _schedule (so a captions-only run can read
+  // utt.dur without building an audio graph), and busyUntil/curPriority advance whenever a line passes —
+  // even in captions-only mode (voice OFF) — so the channel stays consistent. Returns the line, or null
+  // if dropped / no ctx. NOTE: gates on the global voiceEnabled() helper (not a VoiceSys method).
+  _emit(line, p) {
+    if (!AudioSys.ctx) return null;
+    this.ensure();
+    const now = AudioSys.now();
+    if (now < this.busyUntil) {              // a line is on the channel right now
+      if (p <= this.curPriority) return null; // equal/lower → DROP (never queue)
+      // higher → fall through: _schedule() stops the current line and takes the channel
+    } else if (now < this.busyUntil + VOICE_COOLDOWN) {
+      return null;                            // inside the post-line cooldown gap
+    }
+    const utt = buildUtterance(line.phon, VOICE_PARAMS);
+    if (settings.captions) this.showCaption(line.text, utt.dur);
+    if (voiceEnabled()) this._schedule(utt);
+    this.curPriority = p;
+    this.busyUntil = now + 0.10 + utt.dur;   // t0 = now + 0.10 (see _schedule); + utterance length
+    return line;
+  },
+
+  // Overwrite (never queue) the on-screen caption with `text`, timed to utterance length `dur`. life =
+  // the audio's 0.10 s t0 lead + the speech + CAPTION_LINGER; drawCaption() renders it, fading over the
+  // last CAPTION_FADE seconds. Reassigns game.caption wholesale so a superseding line replaces the old.
+  showCaption(text, dur) { game.caption = { text, dur, life: 0.10 + dur + CAPTION_LINGER }; },
+
+  // Recycle-at-dock tiers (§11f / FORK-5 b): map pieces-delivered-this-visit to a line. 1–4 says nothing.
+  dockDelivery(n) {
+    const ev = n >= 20 ? "dock_20" : n >= 15 ? "dock_15" : n >= 10 ? "dock_10" : n >= 5 ? "dock_5" : null;
+    if (ev) return this.say(ev);
+    return null;
+  },
+
+  // The render scheduler — PORT-ME BLOCK A, verbatim from the lab's VL.speak(), retargeted onto
+  // AudioSys.ctx / AudioSys.voice (via this.voiceBus). Schedules a PRE-BUILT utterance (`utt`) as a Web
+  // Audio graph and returns it. buildUtterance() now runs one level up in _emit() (CS011 P2 — the ONLY
+  // line lifted out of this block, so a captions-only run can read utt.dur without building any audio).
+  // Do not re-tune here — tune in the lab, re-port.
+  _schedule(utt) {
+    this.ensure();
+    if (!AudioSys.ctx) return null;
+    const ctx = AudioSys.ctx;
+    if (ctx.state === "suspended") ctx.resume();
+    this._stop();
+    if (!utt.segs.length) return utt;
+    const t0 = ctx.currentTime + 0.10;
+
+    // glottal source — custom pulse (richness = spectral tilt) or a native wave
+    const osc = ctx.createOscillator();
+    if (VOICE_PARAMS.srcType === "pulse") {
+      const NH = 48, re = new Float32Array(NH + 1), im = new Float32Array(NH + 1);
+      for (let h = 1; h <= NH; h++) im[h] = 1 / Math.pow(h, VOICE_PARAMS.richness);
+      osc.setPeriodicWave(ctx.createPeriodicWave(re, im));
+    } else osc.type = VOICE_PARAMS.srcType;
+    const lfo = ctx.createOscillator(); lfo.type = "sine"; lfo.frequency.value = 5.1;
+    const lfoG = ctx.createGain(); lfoG.gain.value = VOICE_PARAMS.wobble;
+    lfo.connect(lfoG); lfoG.connect(osc.frequency);
+
+    const vGain = ctx.createGain(); vGain.gain.value = 0;      // voicing envelope
+    const srcMix = ctx.createGain();
+    osc.connect(vGain); vGain.connect(srcMix);
+    const aspSrc = ctx.createBufferSource(); aspSrc.buffer = this.noiseBuf; aspSrc.loop = true;
+    const aspG = ctx.createGain(); aspG.gain.value = 0;        // aspiration/breath -> formants
+    aspSrc.connect(aspG); aspG.connect(srcMix);
+
+    // parallel formant bank: F1 direct, F2-F4 via hiBus (nasal murmur damps the highs)
+    const utterG = ctx.createGain();
+    const hiBus = ctx.createGain(); hiBus.connect(utterG);
+    const FQ = [7, 10, 12, 14], FG = [0.9, 1.0, 0.7, 0.32], filts = [];
+    for (let i = 0; i < 4; i++) {
+      const f = ctx.createBiquadFilter(); f.type = "bandpass";
+      f.Q.value = FQ[i] / VOICE_PARAMS.bwScale;
+      const g = ctx.createGain(); g.gain.value = FG[i];
+      srcMix.connect(f); f.connect(g); g.connect(i === 0 ? utterG : hiBus);
+      filts.push(f);
+    }
+    filts[3].frequency.value = 3300;                            // fixed F4, naturalness only
+
+    // frication path — bypasses the formant bank (Klatt parallel path)
+    const fricSrc = ctx.createBufferSource(); fricSrc.buffer = this.noiseBuf; fricSrc.loop = true;
+    const fricF = ctx.createBiquadFilter(); fricF.type = "bandpass";
+    const fricG = ctx.createGain(); fricG.gain.value = 0;
+    fricSrc.connect(fricF); fricF.connect(fricG); fricG.connect(utterG);
+    utterG.connect(this.voiceBus);
+
+    // ---- schedule: formants ramp THROUGH targets (pin previous, then ramp — the b/d/g cue)
+    const prevF = [null, null, null];
+    let prevAmp = 0, prevDamp = 1, prevBreath = 0;
+    for (const s of utt.segs) {
+      const at = t0 + s.t0;
+      if (s.F) {
+        const tr = Math.min(s.trans || 0.05, Math.max(0.015, s.dur * 0.6));
+        for (let i = 0; i < 3; i++) {
+          const p = filts[i].frequency;
+          if (prevF[i] === null) p.setValueAtTime(s.F[i], at);
+          else { p.setValueAtTime(prevF[i], at); p.linearRampToValueAtTime(s.F[i], at + tr); }
+          prevF[i] = s.F[i];
+          if (s.F2nd) {           // diphthong: hold, then glide to the second target
+            p.setValueAtTime(s.F[i], at + s.dur * 0.45);
+            p.linearRampToValueAtTime(s.F2nd[i], at + s.dur);
+            prevF[i] = s.F2nd[i];
+          }
+        }
+      }
+      const vAt = at + (s.voiceDelay || 0);
+      vGain.gain.setValueAtTime(prevAmp, vAt);
+      vGain.gain.linearRampToValueAtTime(s.amp, vAt + 0.016);
+      prevAmp = s.amp;
+      const damp = s.hiDamp == null ? 1 : s.hiDamp;
+      if (damp !== prevDamp) {
+        hiBus.gain.setValueAtTime(prevDamp, at);
+        hiBus.gain.linearRampToValueAtTime(damp, at + 0.02);
+        prevDamp = damp;
+      }
+      const breath = s.amp > 0.3 ? VOICE_PARAMS.breath * 0.4 : 0;   // breathiness rides voicing
+      if (breath !== prevBreath) {
+        aspG.gain.setValueAtTime(prevBreath, vAt);
+        aspG.gain.linearRampToValueAtTime(breath, vAt + 0.02);
+        prevBreath = breath;
+      }
+    }
+    const tEnd = t0 + utt.dur;
+    vGain.gain.setValueAtTime(prevAmp, tEnd - 0.06);
+    vGain.gain.linearRampToValueAtTime(0, tEnd);
+
+    // aspiration events (HH, voiceless-stop VOT) — override the breath baseline
+    for (const a of utt.asps) {
+      const at = t0 + a.t;
+      aspG.gain.setValueAtTime(a.g, at);
+      aspG.gain.linearRampToValueAtTime(0.001, at + a.dur);
+    }
+    // frication: typed noise — instant-attack exponential-decay bursts, shaped fricatives
+    for (const fr of utt.frics) {
+      const at = t0 + fr.t;
+      fricF.frequency.setValueAtTime(fr.cf, at);
+      fricF.Q.setValueAtTime(fr.q, at);
+      if (fr.burst) {
+        fricG.gain.setValueAtTime(fr.g, at);
+        fricG.gain.exponentialRampToValueAtTime(0.0001, at + fr.dur);
+        fricG.gain.setValueAtTime(0, at + fr.dur + 0.001);
+      } else {
+        fricG.gain.setValueAtTime(0, at);
+        fricG.gain.linearRampToValueAtTime(fr.g, at + 0.015);
+        fricG.gain.setValueAtTime(fr.g, at + Math.max(0.02, fr.dur - 0.02));
+        fricG.gain.linearRampToValueAtTime(0, at + fr.dur);
+      }
+    }
+    // pitch contour
+    const fp = osc.frequency;
+    fp.setValueAtTime(utt.pitch[0][1], t0 + utt.pitch[0][0]);
+    for (let i = 1; i < utt.pitch.length; i++)
+      fp.linearRampToValueAtTime(utt.pitch[i][1], t0 + utt.pitch[i][0]);
+
+    // utterance master envelope (belt-and-braces declick)
+    utterG.gain.setValueAtTime(0, ctx.currentTime);
+    utterG.gain.setValueAtTime(1, t0 - 0.02);
+    utterG.gain.setValueAtTime(1, tEnd + 0.02);
+    utterG.gain.linearRampToValueAtTime(0, tEnd + 0.12);
+
+    // radio squelch: static bed keys up just before the voice, clicks off after
+    if (VOICE_PARAMS.radio.on) {
+      const g = this.staticGain.gain, lvl = VOICE_PARAMS.radio.static;
+      g.cancelScheduledValues(ctx.currentTime);
+      g.setValueAtTime(0, ctx.currentTime);
+      g.setValueAtTime(lvl * 6, t0 - 0.07);
+      g.linearRampToValueAtTime(lvl, t0 - 0.03);
+      g.setValueAtTime(lvl, tEnd + 0.05);
+      g.setValueAtTime(lvl * 5, tEnd + 0.07);
+      g.linearRampToValueAtTime(0, tEnd + 0.11);
+    }
+
+    const sources = [osc, lfo, aspSrc, fricSrc];
+    for (const s of sources) s.start(ctx.currentTime);
+    for (const s of sources) s.stop(tEnd + 0.3);
+    osc.onended = () => { if (this.cur && this.cur.osc === osc) this.cur = null; };
+    this.cur = { sources, utterG, osc };
+    return utt;
+  },
+};
+
 // ---------- Input ----------
 // One input layer serves both keyboard and gamepad. Everything downstream only ever calls
 // input.left()/right()/thrust()/fire()/shield() — it never reads keys{} or the gamepad directly,
@@ -1150,7 +1996,7 @@ const bindings = {
   // Menu / system actions (edge-triggered). Fixed per F7 — not exposed to rebinding.
   confirm: { label: "Confirm",    fixed: true,  keys: ["enter"],           buttons: [GP.A] },
   // back is context-aware (v3.0 P4): inside a menu it backs out; on title/gameover with no menu, B
-  // opens the system menu (keyboard equivalent is "o", handled inline). ESC is shared with pause below.
+  // opens OPTIONS directly (keyboard equivalent is "o", handled inline). ESC is shared with pause below.
   back:    { label: "Back",       fixed: true,  keys: ["escape"],          buttons: [GP.B] },
   // pause is ESC (P retired, v3.0 P4 FLAG P4-a): ESC pauses during play; inside a menu the keydown
   // handler resolves confirm->back->pause in order, so ESC there means "back" (back matches first).
@@ -1275,8 +2121,9 @@ window.addEventListener("keydown", e => {
   // case entry-handling is ever restructured.
   if (bindings.confirm.keys.includes(k) && (game.state === "title" || game.state === "gameover") && !game.entry) startGame();
   if (bindings.pause.keys.includes(k) && game.state === "playing") openPause();
-  // "O" opens the Options/Achievements system menu from title/gameover (v3.0 P4; replaces the old
-  // P->options path). No game to pause here — openPause() picks the system-menu root off game.state.
+  // "O" opens OPTIONS directly from title/gameover (v3.0 P4 replaced the old P->options path; CS012 P4
+  // FORK-CS012-C → a replaced the Options/Achievements system-menu root with Options itself). No game to
+  // pause here — openPause() routes to the Options screen off game.state.
   // Guarded off during initials entry so O can't pop the menu mid-entry.
   if (k === "o" && (game.state === "title" || game.state === "gameover") && !game.entry) openPause();
 });
@@ -1334,7 +2181,7 @@ function handleGamepadMenu() {
   // frame can't both open a menu AND start a game (FLAG P4-b); priority Start > B > A.
   //   Start = session toggle : title/gameover -> start a game ; playing -> open pause (resume is the
   //           menu-branch case above).
-  //   B     = context-aware  : title/gameover with no menu -> open the system menu (mirrors ESC/O).
+  //   B     = context-aware  : title/gameover with no menu -> open OPTIONS directly (mirrors ESC/O).
   //   A     = confirm        : title/gameover -> start a game (never mid-play, where A is fire).
   const onTitleOrOver = game.state === "title" || game.state === "gameover";
   if (pressedStart) {
@@ -1388,18 +2235,25 @@ function firstPressedButton() {
 // into menuInput(action); the rendering lives near draw() (drawMenu). Gameplay stays frozen the
 // whole time (update() early-returns on paused), so menu input can never move the ship.
 
-// The root screen has two context-dependent layouts (v3.0 P4). Which one is live is decided purely by
-// game.state: pausing mid-game keeps state "playing"; the system menu opened from title/gameover keeps
-// state "title"/"gameover" (update() skips the sim in both, so game.paused is safe in any state).
-const MENU_ROOT_PLAY = ["Continue", "Options", "Quit"];      // paused mid-game
-const MENU_ROOT_SYS  = ["Options", "Achievements", "High Scores", "Back"];  // system menu from title/gameover (v3.6 P6 added "High Scores")
-function rootItems() { return game.state === "playing" ? MENU_ROOT_PLAY : MENU_ROOT_SYS; }
-// v3.4 P6: "Music Track" inserted after "Master Volume". menuOptions()/drawOptionsMenu() dispatch by
-// LABEL (like menuRoot), not by hardcoded index, so adding a row here is purely additive and can't
-// silently shift the Controls/Achievements/Difficulty/Back handlers out from under themselves.
-const MENU_OPTIONS = ["SFX Volume", "Music Volume", "Master Volume", "Music Track", "Controls", "Achievements", "Difficulty", "Back"];
-const VOL_CATS     = ["sfx", "music", "master"]; // parallel to the first three MENU_OPTIONS rows
-const VOL_LABELS   = ["SFX Volume", "Music Volume", "Master Volume"]; // the slider rows, by label
+// The root ("PAUSED") screen is the paused-mid-game menu only (game.state "playing"). CS012 P4
+// (FORK-CS012-C → a) retired the separate system-menu root (the old MENU_ROOT_SYS =
+// ["Options","Achievements","Back"]): from title/gameover, O/Start/B now open OPTIONS directly
+// (openPause routes there off game.state), so Options is the sole hub and rootItems() has only the
+// one layout to return. update() skips the sim outside "playing", so game.paused is safe in any state.
+const MENU_ROOT_PLAY = ["Continue", "Options", "Quit"];      // paused mid-game — the only root layout now
+function rootItems() { return MENU_ROOT_PLAY; }
+// menuOptions()/drawOptionsMenu() dispatch by LABEL (like menuRoot), not by hardcoded index, so
+// adding a row here is purely additive and can't silently shift the other handlers out from under
+// themselves. CS010 P4 (§9/§10a): the three volume sliders + Music Track moved OFF this screen onto
+// the new "Sound / Music" sub-screen (SOUND_ROWS below); "High Scores" (§8b) moved IN, nested here.
+const MENU_OPTIONS = ["Sound / Music", "Controls", "Achievements", "High Scores", "Difficulty", "Back"];
+// CS010 P4 (§9): the Sound/Music sub-screen's rows, same template as DIFFICULTY_ROWS. CS010 P9 (§11c)
+// added the Voice Volume slider — SOUND_ROWS + VOL_LABELS + VOL_CATS grow together so the parallel
+// label→category lookup stays paired. CS011 P3 added "Voice" (style picker) + "Captions" (toggle),
+// both dispatched by label in menuSound/drawSound like the existing Music Track cycler.
+const SOUND_ROWS   = ["SFX Volume", "Music Volume", "Master Volume", "Voice Volume", "Voice", "Captions", "Music Track", "Back"];
+const VOL_CATS     = ["sfx", "music", "master", "voice"]; // parallel to VOL_LABELS (NOT to any MENU_OPTIONS/SOUND_ROWS position)
+const VOL_LABELS   = ["SFX Volume", "Music Volume", "Master Volume", "Voice Volume"]; // the slider rows, by label
 const VOL_STEP     = 0.1;                         // per left/right nudge on a volume slider
 const clamp01 = v => Math.max(0, Math.min(1, v));
 
@@ -1410,23 +2264,37 @@ const settings = {
   shotPowerupMode: "time", // "time" | "shots"  — governs Rapid Fire + Triple Shot expiry
   magnetMode:      "time", // "time" | "pieces" — governs Magnet expiry
   musicTrack:      "zen",  // "zen" | "derelict" | "drift" | "warehouse" — selected gameplay track (v3.5; zen default)
+  shipTurnScale:   SHIP_TURN_SCALE_DEFAULT, // CS010 §10b: player rotation-speed multiplier (0.5..1.5), read by shipTurnRate()
+  voiceStyle:      "comms", // CS011: selected Dan voice — "off" or a VOICE_STYLE_VALUES id. NOT persisted yet (later phase).
+  captions:        true,    // CS011: show on-screen captions of Dan's lines. NOT persisted yet (later phase).
+  autoShield:      false,   // CS012 P5: auto-raise the shield on a hit at critical hull (costs energy + AUTO_SHIELD_SCORE_PENALTY). Off by default.
 };
+
+// CS011: Dan speaks only when a real voice style is selected. voiceStyle "off" mutes him without disturbing
+// VOICE_PARAMS (which keeps the last real style so the acoustic engine always has a valid full object).
+function voiceEnabled() { return settings.voiceStyle !== "off"; }
 
 // Music-track picker. Internal values drive gameplay-track selection; the labels are what the Options
 // row shows. Cycled left/right like a Difficulty toggle. Ordered calm -> hot (v3.5).
 const MUSIC_TRACK_VALUES = ["zen", "derelict", "drift", "warehouse"];
 const MUSIC_TRACK_LABELS = { zen: "Zen", derelict: "Derelict", drift: "Drift", warehouse: "Warehouse" };
 
+// CS011 P3: display labels for the Voice-style picker, parallel to VOICE_STYLE_VALUES.
+const VOICE_STYLE_LABELS = { off: "Off", comms: "Comms", comms_f: "Comms ♀", flat: "Monotone", flat_f: "Monotone ♀", vintage: "Computer", vintage_f: "Computer ♀" };
+
 function menuActive() { return game.paused; } // paused <=> a pause-menu screen is open
 
 // --- Open / close / quit ---
 function openPause() {
   game.paused = true;
-  game.menu.screen = "root"; game.menu.index = 0; game.menu.row = 0; game.menu.col = 0;
+  // CS012 P4 (FORK-CS012-C → a): paused mid-game opens the root menu; from title/gameover, O/Start/B
+  // open OPTIONS directly (no separate system-menu root anymore) — openPause routes off game.state.
+  game.menu.screen = game.state === "playing" ? "root" : "options"; game.menu.index = 0; game.menu.row = 0; game.menu.col = 0;
   game.menu.rebinding = null;
   resetMenuNav();          // don't let a direction held at pause-time fire a phantom move
   AudioSys.thrust(false);  // kill the thrust loop immediately (update() would too, next frame)
   AudioSys.lowhp(false); game.lowHpSiren = false; // same — the siren must not drone through a pause menu
+  game.hpReliefFlash = 0; // CS010 P3: a stale relief exhale must not survive a pause (the siren latch is torn down directly here, bypassing the falling-edge branch)
   AudioSys.ui(true);
 }
 function closePause() {
@@ -1441,6 +2309,8 @@ function quitToTitle() {
   game.state = "title";
   AudioSys.thrust(false); AudioSys.saucer(false); // stop any continuous voices
   AudioSys.lowhp(false); game.lowHpSiren = false;
+  game.hpReliefFlash = 0; // CS010 P3: no stale relief exhale survives a quit-to-title
+  game.caption.life = 0;  // CS011 P2: no stale voice caption lingers into the title
   Achievements.save();  // persist lifetime progress earned during the abandoned game (F9)
   AudioSys.ui(false);
 }
@@ -1467,6 +2337,7 @@ function menuInput(action) {
   switch (game.menu.screen) {
     case "root":         menuRoot(action); break;
     case "options":      menuOptions(action); break;
+    case "sound":        menuSound(action); break;
     case "controls":     menuControls(action); break;
     case "difficulty":   menuDifficulty(action); break;
     case "achievements": menuAchievements(action); break;
@@ -1479,22 +2350,42 @@ function menuRoot(a) {
   if (a === "up")   { m.index = (m.index + N - 1) % N; AudioSys.ui(false); }
   else if (a === "down") { m.index = (m.index + 1) % N; AudioSys.ui(false); }
   else if (a === "confirm") {
-    // Dispatch by label so both root layouts (play vs. system) work off one handler.
+    // CS012 P4: the root is the paused-mid-game menu only — Continue / Options / Quit.
     const label = items[m.index];
-    if (label === "Continue")          closePause();
-    else if (label === "Options")      gotoScreen("options");
-    else if (label === "Achievements") { gotoScreen("achievements"); m.achReturn = "root"; }
-    else if (label === "High Scores")  gotoScreen("highscores"); // v3.6 P6: browsable top-10 table
-    else if (label === "Quit")         quitToTitle();
-    else if (label === "Back")         closePause(); // system menu: close overlay -> underlying title/gameover
+    if (label === "Continue")     closePause();
+    else if (label === "Options") gotoScreen("options");
+    else if (label === "Quit")    quitToTitle();
   }
   else if (a === "back" || a === "pause") closePause();
 }
 
-// v3.4 P6 refactor: dispatch by LABEL (menuRoot is the in-file precedent), not by hardcoded index,
-// so the new "Music Track" row is additive and no index-fragile branch has to shift.
+// Dispatch by LABEL (the menuRoot precedent), not by hardcoded index, so a new row is additive and
+// no index-fragile branch has to shift. CS010 P4 (§8b/§9/§10a): now a pure nav list — the volume
+// sliders + Music Track moved to "sound" (below), and "High Scores" (§8b) was nested in here.
 function menuOptions(a) {
   const m = game.menu, N = MENU_OPTIONS.length, label = MENU_OPTIONS[m.index];
+  if (a === "up")   { m.index = (m.index + N - 1) % N; AudioSys.ui(false); }
+  else if (a === "down") { m.index = (m.index + 1) % N; AudioSys.ui(false); }
+  else if (a === "confirm") {
+    if (label === "Sound / Music") gotoScreen("sound"); // CS010 P4 §9
+    else if (label === "Controls") gotoScreen("controls");
+    else if (label === "Achievements") gotoScreen("achievements"); // viewer (F9)
+    else if (label === "High Scores") gotoScreen("highscores"); // CS010 P4 §8b: nested under Options
+    else if (label === "Difficulty") gotoScreen("difficulty"); // Difficulty screen (v3.0 P5)
+    // CS012 P4: Back is context-aware — paused mid-game returns to the root menu (cursor on Options);
+    // from title/gameover, where Options is the top-level dialog, it closes the overlay entirely.
+    else if (label === "Back") { if (game.state === "playing") gotoScreen("root", rootItems().indexOf("Options")); else closePause(); }
+  }
+  else if (a === "back") { if (game.state === "playing") gotoScreen("root", rootItems().indexOf("Options")); else closePause(); }
+  else if (a === "pause") closePause();
+}
+
+// Sound / Music sub-screen (CS010 P4, §9): the three volume sliders + Music Track cycler, relocated
+// off Options — a relocation, not a redesign, so it's the SAME control style. Follows the
+// menuDifficulty/menuOptions label-dispatch template exactly; VOL_LABELS/VOL_CATS stay a paired
+// lookup (not tied to any row's position on THIS screen either).
+function menuSound(a) {
+  const m = game.menu, N = SOUND_ROWS.length, label = SOUND_ROWS[m.index];
   if (a === "up")   { m.index = (m.index + N - 1) % N; AudioSys.ui(false); }
   else if (a === "down") { m.index = (m.index + 1) % N; AudioSys.ui(false); }
   else if (a === "left" || a === "right") {
@@ -1509,15 +2400,22 @@ function menuOptions(a) {
       settings.musicTrack = MUSIC_TRACK_VALUES[(idx + (a === "right" ? 1 : -1) + n) % n];
       saveSettings();
       AudioSys.ui(false);
+    } else if (label === "Voice") { // cycle Dan's voice style (same idiom as Music Track)
+      const idx = VOICE_STYLE_VALUES.indexOf(settings.voiceStyle), n = VOICE_STYLE_VALUES.length;
+      settings.voiceStyle = VOICE_STYLE_VALUES[(idx + (a === "right" ? 1 : -1) + n) % n];
+      VoiceSys.setStyle(settings.voiceStyle);
+      saveSettings();
+      AudioSys.ui(false);
+    } else if (label === "Captions") { // toggle on-screen captions
+      settings.captions = !settings.captions;
+      saveSettings();
+      AudioSys.ui(false);
     }
   }
   else if (a === "confirm") {
-    if (label === "Controls") gotoScreen("controls");
-    else if (label === "Achievements") { gotoScreen("achievements"); m.achReturn = "options"; } // viewer (F9)
-    else if (label === "Difficulty") gotoScreen("difficulty"); // Difficulty screen (v3.0 P5)
-    else if (label === "Back") gotoScreen("root", rootItems().indexOf("Options")); // -> root, cursor on "Options"
+    if (label === "Back") gotoScreen("options", MENU_OPTIONS.indexOf("Sound / Music"));
   }
-  else if (a === "back") gotoScreen("root", rootItems().indexOf("Options"));
+  else if (a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Sound / Music"));
   else if (a === "pause") closePause();
 }
 
@@ -1525,26 +2423,25 @@ function menuOptions(a) {
 // of confirm/back/pause exits back to Options (cursor left on the "Achievements" row).
 function menuAchievements(a) {
   if (a === "pause") closePause();
-  else if (a === "confirm" || a === "back") {
-    // Return to wherever we came from: the system-menu root (title/gameover) reaches Achievements
-    // directly, whereas play (and system-menu Options) reaches it via the Options screen.
-    if (game.menu.achReturn === "root") gotoScreen("root", rootItems().indexOf("Achievements"));
-    else gotoScreen("options", 4);
-  }
+  // CS012 P4: Achievements now lives ONLY under Options (reached the same way from title/gameover AND
+  // from pause), so Back always returns to Options with the cursor on "Achievements" — the old
+  // achReturn tracker (which distinguished a direct system-root entry) is retired.
+  else if (a === "confirm" || a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Achievements"));
 }
 
-// High Scores viewer (v3.6 P6): read-only top-10 table reachable only from the system-menu root
-// (title/gameover) — mirrors menuAchievements' shape, but has no nested Options path to return to.
+// High Scores viewer: read-only top-10 table, nested under Options (CS010 P4 §8b) — reachable from
+// BOTH title/gameover (via Options) and the pause menu mid-game, unlike the old root-only entry. One
+// entry point -> one back-destination, no return-context tracker needed (like Achievements as of CS012 P4).
 function menuHighScores(a) {
   if (a === "pause") closePause();
-  else if (a === "confirm" || a === "back") gotoScreen("root", rootItems().indexOf("High Scores"));
+  else if (a === "confirm" || a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("High Scores"));
 }
 
 // Difficulty screen (v3.0 P5, B-4/B-5): two left/right mode toggles + Back. Left picks the timed
 // default, right picks the count variant, matching the on-screen "Time | Shots/Pieces" layout.
 // Structured to grow with future difficulty knobs (FLAG B-4-c): add a row here + a case in the
 // switch and the renderer picks it up.
-const DIFFICULTY_ROWS = ["shot", "magnet", "back"];
+const DIFFICULTY_ROWS = ["shot", "magnet", "autoshield", "back"];
 function menuDifficulty(a) {
   const m = game.menu, N = DIFFICULTY_ROWS.length;
   const row = DIFFICULTY_ROWS[m.index];
@@ -1553,6 +2450,7 @@ function menuDifficulty(a) {
   else if (a === "left" || a === "right") {
     if (row === "shot")        { settings.shotPowerupMode = a === "right" ? "shots"  : "time"; saveSettings(); AudioSys.ui(false); }
     else if (row === "magnet") { settings.magnetMode      = a === "right" ? "pieces" : "time"; saveSettings(); AudioSys.ui(false); }
+    else if (row === "autoshield") { settings.autoShield  = a === "right"; saveSettings(); AudioSys.ui(false); }
   }
   else if (a === "confirm") {
     if (row === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Difficulty"));
@@ -1564,19 +2462,25 @@ function menuDifficulty(a) {
 function menuControls(a) {
   const m = game.menu;
   const ACTIONS = REBINDABLE;               // one row per rebindable action, col 0 = kb, col 1 = pad
-  const ROWS = ACTIONS.length + 2;          // + Return to Defaults + Back
-  const defaultsRow = ACTIONS.length, backRow = ACTIONS.length + 1;
+  // Row order: [rebindable actions...], Ship Rotation slider (§10b), Return to Defaults, Back. Derive
+  // the three trailing indices from ACTIONS.length so inserting the slider row can't desync them (nor
+  // can adding/removing a rebindable action later). drawControlsMenu derives them the same way.
+  const turnRow = ACTIONS.length;
+  const defaultsRow = ACTIONS.length + 1, backRow = ACTIONS.length + 2;
+  const ROWS = ACTIONS.length + 3;          // + Ship Rotation + Return to Defaults + Back
   if (a === "up")   { m.row = (m.row + ROWS - 1) % ROWS; AudioSys.ui(false); }
   else if (a === "down") { m.row = (m.row + 1) % ROWS; AudioSys.ui(false); }
   else if (a === "left" || a === "right") {
-    if (m.row < ACTIONS.length) { m.col = 1 - m.col; AudioSys.ui(false); } // toggle kb/pad column
+    if (m.row < ACTIONS.length) { m.col = 1 - m.col; AudioSys.ui(false); }                          // toggle kb/pad column
+    else if (m.row === turnRow) { adjustShipTurnScale(a === "right" ? 1 : -1); AudioSys.ui(false); } // §10b rotation slider
   }
   else if (a === "confirm") {
     if (m.row < ACTIONS.length) startRebind(ACTIONS[m.row], m.col === 0 ? "key" : "pad");
+    // turnRow has no confirm action — it's a ◄/► slider (Paul: rotation returns to default manually).
     else if (m.row === defaultsRow) { returnToDefaults(); AudioSys.ui(true); }
-    else if (m.row === backRow) gotoScreen("options", 3); // back to Options, cursor on "Controls"
+    else if (m.row === backRow) gotoScreen("options", MENU_OPTIONS.indexOf("Controls")); // back to Options, cursor on "Controls"
   }
-  else if (a === "back") gotoScreen("options", 3);
+  else if (a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Controls"));
   else if (a === "pause") closePause();
 }
 
@@ -1604,6 +2508,11 @@ function capturePadRebind(btn) {
   saveSettings();
   AudioSys.ui(true);
 }
+// Controls-screen "Return to Defaults": resets rebindable key/pad bindings ONLY.
+// FLAG-10a (CS010 §10b): this deliberately does NOT reset settings.shipTurnScale — Paul asked that the
+// rotation-speed slider return to 100% MANUALLY, not via this button. Do NOT "fix" it to also reset
+// shipTurnScale; that would reverse an explicit design call. (Counter-intuitive because the slider row
+// lives on this same screen, hence this comment.)
 function returnToDefaults() {
   for (const name of REBINDABLE) {
     const d = DEFAULT_BINDINGS[name];
@@ -1611,6 +2520,16 @@ function returnToDefaults() {
     bindings[name].buttons = d.buttons.slice();
     bindings[name].axis = d.axis ? { index: d.axis.index, dir: d.axis.dir } : null;
   }
+  saveSettings();
+}
+
+// CS010 §10b: nudge the rotation-speed preference by one 10% step (dir = +1 for ►, -1 for ◄), clamp to
+// [MIN, MAX], snap to the 0.10 grid to kill float accumulation, then persist. Held ◄/► only nudges once
+// — the menu-open keydown branch early-returns on e.repeat (v3.5 P1 guard) and the gamepad path is
+// edge-detected, so this can never spin.
+function adjustShipTurnScale(dir) {
+  const stepped = Math.round((settings.shipTurnScale + dir * SHIP_TURN_SCALE_STEP) * 10) / 10;
+  settings.shipTurnScale = Math.max(SHIP_TURN_SCALE_MIN, Math.min(SHIP_TURN_SCALE_MAX, stepped));
   saveSettings();
 }
 
@@ -1627,7 +2546,10 @@ function saveSettings() {
   try {
     const data = { vol: { ...AudioSys.vol }, bindings: {},
       shotPowerupMode: settings.shotPowerupMode, magnetMode: settings.magnetMode, // v3.0 P5 (additive)
-      musicTrack: settings.musicTrack };                                          // v3.4 P6 (additive)
+      musicTrack: settings.musicTrack,                                            // v3.4 P6 (additive)
+      shipTurnScale: settings.shipTurnScale,                                      // CS010 §10b (additive)
+      voiceStyle: settings.voiceStyle, captions: settings.captions,               // CS011 P3 (additive)
+      autoShield: settings.autoShield };                                          // CS012 P5 (additive)
     for (const name of REBINDABLE) {
       const b = bindings[name];
       data.bindings[name] = { keys: b.keys, buttons: b.buttons || [], axis: b.axis || null };
@@ -1642,7 +2564,9 @@ function loadSettings() {
     if (!raw) return;
     const data = JSON.parse(raw);
     if (data.vol) {
-      for (const c of ["master", "sfx", "music"])
+      // CS010 P9: derive the categories from vol's own keys (now incl. "voice") so a newly-added bus
+      // persists automatically — a hardcoded list would silently drop voice volume on every load.
+      for (const c of Object.keys(AudioSys.vol))
         if (typeof data.vol[c] === "number") AudioSys.vol[c] = clamp01(data.vol[c]);
     }
     if (data.bindings) {
@@ -1660,6 +2584,23 @@ function loadSettings() {
     if (data.magnetMode === "time" || data.magnetMode === "pieces") settings.magnetMode = data.magnetMode;
     // v3.4 P6: only accept a known track name, so a corrupt/unknown value falls back to the default.
     if (MUSIC_TRACK_VALUES.includes(data.musicTrack)) settings.musicTrack = data.musicTrack;
+    // CS010 §10b: rotation-speed preference is additive — tolerate a missing key (older saves) and
+    // accept only a finite in-range number; anything else (string / NaN-as-null / 99 / 0) snaps to the
+    // 1.0 default rather than sticking. Snap to the 0.10 grid so a hand-edited save can't desync the slider.
+    if (typeof data.shipTurnScale === "number" && isFinite(data.shipTurnScale) &&
+        data.shipTurnScale >= SHIP_TURN_SCALE_MIN && data.shipTurnScale <= SHIP_TURN_SCALE_MAX) {
+      settings.shipTurnScale = Math.round(data.shipTurnScale * 10) / 10;
+    } else {
+      settings.shipTurnScale = SHIP_TURN_SCALE_DEFAULT;
+    }
+    // CS011 P3: voice style + captions are additive fields — tolerate a missing/corrupt value by
+    // leaving the runtime default in place rather than snapping to a wrong fallback. Captions in
+    // particular must stay true (the default) unless a real boolean was saved — no else-branch.
+    if (VOICE_STYLE_VALUES.includes(data.voiceStyle)) settings.voiceStyle = data.voiceStyle;
+    VoiceSys.setStyle(settings.voiceStyle);
+    if (typeof data.captions === "boolean") settings.captions = data.captions;
+    // CS012 P5: auto-shield is an additive boolean — missing/non-boolean leaves the runtime default (false) in place.
+    if (typeof data.autoShield === "boolean") settings.autoShield = data.autoShield;
   } catch (e) { /* corrupt / unreadable — fall back to defaults, don't crash */ }
 }
 loadSettings(); // apply saved settings (if any) over the shipped defaults, once at startup
@@ -1756,6 +2697,34 @@ function drawPoly(points, x, y, angle, color, closed = true) {
   ctx.restore();
 }
 
+// A HUD ring arc: from 12 o'clock, clockwise, sweeping `frac` of a full turn. `frac` is NOT clamped
+// here — callers clamp (banking can exceed 1.0, see the overcharge arc). Track-only when frac <= 0.
+function drawRingArc(x, y, r, frac, color, width = HUD_RING_W, blur = HUD_RING_BLUR) {
+  if (frac <= 0) return;
+  ctx.beginPath();
+  ctx.arc(x, y, r, -Math.PI / 2, -Math.PI / 2 + TAU * frac);
+  glowStroke(color, width, blur);   // never closePath() — an arc, not a poly
+}
+
+// A segmented HUD ring: `segs` equal wedges from 12 o'clock, clockwise, each separated by
+// HUD_RING_SEG_GAP radians of empty space. Wedges 0..filled-1 are lit (glowStroke, like every
+// other ring arc); the rest are a dim, glow-less stroke — same track idiom as the powerup rows'
+// full-circle track. STROKE ONLY, no fills — never closePath() — arcs, not polys.
+function drawRingSegments(x, y, r, segs, filled, litColor, dimColor) {
+  const step = TAU / segs;
+  for (let i = 0; i < segs; i++) {
+    const start = -Math.PI / 2 + i * step + HUD_RING_SEG_GAP / 2;
+    const end = -Math.PI / 2 + (i + 1) * step - HUD_RING_SEG_GAP / 2;
+    ctx.beginPath();
+    ctx.arc(x, y, r, start, end);
+    if (i < filled) {
+      glowStroke(litColor, HUD_RING_W, HUD_RING_BLUR);
+    } else {
+      ctx.strokeStyle = dimColor; ctx.lineWidth = HUD_RING_TRACK_W; ctx.stroke();
+    }
+  }
+}
+
 const COLOR = {
   ship: "#9fd8ff",
   bullet: "#ffffff",
@@ -1815,8 +2784,9 @@ class Ship {
   }
   update(dt) {
     if (this.dead) return;
-    if (input.left())  this.angle -= SHIP_TURN * dt;
-    if (input.right()) this.angle += SHIP_TURN * dt;
+    const turn = shipTurnRate() * dt;   // player rotation scale (§10b) + optional cargo-turn penalty (§3), one source
+    if (input.left())  this.angle -= turn;
+    if (input.right()) this.angle += turn;
 
     this.thrusting = input.thrust();
     // towed cargo makes the ship heavier: weaker thrust, lower top speed. Scales with
@@ -1885,29 +2855,15 @@ class Ship {
     if (this.dead) return;
     const blink = this.invuln > 0 && Math.floor(this.invuln * 10) % 2 === 0;
     if (!blink) {
-      // Scoop mouth (v3.3 P3; box render v3.6 P1c): drawn BEFORE the hull in COLOR.dock green so it
-      // reads as a collector's throat. This is the EXACT capture region inScoopBox() tests — a
-      // rectangle from forward=-SHIP_RADIUS (behind the nose) to forward=SCOOP_DEPTH[lvl], within
-      // +/-SCOOP_WIDTH[lvl]/2 laterally — not an approximation, so what's drawn is what captures.
-      // Corners are derived, never hardcoded. Filled translucent (a deliberate exception to GDD
-      // §3.2's no-fills rule — a HUD-ish capture-region affordance, not an entity) with the usual
-      // glowStroke outline on top. Hidden at level 0.
+      // Scoop mouth (v3.3 P3; prong-V render restored CS010 P1 — see GDD §2.14.1 for the box-render
+      // supersession history). Drawn BEFORE the hull in COLOR.dock green so it reads as a collector's
+      // throat: an open V from the ship's nose (16,0) flaring forward to +/-SCOOP_WIDTH[lvl]/2 at
+      // SCOOP_DEPTH[lvl]. This is a TELL for inScoopBox()'s capture region, not a literal outline of
+      // it — the box's rear edge at forward=-SHIP_RADIUS isn't shown. Corners derived, never
+      // hardcoded. No fill. Hidden at level 0.
       if (game.scoopLevel > 0) {
         const lvl = game.scoopLevel, hw = SCOOP_WIDTH[lvl] / 2, d = SCOOP_DEPTH[lvl];
-        const box = [[-SHIP_RADIUS, -hw], [d, -hw], [d, hw], [-SHIP_RADIUS, hw]];
-        ctx.save();
-        ctx.translate(this.x, this.y);
-        ctx.rotate(this.angle);
-        ctx.beginPath();
-        ctx.moveTo(box[0][0], box[0][1]);
-        for (let i = 1; i < box.length; i++) ctx.lineTo(box[i][0], box[i][1]);
-        ctx.closePath();
-        ctx.globalAlpha = 0.15; // look-call knob
-        ctx.fillStyle = COLOR.dock;
-        ctx.fill();
-        ctx.globalAlpha = 1;
-        glowStroke(COLOR.dock);
-        ctx.restore();
+        drawPoly([[d, -hw], [16, 0], [d, hw]], this.x, this.y, this.angle, COLOR.dock, false);
       }
       const pts = [[16, 0], [-11, -9], [-6, 0], [-11, 9]];
       drawPoly(pts, this.x, this.y, this.angle, COLOR.ship);
@@ -2235,7 +3191,7 @@ class Saucer {
       let a;
       if (this.small) {
         // aimed, but the error widens toward a barely-aimed spray at low waves (F10)
-        const err = ramp(SAUCER_AIM_ERR_FLOOR, SAUCER_AIM_ERR_CEIL, game.wave);
+        const err = ramp(SAUCER_AIM_ERR_FLOOR, SAUCER_AIM_ERR_CEIL, 1 + (game.wave - 1) * SAUCER_ACCURACY_RAMP_SCALE);
         a = angleTo(this, game.ship) + rand(-err, err);
       } else {
         a = rand(0, TAU); // random
@@ -2446,8 +3402,8 @@ class Powerup {
 }
 
 class FloatText {
-  constructor(text, x, y, color) {
-    this.text = text; this.x = x; this.y = y; this.color = color;
+  constructor(text, x, y, color, size = 16) {
+    this.text = text; this.x = x; this.y = y; this.color = color; this.size = size;
     this.life = 1.1; this.dead = false;
   }
   update(dt) {
@@ -2457,7 +3413,7 @@ class FloatText {
   }
   draw() {
     ctx.globalAlpha = Math.max(0, this.life / 1.1);
-    drawText(this.text, this.x, this.y, 16, this.color);
+    drawText(this.text, this.x, this.y, this.size, this.color);
     ctx.globalAlpha = 1;
   }
 }
@@ -2507,6 +3463,7 @@ function resetGameStats() {
     gameTime: 0,             // sec since this game started (Speed Recycler's 60s window)
     delivered: 0,            // canisters delivered to the dock this game (Scrap Runner)
     fullChainVisit: false,   // a single dock visit reached 12 deliveries (Heavy Hauler)
+    maxChainVisit: false,    // a single dock visit reached CARGO_CAP_MAX (24) deliveries (Maxed Out, CS012 P3)
     bestCombo: 0,            // highest delivery combo reached in one visit (Combo Collector)
     speedRecycler: false,    // first canister delivered within 60s (Speed Recycler)
     pacifistStreak: 0,       // consecutive deliveries with no shot fired between them
@@ -2542,7 +3499,7 @@ const game = {
   // Pause-menu state machine (F8): screen = null | "root" | "options" | "controls";
   // index = cursor for root/options; row/col = cursor for the controls grid;
   // rebinding = { action, device } while capturing a new binding, else null.
-  menu: { screen: null, index: 0, row: 0, col: 0, rebinding: null, achReturn: "options" },
+  menu: { screen: null, index: 0, row: 0, col: 0, rebinding: null },
   ship: new Ship(),
   camera: { x: WORLD_W / 2, y: WORLD_H / 2 }, // world point at the center of the viewport
   debris: [], bullets: [], saucers: [], hunters: [], particles: [],
@@ -2550,10 +3507,20 @@ const game = {
   powerups: [],                                        // free-floating Powerup pickups (F6)
   powerFx: { rapid: 0, triple: 0, magnet: 0, engine: 0 }, // remaining sec per timed effect (0 = inactive)
   powerBudget: { rapid: 0, triple: 0, magnet: 0 },    // remaining shots/pieces in count mode (P5; Engine is always timed)
+  powerBank: { rapid: 0, triple: 0, magnet: 0, engine: 0 },    // CS009 P5: sec of bank-flash left per type (0 = none)
+  powerBankAmt: { rapid: 0, triple: 0, magnet: 0, engine: 0 }, // CS009 P5: the "+Ns" badge amount for the current flash
+  hudHull: 1,                                          // CS009 P1: eased HUD hull fraction, chases
+                                                        // ship.hp/SHIP_MAX_HP so a hit/heal reads as a
+                                                        // drain/fill, not a jump. Advanced in update(),
+                                                        // NOT drawHUD() — see the update() call site.
   scoopLevel: 0,                                       // PERSISTENT scoop upgrade level 0..SCOOP_MAX_LEVEL (v3.3 P3; NOT a timed effect)
   scoopHits: 0,                                        // running non-lethal-hit tally; every SCOOP_HITS_PER_LEVEL costs a level
   healthTimer: 0,                                      // countdown to the next ambient Health spawn
   cargoMax: CARGO_BASE,                                // runtime tow cap; grows CARGO_BASE→CARGO_CAP_MAX per canisters delivered (B-8)
+  cargoFlash: 0,                                       // CS009 P3: >0 for HUD_CAP_FLASH sec after a cap-up —
+                                                        // a cap-up SHRINKS the CARGO ring's fraction (same chain,
+                                                        // bigger denominator), so without this flash it reads as
+                                                        // a bug instead of a promotion. Decayed in update().
   deliveryCount: 0, offloadTimer: 0,
   score: 0, wave: 0,
   nextRepair: REPAIR_MILESTONE,   // next score threshold that repairs the hull (F2)
@@ -2561,9 +3528,40 @@ const game = {
   hunterTimer: 0,
   beatTimer: 0, beatHigh: false, beatInterval: 1.0,
   waveClearTimer: 0,
-  lowHpSiren: false   // v3.4 P5: edge-detection latch for AudioSys.lowhp — true iff the siren is
+  lowHpSiren: false,  // v3.4 P5: edge-detection latch for AudioSys.lowhp — true iff the siren is
                       // currently playing, so update() can fire lowhp(true)/(false) exactly once
                       // per state transition instead of every frame
+  // CS010 P9: Dan's OWN low-health latch — answers "has Dan already said 'hull critical' for THIS
+  // episode?", a DIFFERENT question from lowHpSiren's "is the tone playing?". It must NOT be torn down
+  // by openPause/quitToTitle (which reset lowHpSiren so the rising edge re-fires the SIREN on unpause);
+  // otherwise Dan re-announces every single unpause. Cleared ONLY on the genuine falling edge + startGame.
+  lowHpVoiced: false,
+  // CS010 P9: edge-detect latch for the hull-FULL voice (hp >= max). Starts TRUE (the ship spawns full,
+  // so no "brand new ship" line at wave start); flips false when hp drops below max, so a heal back to
+  // full — from the Health powerup OR addScore()'s repair milestone — fires the line exactly once.
+  hpFullVoice: true,
+  // CS010 P9: previous powerActive() state per timed type, for the powerup-EXPIRED voice's falling edge.
+  // Keyed through powerActive() (not powerFx) so it correctly covers count modes too.
+  powerVoiced: { rapid: false, triple: false, magnet: false, engine: false },
+  // CS010 P3: the low-health pulse PHASE ACCUMULATOR. Advanced by 2π·lowhpPulseRate(t)·dt in update()
+  // while engaged; read as Math.sin(game.lowHpPhase) by BOTH the critical-hull ring pulse AND the corner
+  // glow, so they lock to each other and (via the shared rate helper) to the siren — one alarm. An
+  // ACCUMULATOR, not omega·clock, is mandatory: omega is HP-dependent, and omega·clock would SNAP the
+  // phase (~30 rad on a 0.5 rad/s rate delta at t=60s) every time HP changes, visibly stuttering the
+  // pulse. Reset to 0 on disengage + startGame; FREEZES while paused (update early-returns), which is
+  // correct — openPause tears the siren down anyway, matching CS009's hudHull/cargoFlash placement.
+  lowHpPhase: 0,
+  // CS010 P3: >0 for LOWHP_RELIEF_FLASH sec after low-health CLEARS with the ship alive — the visual
+  // relief cue (§5, FLAG-CS010-a): a geometry-only (radius+width) NON-pulsing "exhale" on the hull ring.
+  // Armed on the falling edge ONLY IF !ship.dead (dying ALSO drives the low-health state false, so the
+  // guard stops a cheerful pop firing at the moment of death). Decayed in update() beside cargoFlash;
+  // zeroed at every direct siren teardown (pause/quit/start/death) so no stale exhale survives.
+  hpReliefFlash: 0,
+  // CS011 P2: the on-screen caption of Dan's current line — the voice channel's VISIBLE echo. text = the
+  // line text; dur = its utterance length (from buildUtterance); life = seconds left to display, set to
+  // 0.10 + dur + CAPTION_LINGER by showCaption() and decayed in update()'s playing body. drawCaption()
+  // renders it while life > 0 (fading over the last CAPTION_FADE s). Overwritten wholesale per line.
+  caption: { text: "", life: 0, dur: 0 }
 };
 
 function startGame() {
@@ -2571,7 +3569,7 @@ function startGame() {
   game.paused = false;
   game.deathT = 0; game.shake = 0;   // v3.6 P5: a fresh run never carries death-spectacle state over
   game.entry = null; game.lastScoreId = null; // v3.6 P6: nor any stale initials-entry/highlight state
-  game.menu = { screen: null, index: 0, row: 0, col: 0, rebinding: null, achReturn: "options" }; // ensure no menu carries in
+  game.menu = { screen: null, index: 0, row: 0, col: 0, rebinding: null }; // ensure no menu carries in
   game.stats = resetGameStats();  // fresh per-game achievement tracking (F9)
   game.toasts = [];               // clear any lingering unlock toasts
   game.score = 0;
@@ -2583,20 +3581,34 @@ function startGame() {
   game.powerups = [];
   game.powerFx = { rapid: 0, triple: 0, magnet: 0, engine: 0 };
   game.powerBudget = { rapid: 0, triple: 0, magnet: 0 }; // count-mode budgets reset with the run (P5)
+  game.powerBank = { rapid: 0, triple: 0, magnet: 0, engine: 0 };    // bank-flash state resets with the run (P5)
+  game.powerBankAmt = { rapid: 0, triple: 0, magnet: 0, engine: 0 };
   game.scoopLevel = 0; game.scoopHits = 0;               // persistent scoop upgrade resets each run (v3.3 P3)
   game.healthTimer = rand(POWERUP_HEALTH_GAP[0], POWERUP_HEALTH_GAP[1]);
   game.cargoMax = CARGO_BASE;      // tow cap resets to base each run; grows with deliveries (B-8)
+  game.cargoFlash = 0;             // CS009 P3: no cap-up flash carries into a fresh run
   game.deliveryCount = 0; game.offloadTimer = 0;
   game.ship = new Ship();
+  game.hudHull = game.ship.hp / SHIP_MAX_HP;   // CS009 P1: no drain animation on a fresh run
   game.camera = { x: game.ship.x, y: game.ship.y };
   game.saucerTimer = rand(SAUCER_GAP_FLOOR_MIN, SAUCER_GAP_FLOOR_MAX); // first saucer waits the wave-1 floor gap (F10)
   game.hunterTimer = rand(14, 22);
   game.lowHpSiren = false; AudioSys.lowhp(false); // fresh run never carries the siren over (v3.4 P5)
+  game.lowHpPhase = 0;      // CS010 P3: the pulse accumulator starts a fresh run at 0
+  game.hpReliefFlash = 0;   // CS010 P3: no stale relief exhale carries into a fresh run
+  // CS010 P9: Dan's latches. lowHpVoiced false (not yet at low HP); hpFullVoice TRUE (spawns full — no
+  // "brand new ship" at wave start); powerVoiced all false. reset() clears any in-flight line + cooldown.
+  game.lowHpVoiced = false;
+  game.hpFullVoice = true;
+  game.powerVoiced = { rapid: false, triple: false, magnet: false, engine: false };
+  game.caption = { text: "", life: 0, dur: 0 }; // CS011 P2: no stale caption carries into a fresh run
+  VoiceSys.reset();
   nextWave();
 }
 
 function nextWave() {
   game.wave++;
+  VoiceSys.sayLevel(game.wave); // CS011 P4 — announces Level 1 too (VoiceSys.reset() ran just above in startGame)
   // v3.4 P7: intensity recomputed ONLY on wave change, never per-frame — keeps updateMusic()'s
   // per-frame path clean. Runs at wave 1 too (startGame calls nextWave()), so a fresh run starts
   // pinned to difficultyFactor(1) === 0 (foundation layer only) before any track has even loaded.
@@ -2842,14 +3854,25 @@ function applyPowerup(type) {
     }
     game.stats.powerupsPicked++;
     AudioSys.powerup();
+    VoiceSys.say("collect_scoop"); // CS010 P9: scoop is the early-return branch — hook the line HERE
     return;
   }
   if (type === "health") {
     game.ship.hp = Math.min(SHIP_MAX_HP, game.ship.hp + POWERUP_HEALTH_AMOUNT);
   } else if (powerMode(type) === "time") {
+    // CS009 P5: check BEFORE the += — this is what distinguishes a bank (effect already running) from
+    // a fresh pickup (it wasn't). A fresh pickup arms no badge.
+    if (powerActive(type)) {
+      game.powerBank[type] = HUD_BANK_FLASH;
+      game.powerBankAmt[type] = powerDuration(type); // FLAG-F: 30 for magnet, 15 for the rest — never a literal
+    }
     game.powerFx[type] += powerDuration(type);      // BANKS (v3.6 P4, reverses the old refresh rule) —
                                                       // same-type pickups add duration; magnitude still never stacks
   } else {
+    if (powerActive(type)) {
+      game.powerBank[type] = HUD_BANK_FLASH;
+      game.powerBankAmt[type] = POWERUP_BUDGET[type];
+    }
     game.powerBudget[type] += POWERUP_BUDGET[type]; // count mode: banks the shots/pieces budget too (same rule)
   }
   // Achievement stats (F9): any pickup counts for "No Powerups Needed"; Health picks gate "Glass
@@ -2859,6 +3882,10 @@ function applyPowerup(type) {
   else game.stats.powerUsed[type] = true;
   game.floaters.push(new FloatText(POWERUP_LABEL[type], game.ship.x, game.ship.y - 22, POWERUP_COLOR[type]));
   AudioSys.powerup();
+  // CS010 P9: the four timed types announce their pickup (Health has no collect line — it speaks via the
+  // hull-full latch instead). A same-type BANK re-pickup re-fires collect_<type>; the §11e cooldown drops
+  // the second line if it lands inside the window (a decided, acceptable behavior — see STATUS.md).
+  if (type !== "health") VoiceSys.say("collect_" + type);
 }
 
 // ---------- Achievements (F9) ----------
@@ -2903,7 +3930,7 @@ const Achievements = {
     { id: "flawless_run",     name: "Flawless Run",     desc: "Clear wave 8 or later without taking any damage.",      goal: 1,  cur: s => s.flawlessLateWave ? 1 : 0 }
   ],
 
-  // 19 lifetime achievements (v3.0 P8 added 7). cur() reads the persisted lifetime counters (l) — never
+  // 20 lifetime achievements (v3.0 P8 added 7; CS012 P3 added max_haul). cur() reads the persisted lifetime counters (l) — never
   // mutated here. Fourteen of these are now TIERED: an optional `tiers:[bronze..diamond]` ascending ladder
   // replaces the single `goal`; evaluate() unlocks every newly-crossed tier (see evaluate/onUnlock).
   // Two counter kinds (FLAG A-1-b): SUM (running total, l.X++ at the event) and MAX (personal best,
@@ -2932,6 +3959,8 @@ const Achievements = {
     { id: "untouchable",       name: "Untouchable",       desc: "Reach wave 10 without dropping below 50% HP.",        goal: 1,     cur: s => (game.wave >= 10 && !s.everBelowHalf) ? 1 : 0 },
     { id: "ton_of_scrap",      name: "Ton of Scrap",      desc: "Earn 10,000 points from dock deliveries (all-time).", goal: 10000, cur: (s, l) => l.deliveryScore },
     { id: "long_haul",         name: "The Long Haul",     desc: "Deliver 12+ canisters in one dock visit, 10 times.",  goal: 10,    cur: (s, l) => l.fullChains },
+    // CS012 P3 (FORK-CS012-B a): placeholder id/name/desc — Paul to finalize before ship.
+    { id: "max_haul",          name: "Maxed Out",         desc: "Deliver a full 24-canister chain in one dock visit.", goal: 1,     cur: s => s.maxChainVisit ? 1 : 0 },
     { id: "marathon_runner",   name: "Marathon Runner",   desc: "Play for 10 hours total.",                            goal: 36000, cur: (s, l) => l.playTime,
       text: (s, l) => (l.playTime / 3600).toFixed(1) + "/10h" }
   ],
@@ -3228,6 +4257,29 @@ function powerTypesUsed(s) {
 // damage was actually applied.
 function damageShip(amount, srcX, srcY) {
   const s = game.ship;
+  // CS012 P5 auto-shield: a reactive last-resort save at critical hull. When enabled and the hull is at/below
+  // the low-health threshold, an incoming hit spends SHIELD_HIT_COST energy to raise the shield and eat the hit
+  // for 0 HP instead of taking damage. The knockback+stun below are the SAME as a real hit — the i-frame is the
+  // rate-limiter that caps this to ~one save per HIT_STUN_DURATION (same-frame repeats hit the shieldOn early-return
+  // just below), and energy recharge (0.12/s) < cost (0.22/save) means it self-exhausts after ~4-5 saves. Guarded by
+  // the same conditions the early-return checks so it never fires on a dead/shielded/i-framed ship.
+  if (settings.autoShield && !s.dead && !s.shieldOn && s.invuln <= 0 && s.hp <= LOW_HP_THRESHOLD
+      && s.energy >= SHIELD_HIT_COST) {
+    s.energy = Math.max(0, s.energy - SHIELD_HIT_COST);
+    // Knockback away from the hazard — copied verbatim from the real-hit body below so an auto-save shoves clear identically.
+    const [kdx, kdy] = shortDelta(srcX, srcY, s.x, s.y); // vector from hazard to ship = away
+    const kd = Math.hypot(kdx, kdy);
+    const ka = kd > 0.001 ? Math.atan2(kdy, kdx) : rand(0, TAU);
+    s.vx = Math.cos(ka) * KNOCKBACK_SPEED;
+    s.vy = Math.sin(ka) * KNOCKBACK_SPEED;
+    s.invuln = HIT_STUN_DURATION;
+    s.shieldOn = true;
+    // Penalty BYPASSES addScore by design (FLAG-4e / CLAUDE.md scoring exception): auto-save must NOT touch
+    // game.nextRepair, so it can never trip the HP-repair milestone. Clamp the score at 0.
+    game.score = Math.max(0, game.score - AUTO_SHIELD_SCORE_PENALTY);
+    game.floaters.push(new FloatText("-" + AUTO_SHIELD_SCORE_PENALTY, s.x, s.y, COLOR.lowhp));
+    return false; // 0 HP dealt — same contract as the shielded early-return
+  }
   if (s.dead || s.shieldOn || s.invuln > 0) return false;
   s.hp -= amount;
   if (s.hp <= 0) {
@@ -3263,6 +4315,7 @@ function damageShip(amount, srcX, srcY) {
       game.scoopHits = 0;
       game.floaters.push(new FloatText("SCOOP -1", s.x, s.y - 22, POWERUP_COLOR.scoop));
       AudioSys.scooploss();
+      VoiceSys.say("expire_scoop"); // CS010 P9: scoop decays by DAMAGE, not time — Dan reports it here
     }
   }
   return true;
@@ -3273,6 +4326,7 @@ function killShip() { // hull destroyed (0 HP): a true, permanent game over — 
   game.ship.dead = true;
   AudioSys.thrust(false);
   AudioSys.lowhp(false); game.lowHpSiren = false;
+  game.hpReliefFlash = 0; // CS010 P3: death is not relief — never arm/leave a "you're okay now" exhale on the frame the ship dies
   boom(game.ship.x, game.ship.y, 3, COLOR.ship);
   scatterChain();
   // v3.6 P5: enter the "dying" spectacle instead of freezing straight to "gameover" — updateDeath()
@@ -3331,6 +4385,15 @@ function chainMass() {
   // quantity feeding thrustMul/maxSp (Ship.update) and the momentum-tug massFactor (updateChain),
   // so halving it here eases all three at once — "easier to maneuver even when towing garbage."
   return powerActive("engine") ? m * ENGINE_MASS_MULT : m;
+}
+
+// Ship turn rate (CS010 §10b + §3): the ONE place both Ship.update turn sites read, so they can
+// never diverge. Folds in the player's rotation-speed preference (settings.shipTurnScale) AND an
+// optional towed-mass turn penalty (CARGO_TURN). At the shipped CARGO_TURN = 0 this is exactly
+// SHIP_TURN * scale — cargo does not affect rotation, byte-identical to pre-CS010 turn × the slider.
+// CARGO_TURN > 0 makes a heavy chain resist turning (the proposed "inertia" fix; see the constant).
+function shipTurnRate() {
+  return SHIP_TURN * settings.shipTurnScale / (1 + chainMass() * CARGO_TURN);
 }
 
 function wrapNode(n) { // wrap verlet nodes; shift prev pos too so velocity survives
@@ -3461,6 +4524,7 @@ function breakChain(i) { // node i destroyed; everything aft breaks loose
   }
   chain.length = i;
   game.deliveryCount = 0;
+  VoiceSys.say("chain_broken"); // CS011 P5: choke point only — scatterChain() (ship death) stays silent
 }
 
 function scatterChain() { // ship destroyed: whole load breaks loose
@@ -3577,19 +4641,70 @@ function update(dt) {
   }
 
   game.ship.update(dt);
+  // CS009 P1: eased HUD hull fraction — chases the true value so a hit/heal reads as a drain/fill,
+  // not a jump. Lives HERE, not in drawHUD(), because drawHUD() is gated by Capture.hudVisible: an
+  // ease running only while drawn would freeze while the HUD is toggled off with H and then snap on
+  // re-show. Math.pow(HUD_EASE, dt) is the shipped MAGNET_DAMP idiom — frame-rate independent.
+  game.hudHull += (game.ship.hp / SHIP_MAX_HP - game.hudHull) * (1 - Math.pow(HUD_EASE, dt));
+  // CS009 P3: linear decay of the CARGO ring's cap-up flash — lives here (not drawHUD()) for the same
+  // Capture.hudVisible reason as hudHull above: a decay that only ran while drawn would freeze while
+  // hidden and pop back on re-show.
+  if (game.cargoFlash > 0) game.cargoFlash = Math.max(0, game.cargoFlash - dt);
+  // CS010 P3: linear decay of the low-health relief "exhale" — lives HERE (not drawHUD()) for the same
+  // Capture.hudVisible reason as hudHull/cargoFlash above: a decay that only ran while drawn would freeze
+  // while the HUD is hidden with H and pop back on re-show.
+  if (game.hpReliefFlash > 0) game.hpReliefFlash = Math.max(0, game.hpReliefFlash - dt);
   // Camera tracks the ship's world position every frame (world wraps, so no clamping)
   game.camera.x = game.ship.x;
   game.camera.y = game.ship.y;
-  // Low-health siren (v3.4 P5): the STATE is a pure per-frame read (no stored flag), but the AUDIO
-  // voice is edge-detected off game.lowHpSiren so lowhp(true/false) fires exactly once per
-  // transition, not every frame. Driven from this one site; killShip/quitToTitle/openPause each
-  // tear the voice down directly since they leave "playing" without passing back through here.
+  // Low-health alarm (v3.4 P5; CS010 P3): the STATE is a pure per-frame read (no stored flag), but the
+  // AUDIO voice is edge-detected off game.lowHpSiren so lowhp(true/false) fires exactly once per
+  // transition, not every frame. Driven from this one site; killShip/quitToTitle/openPause each tear the
+  // voice down directly since they leave "playing" without passing back through here.
   const lowHp = game.ship.hp <= LOW_HP_THRESHOLD && !game.ship.dead;
-  if (lowHp && !game.lowHpSiren) { AudioSys.lowhp(true); game.lowHpSiren = true; }
-  else if (!lowHp && game.lowHpSiren) { AudioSys.lowhp(false); game.lowHpSiren = false; }
-  // v3.5 P3: HP-scaled urgency for the pulsed voice — a per-frame call (not edge-detected), safe
-  // no-op via lowhpSet's own guards when the state isn't engaged or the voice isn't live.
-  if (lowHp) AudioSys.lowhpSet(1 - game.ship.hp / LOW_HP_THRESHOLD);
+  if (lowHp && !game.lowHpSiren) {
+    AudioSys.lowhp(true); game.lowHpSiren = true;
+    // CS010 P9: Dan announces the crisis on the GENUINE rising edge only. The SIREN latch re-arms on
+    // every unpause (openPause/quitToTitle tear it down), so gating the voice on lowHpVoiced — which
+    // those menus DON'T touch — is what stops Dan re-announcing "Hull integrity is critical." per unpause.
+    if (!game.lowHpVoiced) { VoiceSys.say("health_low"); game.lowHpVoiced = true; }
+  }
+  else if (!lowHp && game.lowHpSiren) {
+    // Falling edge — disengage. Reset the pulse phase, then arm the relief exhale ONLY IF THE SHIP IS
+    // ALIVE (CS010 P3, §5, FLAG-CS010-a). THE GUARD IS LOAD-BEARING: `lowHp` also goes false when the
+    // ship DIES (the `!dead` term), so this branch is the moment of death too — without `!ship.dead` the
+    // hull ring would play a cheerful "you're okay now" pop at the instant the player is killed. (Today
+    // killShip zeroes game.lowHpSiren directly and the dying state early-returns before this site, so the
+    // edge isn't even reached at death — but that is incidental; guard explicitly.)
+    AudioSys.lowhp(false); game.lowHpSiren = false;
+    game.lowHpPhase = 0;
+    if (!game.ship.dead) {
+      game.hpReliefFlash = LOWHP_RELIEF_FLASH;   // relief, not death
+      // CS010 P9: Dan's relief line is ADDITIVE to P3's visual exhale (both carry the falling edge —
+      // parity with the four onset tells). Guarded on !ship.dead like the flash: death isn't relief.
+      VoiceSys.say("health_relief");
+    }
+    game.lowHpVoiced = false;   // CS010 P9: the crisis is over — re-arm Dan for the NEXT low-HP episode
+  }
+  // CS010 P9: hull-FULL voice. Edge-detected on hp >= max (matching the HUD's hpMax, not === ) so it
+  // fires ONCE per heal-to-full and never every frame while healthy — and, living here in update(),
+  // catches healing from ANY source (Health powerup AND addScore()'s repair milestone) for free. The
+  // latch starts true at spawn (see startGame) so a fresh full-HP run doesn't blurt "brand new ship".
+  const hpFull = game.ship.hp >= SHIP_MAX_HP && !game.ship.dead;
+  if (hpFull && !game.hpFullVoice) { VoiceSys.say("health_full"); game.hpFullVoice = true; }
+  else if (!hpFull) game.hpFullVoice = false;
+  // v3.5 P3: HP-scaled urgency for the pulsed voice — a per-frame call (not edge-detected), safe no-op
+  // via lowhpSet's own guards when the state isn't engaged or the voice isn't live. CS010 P3: the SAME t
+  // and the SAME lowhpPulseRate(t) also advance game.lowHpPhase, the shared accumulator the critical-hull
+  // ring and the corner glow read via Math.sin — so siren, ring and glow are ONE alarm at ONE HP-ramped
+  // rate. Integrating the phase (not phase = omega·clock) keeps it CONTINUOUS when the HP-dependent rate
+  // changes mid-alarm; mod TAU keeps the accumulator bounded. Living here means it FREEZES while paused —
+  // correct and deliberate (openPause tears the siren down; same rationale as hudHull/cargoFlash above).
+  if (lowHp) {
+    const t = 1 - game.ship.hp / LOW_HP_THRESHOLD;
+    AudioSys.lowhpSet(t);
+    game.lowHpPhase = (game.lowHpPhase + TAU * lowhpPulseRate(t) * dt) % TAU;
+  }
   // Achievements (F9): per-game clock (Speed Recycler's 60s window) + lifetime play time & periodic save
   game.stats.gameTime += dt;
   Achievements.tick(dt);
@@ -3599,6 +4714,7 @@ function update(dt) {
   game.hunters.forEach(h => h.update(dt));
   game.particles.forEach(p => p.update(dt));
   game.floaters.forEach(f => f.update(dt));
+  game.caption.life -= dt; // CS011 P2: age Dan's on-screen caption (drawCaption gates on life > 0)
   if (game.dock) game.dock.update(dt);
 
   // --- Salvage pickup & chain physics ---
@@ -3673,6 +4789,11 @@ function update(dt) {
           g.vy += (ay / d) * SCOOP_SPILL_KICK;
         }
       }
+      // CS010 P9: "Truck is full, let's go." fires on the pickup where the chain BECOMES full — after the
+      // single/clump branches so BOTH paths trip it, and inside the capture branch so only a real hook
+      // counts. cargoMax is the RUNTIME cap (grows 12→24), so "full" is a moving target; the pickup gate
+      // above blocks further hooks once full, so this trips exactly once and re-arms after a delivery.
+      if (game.chain.length === game.cargoMax) VoiceSys.say("cargo_full");
     }
   }
   coalesceGarbage(dt); // v3.1 P3: neglected scrap clumps; a 12-piece clump becomes a Hunter
@@ -3688,6 +4809,18 @@ function update(dt) {
   }
   for (const k in game.powerFx) {
     if (game.powerFx[k] > 0) game.powerFx[k] = Math.max(0, game.powerFx[k] - dt);
+  }
+  // CS010 P9: powerup-EXPIRED voice — the falling edge of powerActive(t) per timed type. Routed through
+  // powerActive() (never powerFx directly) so it correctly catches BOTH time mode (clock ran out) AND
+  // count mode (shots/pieces budget hit 0) — hooking powerFx would silently miss the count modes. Runs
+  // after the powerFx decay and after this frame's budget spends, so powerActive() is current.
+  for (const t of POWERUP_DROP_TYPES) {
+    const active = powerActive(t);
+    if (!active && game.powerVoiced[t]) VoiceSys.say("expire_" + t);
+    game.powerVoiced[t] = active;
+  }
+  for (const k in game.powerBank) {
+    if (game.powerBank[k] > 0) game.powerBank[k] = Math.max(0, game.powerBank[k] - dt);
   }
 
   // --- Recycling dock offload ---
@@ -3712,6 +4845,11 @@ function update(dt) {
         if (growCap > game.cargoMax) {
           game.cargoMax = growCap;
           game.floaters.push(new FloatText("TOW +1", game.ship.x, game.ship.y - 22, COLOR.dock));
+          // CS009 P3 (FORK-2 A): a cap-up SHRINKS the CARGO ring (same chain, bigger denominator) —
+          // arm the flash so the ring reads gold+thick for HUD_CAP_FLASH sec, and drop the reward
+          // text at the dock (where it was earned), not the ship.
+          game.cargoFlash = HUD_CAP_FLASH;
+          game.floaters.push(new FloatText("+1 CAP", game.dock.x, game.dock.y - 22, COLOR.ach));
         }
         game.stats.bestCombo = Math.max(game.stats.bestCombo, game.deliveryCount);
         // v3.6 P3 (Source 3, FORK-2): the recycle hub emits one powerup per visit, the first time
@@ -3738,10 +4876,23 @@ function update(dt) {
         // (FLAG A-5-a / B-8-b) — deliveryCount passes through 12 exactly once per qualifying visit, so all
         // three latch once per visit.
         if (game.deliveryCount === 12) { game.stats.fullChainVisit = true; Achievements.lifetime.fullChains++; Achievements.lifetime.heavyHaulerEvents++; }
+        // Maxed Out (lifetime, CS012 P3): deliveryCount passes through CARGO_CAP_MAX exactly once per
+        // qualifying visit (same "passes through" latch idiom as the ===12 check above). Celebration
+        // (floater + gold ring pulse) fires at this same instant — no voice line (deferred, FORK-CS012-B b).
+        if (game.deliveryCount === CARGO_CAP_MAX) {
+          game.stats.maxChainVisit = true;
+          game.floaters.push(new FloatText("MAX HAUL", game.dock.x, game.dock.y - 22, COLOR.ach, 24));
+          game.cargoFlash = HUD_CAP_FLASH;
+        }
         Achievements.lifetime.delivered++;
         Achievements.lifetime.deliveryScore += pts;
         game.floaters.push(new FloatText("+" + pts, node.x, node.y, COLOR.dock));
         AudioSys.deliver(game.deliveryCount);
+        // CS010 P9 (FORK-5 = b): Dan sizes up the haul on the pop that EMPTIES the chain — the offload
+        // block only runs while chain.length > 0, so the emptying pop happens exactly once (THE GATE IS
+        // THE LATCH, no flag needed) and deliveryCount is intact at this instant. 1–4 pieces says nothing.
+        // breakChain()/scatterChain() also zero deliveryCount but never reach here, so they stay silent.
+        if (game.chain.length === 0) VoiceSys.dockDelivery(game.deliveryCount);
         game.offloadTimer = DOCK_OFFLOAD_INTERVAL;
       }
     } else {
@@ -3966,6 +5117,19 @@ function drawText(str, x, y, size, color = COLOR.text, align = "center") {
   ctx.shadowBlur = 0;
 }
 
+// CS011 P2: Dan's on-screen caption — the voice channel's visible echo (settings.captions), centered near
+// the viewport bottom. In-play only (never over a menu / gameover / the title). Independent of Capture's H
+// HUD toggle by design (accessibility text, not a HUD readout) — a SIBLING of drawHUD() in draw(), not
+// inside it. Fades over the last CAPTION_FADE s via ctx.globalAlpha (drawText leaves globalAlpha alone).
+function drawCaption() {
+  if (game.state === "playing" && !game.paused && game.caption.life > 0) {
+    const a = game.caption.life < CAPTION_FADE ? game.caption.life / CAPTION_FADE : 1;
+    ctx.globalAlpha = a;
+    drawText(game.caption.text, VIEW_W/2, VIEW_H - CAPTION_Y, CAPTION_SIZE, COLOR.text, "center");
+    ctx.globalAlpha = 1;
+  }
+}
+
 // ---------- Pause menu / Options / Controls rendering (F8) ----------
 // Screen-fixed overlays, drawn after the HUD when game.paused. A dimmed backdrop plus a
 // glow-stroked panel keeps the vector aesthetic (Pillar 1). The state lives in game.menu.
@@ -3975,6 +5139,7 @@ function drawMenu() {
   const s = game.menu.screen;
   if (s === "root") drawRootMenu();
   else if (s === "options") drawOptionsMenu();
+  else if (s === "sound") drawSound();
   else if (s === "controls") drawControlsMenu();
   else if (s === "difficulty") drawDifficulty();
   else if (s === "achievements") drawAchievements();
@@ -4005,16 +5170,28 @@ function drawRootMenu() {
   drawText("↑↓ move    ENTER / A select    ESC / B back", VIEW_W / 2, y + 272, 12, COLOR.dim);
 }
 
-// v3.4 P6: rendered label-driven off MENU_OPTIONS (no hardcoded row indices), so it stays in step
-// with the label-dispatch menuOptions(). Adjustable "value" rows (the three sliders + Music Track)
-// are drawn left-aligned in a top block; the nav rows (Controls…Back) are centered below.
+// CS010 P4 (§9/§10a): now a pure nav list (Sound / Music, Controls, Achievements, High Scores,
+// Difficulty, Back) — the value rows (volume sliders + Music Track) moved to drawSound() below, so
+// this mirrors drawRootMenu's plain centered-list layout instead of the old split value/nav layout.
 function drawOptionsMenu() {
-  const { x, y } = menuPanel(600, 500, "OPTIONS");
+  const { y } = menuPanel(600, 420, "OPTIONS");
   const m = game.menu;
-  const isValueRow = label => VOL_LABELS.includes(label) || label === "Music Track";
-  let cy = y + 100;
   MENU_OPTIONS.forEach((label, i) => {
-    if (!isValueRow(label)) return;
+    const sel = m.index === i;
+    drawText((sel ? "▶ " : "   ") + label, VIEW_W / 2, y + 118 + i * 42, 22, sel ? COLOR.text : COLOR.dim);
+  });
+  drawText("↑↓ move    ENTER / A select    ESC / B back", VIEW_W / 2, y + 400, 12, COLOR.dim);
+}
+
+// Sound / Music sub-screen (CS010 P4, §9) — a relocation of the three volume sliders + Music Track
+// cycler off Options, same control style. Follows drawOptionsMenu's pre-CS010-P4 value-row layout
+// (left-aligned label + slider/value), dispatched off SOUND_ROWS by label, plus a centered Back row.
+function drawSound() {
+  const { x, y } = menuPanel(600, 602, "SOUND / MUSIC"); // CS011 P3: +92px for the Voice picker + Captions rows
+  const m = game.menu;
+  let cy = y + 100;
+  SOUND_ROWS.forEach((label, i) => {
+    if (label === "Back") return;
     const sel = m.index === i;
     drawText(label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.dim, "left");
     const vi = VOL_LABELS.indexOf(label);
@@ -4026,51 +5203,60 @@ function drawOptionsMenu() {
       ctx.fillRect(bx + 1, by + 1, (bw - 2) * AudioSys.vol[VOL_CATS[vi]], bh - 2);
       drawText(Math.round(AudioSys.vol[VOL_CATS[vi]] * 100) + "%", bx + bw + 44, cy + 6, 16, sel ? COLOR.text : COLOR.dim, "right");
       if (sel) { drawText("◄", bx - 16, cy + 7, 16, COLOR.text); drawText("►", bx + bw + 16, cy + 7, 16, COLOR.text); }
-    } else { // Music Track — a value column mirroring drawDifficulty's toggle layout
+    } else { // value-column rows — a single dispatch mirroring drawDifficulty's toggle layout
       const ox = x + 270;
-      drawText(MUSIC_TRACK_LABELS[settings.musicTrack], ox, cy + 6, 18, sel ? COLOR.text : COLOR.dim, "left");
+      let val;
+      if (label === "Music Track")   val = MUSIC_TRACK_LABELS[settings.musicTrack];
+      else if (label === "Voice")    val = VOICE_STYLE_LABELS[settings.voiceStyle];
+      else if (label === "Captions") val = settings.captions ? "On" : "Off";
+      drawText(val, ox, cy + 6, 18, sel ? COLOR.text : COLOR.dim, "left");
       if (sel) { drawText("◄", ox - 20, cy + 7, 16, COLOR.text); drawText("►", ox + 150, cy + 7, 16, COLOR.text); }
     }
     cy += 46;
   });
   cy += 14;
-  MENU_OPTIONS.forEach((label, i) => {
-    if (isValueRow(label)) return;
-    const sel = m.index === i;
-    drawText((sel ? "▶ " : "   ") + label, VIEW_W / 2, cy + 6, 22, sel ? COLOR.text : COLOR.dim);
-    cy += 38;
-  });
-  drawText("↑↓ move    ◄► adjust    ENTER / A select    ESC / B back", VIEW_W / 2, y + 480, 12, COLOR.dim);
+  const backSel = m.index === SOUND_ROWS.indexOf("Back");
+  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, cy + 6, 22, backSel ? COLOR.text : COLOR.dim);
+  drawText("↑↓ move    ◄► adjust    ENTER / A select    ESC / B back", VIEW_W / 2, y + 582, 12, COLOR.dim);
 }
 
 // Difficulty screen renderer (v3.0 P5): two two-option toggle rows + Back. The active side of each
 // toggle is lit (COLOR.text), the other dim; the selected row shows the ◄► adjust chevrons. Mirrors
 // the tested drawOptionsMenu pattern so it inherits the same vector-panel look.
 function drawDifficulty() {
-  const { x, y } = menuPanel(620, 360, "DIFFICULTY");
+  // Panel grown +58 (from 360) vs. pre-CS012-P5 to seat the third value row (Auto-shield); Back and the
+  // help/hint lines shift down by the same 58 so the layout below the rows is unchanged in spirit.
+  const { x, y } = menuPanel(620, 418, "DIFFICULTY");
   const m = game.menu;
+  // Each row draws as "left | right" with the ACTIVE side lit. rightActive=true lights the right label.
   const rows = [
-    { label: "Shot powerups expire", value: settings.shotPowerupMode, right: "shots"  },
-    { label: "Magnet expires",       value: settings.magnetMode,       right: "pieces" },
+    { label: "Shot powerups expire", left: "Time", right: "Shots",  rightActive: settings.shotPowerupMode === "shots" },
+    { label: "Magnet expires",       left: "Time", right: "Pieces", rightActive: settings.magnetMode === "pieces" },
+    { label: "Auto-shield",          left: "Off",  right: "On",     rightActive: settings.autoShield },
   ];
   rows.forEach((r, i) => {
     const sel = m.index === i, cy = y + 122 + i * 58;
     drawText(r.label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.dim, "left");
-    const timeOn = r.value === "time";
-    const ox = x + 360, rightLabel = r.right === "shots" ? "Shots" : "Pieces";
-    drawText("Time",     ox,       cy + 6, 18, timeOn ? COLOR.text : COLOR.dim, "left");
-    drawText("|",        ox + 74,  cy + 6, 18, COLOR.dim, "left");
-    drawText(rightLabel, ox + 92,  cy + 6, 18, timeOn ? COLOR.dim : COLOR.text, "left");
+    const ox = x + 360;
+    drawText(r.left,  ox,       cy + 6, 18, r.rightActive ? COLOR.dim : COLOR.text, "left");
+    drawText("|",     ox + 74,  cy + 6, 18, COLOR.dim, "left");
+    drawText(r.right, ox + 92,  cy + 6, 18, r.rightActive ? COLOR.text : COLOR.dim, "left");
     if (sel) { drawText("◄", ox - 24, cy + 7, 16, COLOR.text); drawText("►", ox + 178, cy + 7, 16, COLOR.text); }
   });
-  const backSel = m.index === 2;
-  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 262, 22, backSel ? COLOR.text : COLOR.dim);
-  drawText("Time = today's 15-second timer.   Shots / Pieces = expire by use, not the clock.", VIEW_W / 2, y + 306, 12, COLOR.dim);
-  drawText("↑↓ move    ◄► toggle    ENTER / A select    ESC / B back", VIEW_W / 2, y + 336, 12, COLOR.dim);
+  // Per-row help line under the rows — describes the FOCUSED row only (Back has no help line).
+  const HELP = [
+    "Time = today's 15-second timer.   Shots = expire by use, not the clock.",
+    "Time = today's 15-second timer.   Pieces = expire by use, not the clock.",
+    "Auto-raises shield at critical hull. -500 points per blocked hit.",
+  ];
+  const backSel = m.index === 3;
+  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 320, 22, backSel ? COLOR.text : COLOR.dim);
+  drawText(m.index < HELP.length ? HELP[m.index] : "", VIEW_W / 2, y + 364, 12, COLOR.dim);
+  drawText("↑↓ move    ◄► toggle    ENTER / A select    ESC / B back", VIEW_W / 2, y + 394, 12, COLOR.dim);
 }
 
 function drawControlsMenu() {
-  const { x, y } = menuPanel(760, 470, "CONTROLS");
+  const { x, y } = menuPanel(760, 512, "CONTROLS");   // +42px vs. pre-CS010 to seat the Ship Rotation slider row
   const m = game.menu;
   drawText("ACTION", x + 36, y + 88, 13, COLOR.dim, "left");
   drawText("KEYBOARD", x + 250, y + 88, 13, COLOR.dim, "left");
@@ -4084,10 +5270,37 @@ function drawControlsMenu() {
     drawBindCell(x + 250, ry, keyLabel(bindings[name]), rowSel && m.col === 0, capKb);
     drawBindCell(x + 490, ry, padLabel(bindings[name]), rowSel && m.col === 1, capGp);
   });
-  const dRow = REBINDABLE.length, bRow = dRow + 1;
+  // Ship Rotation slider (§10b): a ◄/► value row below the rebind rows. Row index derived from
+  // REBINDABLE.length so it stays in lockstep with menuControls' turnRow (never hardcode it).
+  const turnRow = REBINDABLE.length;
+  drawTurnScaleRow(x, y + 122 + turnRow * 42, m.row === turnRow);
+  const dRow = REBINDABLE.length + 1, bRow = dRow + 1;
   drawText((m.row === dRow ? "▶ " : "   ") + "Return to Defaults", VIEW_W / 2, y + 122 + dRow * 42 + 26, 20, m.row === dRow ? COLOR.text : COLOR.dim);
   drawText((m.row === bRow ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 122 + bRow * 42 + 26, 20, m.row === bRow ? COLOR.text : COLOR.dim);
-  drawText("↑↓ row    ◄► column    ENTER / A rebind    ESC / B back", VIEW_W / 2, y + 452, 12, COLOR.dim);
+  drawText("↑↓ row    ◄► column / rotation    ENTER / A rebind    ESC / B back", VIEW_W / 2, y + 494, 12, COLOR.dim);
+}
+
+// One slider row for the ship-rotation preference on the Controls screen (§10b). Readout is a
+// PERCENTAGE (the raw rad/s means nothing to a player). A gold tick marks the 100% default so "home"
+// is visible WITHOUT moving the slider; the fill + readout also go gold and gain a "(default)" tag
+// when the value sits exactly on 100%. Menu rects are exempt from the HUD no-fills rule — this mirrors
+// the volume slider in drawOptionsMenu.
+function drawTurnScaleRow(x, ry, sel) {
+  drawText("Ship Rotation", x + 36, ry, 17, sel ? COLOR.text : COLOR.dim, "left");
+  const bx = x + 250, bw = 200, bh = 12, by = ry - 11;
+  const span = SHIP_TURN_SCALE_MAX - SHIP_TURN_SCALE_MIN;
+  const frac = (settings.shipTurnScale - SHIP_TURN_SCALE_MIN) / span;
+  const atDefault = Math.abs(settings.shipTurnScale - SHIP_TURN_SCALE_DEFAULT) < 1e-6;
+  ctx.strokeStyle = sel ? COLOR.shield : COLOR.dim; ctx.lineWidth = 1;
+  ctx.strokeRect(bx, by, bw, bh);
+  ctx.fillStyle = atDefault ? COLOR.ach : (sel ? COLOR.shield : COLOR.dim);
+  ctx.fillRect(bx + 1, by + 1, (bw - 2) * frac, bh - 2);
+  const tx = bx + bw * ((SHIP_TURN_SCALE_DEFAULT - SHIP_TURN_SCALE_MIN) / span);  // 100% tick — always drawn
+  ctx.strokeStyle = COLOR.ach; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(tx, by - 4); ctx.lineTo(tx, by + bh + 4); ctx.stroke();
+  const pct = Math.round(settings.shipTurnScale * 100) + "%";
+  drawText(atDefault ? pct + "  (default)" : pct, bx + bw + 30, ry, 16, atDefault ? COLOR.ach : (sel ? COLOR.text : COLOR.dim), "left");
+  if (sel) { drawText("◄", bx - 20, ry + 1, 16, COLOR.text); drawText("►", bx + bw + 8, ry + 1, 16, COLOR.text); }
 }
 
 // One binding cell on the Controls screen. Highlights when selected; shows "press…" while capturing.
@@ -4168,22 +5381,30 @@ function drawAchRow(ach, x, ry, w) {
 // COLOR.ach) and the browsable system-menu "High Scores" screen (highlightId null, nothing lit).
 // Crash-free on an empty, partial, or full HighScores.entries: a missing row just shows a bare dim
 // rank number instead of a record.
-function drawScoreTable(cx, topY, highlightId) {
-  const colRank = cx - 230, colInit = cx - 170, colScore = cx + 10, colWave = cx + 130, colDeliv = cx + 230;
-  drawText("#", colRank, topY, 13, COLOR.dim, "left");
-  drawText("INITIALS", colInit, topY, 13, COLOR.dim, "left");
-  drawText("SCORE", colScore, topY, 13, COLOR.dim, "right");
-  drawText("LEVEL", colWave, topY, 13, COLOR.dim, "right");
-  drawText("DELIVERED", colDeliv, topY, 13, COLOR.dim, "right");
+// `scale` (CS010 P5, §8a) multiplies every font size, the row pitch/header offset, AND the column
+// x-offsets (bigger glyphs need wider columns). Defaults to 1 (the gameover caller, unchanged: its
+// layout is already tight against "PRESS ENTER TO PLAY AGAIN"/the O-hint below it, and the fresh
+// entry is already highlighted gold there, so it doesn't need the bigger type to stand out). The
+// browsable screen (drawHighScores) passes 1.8 — don't unify the two callers, the gameover table
+// has no room to grow without re-flowing that screen (a separate, un-scoped job — see STATUS.md).
+function drawScoreTable(cx, topY, highlightId, scale = 1) {
+  const colRank = cx - 230 * scale, colInit = cx - 170 * scale, colScore = cx + 10 * scale,
+        colWave = cx + 130 * scale, colDeliv = cx + 230 * scale;
+  const fontHeader = 13 * scale, fontRow = 13 * scale, rowPitch = 18 * scale, headerOffset = 22 * scale;
+  drawText("#", colRank, topY, fontHeader, COLOR.dim, "left");
+  drawText("INITIALS", colInit, topY, fontHeader, COLOR.dim, "left");
+  drawText("SCORE", colScore, topY, fontHeader, COLOR.dim, "right");
+  drawText("LEVEL", colWave, topY, fontHeader, COLOR.dim, "right");
+  drawText("DELIVERED", colDeliv, topY, fontHeader, COLOR.dim, "right");
   for (let i = 0; i < SCORES_MAX; i++) {
-    const r = HighScores.entries[i], ry = topY + 22 + i * 18;
-    if (!r) { drawText((i + 1) + ".", colRank, ry, 13, COLOR.dim, "left"); continue; }
+    const r = HighScores.entries[i], ry = topY + headerOffset + i * rowPitch;
+    if (!r) { drawText((i + 1) + ".", colRank, ry, fontRow, COLOR.dim, "left"); continue; }
     const col = r.id === highlightId ? COLOR.ach : COLOR.text;
-    drawText((i + 1) + ".", colRank, ry, 13, col, "left");
-    drawText(r.initials, colInit, ry, 13, col, "left");
-    drawText(fmtCommas(r.score), colScore, ry, 13, col, "right");
-    drawText(String(r.wave), colWave, ry, 13, col, "right");
-    drawText(String(r.delivered), colDeliv, ry, 13, col, "right");
+    drawText((i + 1) + ".", colRank, ry, fontRow, col, "left");
+    drawText(r.initials, colInit, ry, fontRow, col, "left");
+    drawText(fmtCommas(r.score), colScore, ry, fontRow, col, "right");
+    drawText(String(r.wave), colWave, ry, fontRow, col, "right");
+    drawText(String(r.delivered), colDeliv, ry, fontRow, col, "right");
   }
 }
 
@@ -4205,12 +5426,19 @@ function drawEntrySlots(cy) {
   drawText("↑↓ letter    ←→ move    ENTER confirm", VIEW_W / 2, cy + 60, 12, COLOR.dim);
 }
 
-// Browsable top-10 table reachable from the system menu (title/gameover -> "High Scores"). Read-only,
-// like drawAchievements — reuses drawScoreTable with no highlight.
+// Browsable top-10 table, nested under Options (CS010 P4 §8b) — reachable from both the system menu
+// (title/gameover -> Options -> High Scores) and the pause menu mid-game. Read-only, like
+// drawAchievements — reuses drawScoreTable with no highlight.
+// CS010 P5 (§8a): rendered at HS_TABLE_SCALE (180%) — this screen, unlike the gameover table, has no
+// competing content below it, so the panel grows to fit rather than shrinking the type. Panel/offsets
+// below are hand-computed for the 1.8 scale (header 22*1.8=39.6, pitch 18*1.8=32.4, 10 rows -> last
+// row baseline at topY+331.2); if HS_TABLE_SCALE ever changes, re-derive topY/footer/panel h by hand.
+const HS_TABLE_SCALE = 1.8;
 function drawHighScores() {
-  const { y } = menuPanel(640, 460, "HIGH SCORES");
-  drawScoreTable(VIEW_W / 2, y + 90, null);
-  drawText("ESC / B / ENTER  return", VIEW_W / 2, y + 420, 12, COLOR.dim);
+  const { y } = menuPanel(1000, 560, "HIGH SCORES");
+  const topY = y + 120;
+  drawScoreTable(VIEW_W / 2, topY, null, HS_TABLE_SCALE);
+  drawText("ESC / B / ENTER  return", VIEW_W / 2, y + 497, 12, COLOR.dim);
 }
 
 // Non-blocking unlock banners at top-center. Fade in then out; stack downward if several land at once.
@@ -4329,6 +5557,9 @@ function draw() {
     if (Math.floor(performance.now() / 600) % 2 === 0)
       drawText("PRESS ENTER TO START", VIEW_W/2, VIEW_H/2 + 180, 26);
     drawText("OPTIONS / ACHIEVEMENTS: O    (controller: B)", VIEW_W/2, VIEW_H/2 + 220, 14, COLOR.ach);
+    // CS010 P0 — build stamp, lower-right corner. Not a design element: small, dim, out of the way.
+    drawText("v" + GAME_VERSION, VIEW_W - VERSION_STAMP_INSET_X, VIEW_H - VERSION_STAMP_INSET_Y,
+              12, COLOR.dim, "right");
     // decorative drifting debris lives in screen space (its own tiny wrapped field)
     titleDebris.forEach(a => {
       a.update(1/60);
@@ -4338,7 +5569,7 @@ function draw() {
       if (a.y > VIEW_H + 60) a.y -= VIEW_H + 120;
       a.draw();
     });
-    if (game.paused) drawMenu();  // system menu (Options/Achievements) overlays the title (v3.0 P4)
+    if (game.paused) drawMenu();  // the menu (Options + its sub-screens) overlays the title (v3.0 P4; CS012 P4)
     drawToasts();                 // keep unlock banners on top even on the title
     return;
   }
@@ -4382,6 +5613,7 @@ function draw() {
   // Capture tools (P/O/H — see the block comment above the Capture object) toggle visibility
   // of this call only; the game keeps simulating/updating regardless of hudVisible.
   if (Capture.hudVisible) drawHUD();
+  drawCaption(); // CS011 P2: sibling of drawHUD (NOT inside it) — captions show regardless of the H toggle
 
   if (game.state === "gameover") {
     drawText("GAME OVER", VIEW_W/2, VIEW_H/2 - 20, 56);
@@ -4411,6 +5643,34 @@ function draw() {
 // block comment above the Capture object) only ever hides the always-on overlay, never anything
 // modal or transient.
 function drawHUD() {
+  // CS010 P3 — low-health CORNER GLOW (§5, FORK-3 = FILL; a NAMED GDD §3.2 fills-exception, Paul signed
+  // off). A peripheral-vision alarm: four radial-gradient corner fills in the low-health red. It engages
+  // on the EXACT SAME predicate as the siren (game.lowHpSiren) and pulses IN PHASE with the critical-hull
+  // ring and the siren — all read game.lowHpPhase, one instrument. It NEVER reads a Web Audio LFO value:
+  // the phase is a game-side accumulator, so the glow renders even with audio unavailable (ctx null, no
+  // user gesture yet). WHY A FILL, not a glowStroke arc: a corner-of-the-eye alarm is low-frequency,
+  // large-area and EDGELESS by definition — that is what makes it readable without competing for focus.
+  // A glowStroke arc is a LINE (high-frequency, small-area) that would read as a THIRD red HUD element
+  // beside the two red rings — the very noise this phase exists to remove — and it is more expensive
+  // (glowStroke is shadowBlur, the renderer's hot spot; four blurred arcs would burn it in the busiest
+  // frames). Drawn FIRST so the HUD readouts paint crisply over it. Lives in drawHUD() so Capture's H key
+  // hides it and P exports a clean frame. Intensity scales with t (BRIGHTER near death) AND the shared
+  // pulse — never merely faster. Alpha rides the gradient stop, so this block NEVER touches globalAlpha
+  // (it can't leak). Two corners (top-right rings, bottom-left powerup rows) are occupied; the radius is
+  // sized to FRAME rather than fight — a PLAYTEST KNOB (STATUS.md).
+  if (game.lowHpSiren) {
+    const gt = clamp01(1 - game.ship.hp / LOW_HP_THRESHOLD);            // HP urgency, the same t the siren uses
+    const gpulse = 0.6 + 0.4 * Math.sin(game.lowHpPhase);              // shared phase → locked to the hull ring + siren
+    const peak = (LOWHP_GLOW_ALPHA_MIN + (LOWHP_GLOW_ALPHA_MAX - LOWHP_GLOW_ALPHA_MIN) * gt) * gpulse;
+    const R = LOWHP_GLOW_RADIUS;
+    for (const c of [[0, 0], [VIEW_W, 0], [0, VIEW_H], [VIEW_W, VIEW_H]]) {
+      const grad = ctx.createRadialGradient(c[0], c[1], 0, c[0], c[1], R);
+      grad.addColorStop(0, `rgba(${LOWHP_GLOW_RGB},${peak})`);
+      grad.addColorStop(1, `rgba(${LOWHP_GLOW_RGB},0)`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(Math.max(0, c[0] - R), Math.max(0, c[1] - R), R, R);
+    }
+  }
   drawText(String(game.score).padStart(6, "0"), 30, 46, 30, COLOR.text, "left");
   // v3.3 P1 (spec §7): "LEVEL" is the player-facing label for game.wave — moved from the dim,
   // easy-to-miss top-right corner into the left column, lit like the other HUD readouts. game.wave /
@@ -4418,71 +5678,157 @@ function drawHUD() {
   // a display label only ("level" is player-facing vocabulary, "wave" stays the code term).
   drawText("LEVEL " + game.wave, 30, 62, 22, COLOR.text, "left");
 
-  // v3.6 P4: HUD left column, top to bottom — Score, Level, Hull, Shield, Cargo, Powerups. A local
-  // layout cursor replaces the old bare-literal row offsets.
-  let row = 104;
+  // CS009 P2: the hull + shield fill bars are gone from the left column — they are now the HULL ring in
+  // the top-right corner (drawn below). Left column top-to-bottom is now Score, Level, Cargo, Powerups.
 
-  // hull HP bar. At max HP a Health pickup would be wasted, so full hull gets an unmistakable gold
-  // fill + MAX tag instead of reading as "just another full bar" (FLAG-E).
-  const hpw = 140, hph = 8, hpx = 92, hpy = row - 6;
-  ctx.strokeStyle = COLOR.dim;
-  ctx.lineWidth = 1;
-  ctx.strokeRect(hpx, hpy, hpw, hph);
-  const hp = Math.max(0, game.ship.hp), hpFrac = hp / SHIP_MAX_HP;
-  const hpMax = game.ship.hp >= SHIP_MAX_HP;
-  ctx.fillStyle = hpMax ? COLOR.ach : (hpFrac > 0.3 ? COLOR.text : "#ff7060");
-  ctx.fillRect(hpx + 1, hpy + 1, (hpw - 2) * hpFrac, hph - 2);
-  drawText("HULL", hpx - 12, hpy + 8, 13, COLOR.dim, "right");
-  if (hpMax) drawText("MAX", hpx + hpw + 10, hpy + 8, 13, COLOR.ach, "left");
-  row += 26;
-
-  // shield energy bar — moved out of the top-right corner into the left column, beneath hull (v3.6 P4).
-  const shw = 140, shh = 8, shx = 92, shy = row - 6;
-  ctx.strokeStyle = COLOR.dim;
-  ctx.lineWidth = 1;
-  ctx.strokeRect(shx, shy, shw, shh);
-  ctx.fillStyle = game.ship.energy > 0.25 ? COLOR.text : "#ff7060";
-  ctx.fillRect(shx + 1, shy + 1, (shw - 2) * game.ship.energy, shh - 2);
-  drawText("SHIELD", shx - 12, shy + 8, 13, COLOR.dim, "right");
-  row += 22;
-
-  drawText("CARGO " + game.chain.length + "/" + game.cargoMax, 30, row, 16,
-    game.chain.length ? COLOR.text : COLOR.dim, "left");
-  row += 26;
-
-  // active-powerup row (F6): one row per running effect — a small type glyph + a shield-bar-style
-  // remaining bar. Health is instant, so it never appears here. v3.0 P5: one renderer, two data
-  // sources — in count mode ("shots"/"pieces") budgets bank (v3.6 P4) with no ceiling to draw a bar
-  // against, so it's glyph + plain number only; in time mode it's the remaining-duration fraction,
-  // already clamp01'd so a banked surplus is simply invisible (accepted behaviour).
-  for (const t of POWERUP_DROP_TYPES) {          // rapid / triple / magnet / engine (stable order)
-    if (!powerActive(t)) continue;
-    const c = POWERUP_COLOR[t];
-    const counted = powerMode(t) !== "time";
-    drawPowerupGlyph(t, 40, row, 9, c);
-    if (counted) {
-      drawText(String(game.powerBudget[t]), 58, row + 4, 16, c, "left"); // shots/pieces left, no bar
-    } else {
-      const frac = game.powerFx[t] / powerDuration(t);
-      const pw = 96, ph = 6, ppx = 58, ppy = row - 3;
-      ctx.strokeStyle = COLOR.dim; ctx.lineWidth = 1;
-      ctx.strokeRect(ppx, ppy, pw, ph);
-      ctx.fillStyle = c;
-      ctx.fillRect(ppx + 1, ppy + 1, (pw - 2) * clamp01(frac), ph - 2);
-    }
-    row += 20;
+  // HULL ring (top-right). FORK-1 A: one "ship status" element, two concentric arcs (hull outer,
+  // shield inner) around a ship glyph. Everything strokes through drawRingArc/glowStroke — no fills.
+  // STATE is read from the TRUE game.ship.hp so the color flips the instant a hit lands; the hull ARC
+  // reads the eased game.hudHull so the fill drains/fills ~0.35s behind, reading as a drain, not a jump.
+  // Precedence MAX > Critical > Normal (mutually exclusive). The shield arc is NEVER state-colored —
+  // it is a separate resource and must not get swept into a hull warning.
+  const hpMax = game.ship.hp >= SHIP_MAX_HP;                 // full hull → a Health pickup is wasted (FLAG-E)
+  const hpCrit = game.ship.hp <= LOW_HP_THRESHOLD;           // same threshold as the siren + low-HP chevron
+  const hullColor = hpMax ? COLOR.ach : (hpCrit ? COLOR.lowhp : COLOR.hp);
+  // full-circle track, no glow (drawn direct, not via drawRingArc — that helper is arc-only).
+  ctx.beginPath();
+  ctx.arc(HUD_HULL_CX, HUD_RING_CY, HUD_RING_R, 0, TAU);
+  ctx.strokeStyle = COLOR.dim; ctx.lineWidth = HUD_RING_TRACK_W; ctx.stroke();
+  // shield arc: concentric, inside the hull ring, thinner, own color, NOT eased (energy is already
+  // continuous) and NOT pulsed — drawn at full alpha before the pulse is applied below.
+  drawRingArc(HUD_HULL_CX, HUD_RING_CY, HUD_RING_R - HUD_SHIELD_R_GAP,
+    game.ship.energy, COLOR.shield, HUD_RING_TRACK_W + 1);
+  // hull arc + ship glyph pulse together, only when Critical. CS010 P3: the pulse now reads the SHARED
+  // game.lowHpPhase accumulator (rate = lowhpPulseRate(t), advanced in update()), so the hull ring, the
+  // corner glow and the audio siren are ONE alarm at ONE HP-ramped rate. This REVERSES CS009's deliberate
+  // flat-rate choice (Paul signed off): CS009 kept the visual flat because the siren already ramped, but
+  // two red pulses beating in and out of phase is the noise §5 exists to remove. HUD_PULSE_HZ still drives
+  // the NON-HP pulses (cargo-gold, powerup low-timer); only elements keyed on LOW_HP_THRESHOLD read the
+  // ramped rate. While paused the phase freezes, so this shows a static alpha — correct (see update()).
+  if (hpCrit && !hpMax) {
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(game.lowHpPhase);
   }
-  // SCOOP level pips (v3.3 P3) — a PERSISTENT upgrade, NOT a timed bar, so it's deliberately drawn
-  // OUTSIDE the powerActive/POWERUP_DROP_TYPES loop above. Filled pips = current level; hidden at 0.
-  if (game.scoopLevel > 0) {
-    drawText("SCOOP", 40, row + 4, 13, POWERUP_COLOR.scoop, "left");
-    for (let i = 0; i < SCOOP_MAX_LEVEL; i++) {
-      ctx.beginPath();
-      ctx.arc(108 + i * 16, row, 4, 0, TAU);
-      if (i < game.scoopLevel) { ctx.fillStyle = POWERUP_COLOR.scoop; ctx.fill(); }
-      else { ctx.strokeStyle = COLOR.dim; ctx.lineWidth = 1; ctx.stroke(); }
+  // CS010 P3: relief EXHALE — a geometry-only (radius + width) NON-pulsing pop on the hull VALUE arc when
+  // low-health just cleared with the ship alive, decaying to normal over LOWHP_RELIEF_FLASH. The alarm WAS
+  // the pulse; the relief is its absence plus one clean exhale. Color is deliberately UNTOUCHED: hpCrit is
+  // already false here, so hullColor is back to COLOR.hp (and the hpMax gold case still wins) — geometry
+  // composes with that precedence chain for free, adds no new color semantics, and never touches
+  // globalAlpha (so it can't leak). Idioms reused verbatim: HUD_BANK_POP's fractional-radius pop and the
+  // cargo cap-up's +2 width bump. The dim track stays at HUD_RING_R, so the arc visibly swells past it and
+  // settles back.
+  const reliefK = game.hpReliefFlash > 0 ? game.hpReliefFlash / LOWHP_RELIEF_FLASH : 0;
+  const hullArcR = HUD_RING_R * (1 + HUD_BANK_POP * reliefK);
+  const hullArcW = HUD_RING_W + 2 * reliefK;
+  drawRingArc(HUD_HULL_CX, HUD_RING_CY, hullArcR, clamp01(game.hudHull), hullColor, hullArcW);
+  drawPoly(HUD_SHIP_GLYPH, HUD_HULL_CX, HUD_RING_CY, -Math.PI / 2, hullColor);
+  ctx.globalAlpha = 1;   // ALWAYS restore — a leaked alpha would tint the rest of the frame
+  drawText("HULL", HUD_HULL_CX, HUD_RING_LABEL_Y, 13, COLOR.dim, "center");
+
+  // CARGO ring (top-right, beside HULL). FORK-2 A: game.cargoMax is NOT a constant — it grows
+  // CARGO_BASE->CARGO_CAP_MAX at runtime (+1 per CARGO_GROW_PER delivered), so the fraction and the
+  // "/N" label both read it live every frame; never cache it, never substitute a literal.
+  const cargoFull = game.chain.length >= game.cargoMax;
+  // Full-cap or a fresh cap-up both mean gold — same idiom as the HULL ring's MAX state: gold means
+  // exactly one thing across the whole HUD, "this resource is at its cap; more is wasted."
+  const cargoGold = cargoFull || game.cargoFlash > 0;
+  const cargoColor = cargoGold ? COLOR.ach : COLOR.text;
+  const cargoRingW = game.cargoFlash > 0 ? HUD_RING_W + 2 : HUD_RING_W;
+  ctx.beginPath();
+  ctx.arc(HUD_CARGO_CX, HUD_RING_CY, HUD_RING_R, 0, TAU);
+  ctx.strokeStyle = COLOR.dim; ctx.lineWidth = HUD_RING_TRACK_W; ctx.stroke();
+  if (cargoGold) {
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(performance.now() / 1000 * TAU * HUD_PULSE_HZ);
+  }
+  drawRingArc(HUD_CARGO_CX, HUD_RING_CY, HUD_RING_R, clamp01(game.chain.length / game.cargoMax),
+    cargoColor, cargoRingW);
+  drawText(String(game.chain.length), HUD_CARGO_CX, HUD_RING_CY - 4, 20,
+    game.chain.length ? COLOR.text : COLOR.dim, "center");
+  drawText("/" + game.cargoMax, HUD_CARGO_CX, HUD_RING_CY + 14, 11, COLOR.dim, "center");
+  ctx.globalAlpha = 1;   // ALWAYS restore — a leaked alpha would tint the rest of the frame
+  drawText("CARGO", HUD_CARGO_CX, HUD_RING_LABEL_Y, 13, COLOR.dim, "center");
+
+  // CS009 P4: active-powerup ROWS (F6, spec §5) — each effect is a ring + glyph + label + number,
+  // matching the HULL/CARGO ring idiom. Health is instant so it never appears here; Scoop is
+  // persistent (its own segmented-ring row below). Rows are iterated in the stable POWERUP_DROP_TYPES
+  // order — that order is load-bearing (do not inline it), so a type's row never moves.
+  //
+  // CS012 P2: rows are ALWAYS shown at a FIXED y (row i sits at HUD_FX_BASE_Y - (i+1)*HUD_FX_ROW_H,
+  // i = index in POWERUP_DROP_TYPES) — activating/expiring a powerup no longer moves any other row,
+  // because nothing is compacted anymore (the old `slot` cursor + `!powerActive(t) continue` skip are
+  // gone). An inactive row is a muted track: dim glyph/label/number, no value arc, no low pulse, no
+  // bank pop. Row index 0 (y = HUD_FX_BASE_Y) is RESERVED for the SCOOP segmented ring below; the four
+  // timed rows float above it, i = 0..3.
+  for (let i = 0; i < POWERUP_DROP_TYPES.length; i++) {
+    const t = POWERUP_DROP_TYPES[i];
+    const y = HUD_FX_BASE_Y - (i + 1) * HUD_FX_ROW_H;
+    const active = powerActive(t);
+    // v3.0 P5 dual data source: time mode expires on a clock (powerFx sec), count mode on a budget
+    // (powerBudget shots/pieces) chosen per-type from player settings — powerMode(t) is the switch.
+    const counted = powerMode(t) !== "time";
+    // TRAP 3 / FORK-5: count mode has no denominator, so it has no value arc — only the dim track (so
+    // the row's SHAPE is identical across modes), the glyph, and the raw budget number. A low-timer
+    // warning is a deadline; a budget of 2 shots is not (FLAG-E), so count mode never state-colors.
+    let color = active ? POWERUP_COLOR[t] : COLOR.dim;
+    const low = active && !counted && game.powerFx[t] <= HUD_FX_LOW;   // time mode only, active only
+    if (low) color = COLOR.lowhp;                            // ring + label + seconds all shift + pulse
+    // dim full-circle track, always drawn (no glow, drawn direct — drawRingArc is arc-only), so every
+    // row reads as the same object whether it's an arc-bearing timer, a countless budget, or inactive.
+    ctx.beginPath();
+    ctx.arc(40, y, HUD_FX_RING_R, 0, TAU);
+    ctx.strokeStyle = COLOR.dim; ctx.lineWidth = HUD_RING_TRACK_W; ctx.stroke();
+    if (active) {
+      // low-timer pulse: reuse Phase 2's exact idiom + HUD_PULSE_HZ. Wraps the value arc, glyph, and
+      // text; restored to 1 immediately after so it can't leak into the next row or the rest of the frame.
+      if (low) ctx.globalAlpha = 0.6 + 0.4 * Math.sin(performance.now() / 1000 * TAU * HUD_PULSE_HZ);
+      if (!counted) {
+        // TRAP 1: the denominator DIFFERS by type — powerDuration(t) is 30 for magnet, 15 for the rest.
+        // Call the function; never POWERUP_DURATION directly, or the magnet ring renders permanently full.
+        const frac = game.powerFx[t] / powerDuration(t);
+        // TRAP 2 / FORK-3 A: banking makes powerFx exceed the denominator (a double-banked Rapid = 30s /
+        // 15s = 2.0). Main arc = clamp01(frac); if frac > 1, a second, thinner arc at HUD_FX_RING_R + 4
+        // shows the overcharge (clamp01(frac - 1)) — a full ring with a halo, so the surplus stays legible
+        // instead of pinning the ring at 100% for 15 straight seconds (which reads as broken).
+        drawRingArc(40, y, HUD_FX_RING_R, clamp01(frac), color, 3);
+        if (frac > 1) drawRingArc(40, y, HUD_FX_RING_R + 4, clamp01(frac - 1), color, 2);
+      }
     }
-    row += 20;
+    // glyph dead center of the ring — the shipped double-chevron/fan/horseshoe/bell set (L2411), already
+    // the field-pickup icons; the brief's chevron/diamond are superseded. Same call the shipped HUD made.
+    drawPowerupGlyph(t, 40, y, HUD_FX_GLYPH_R, color);
+    // label + number to the right of the ring. In count mode the number is the raw budget (no "s"); in
+    // time mode it's Math.ceil(powerFx) + "s" — CEIL, not round, so a ring reading "1s" hasn't expired.
+    // Inactive rows leave powerFx/powerBudget at their idle 0, so this collapses to "0s"/"0" unchanged —
+    // no special-casing needed.
+    const num = counted ? String(game.powerBudget[t]) : Math.ceil(game.powerFx[t]) + "s";
+    drawText(POWERUP_LABEL[t], 64, y - 4, 13, color, "left");
+    drawText(num, 64, y + 14, 16, color, "left");
+    ctx.globalAlpha = 1;   // ALWAYS restore — a leaked alpha would tint the next row / rest of the frame
+
+    // CS009 P5: bank feedback — a same-type pickup while already active pops the ring 25% and settling,
+    // plus a fading "+Ns" badge to the right of the number, over HUD_BANK_FLASH sec.
+    if (active && game.powerBank[t] > 0) {
+      const k = game.powerBank[t] / HUD_BANK_FLASH; // 1 -> 0
+      ctx.beginPath();
+      ctx.arc(40, y, HUD_FX_RING_R * (1 + HUD_BANK_POP * k), 0, TAU);
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+      ctx.globalAlpha = k;
+      drawText("+" + game.powerBankAmt[t] + (counted ? "" : "s"), 104, y + 14, 16, COLOR.ach, "left");
+      ctx.globalAlpha = 1;   // ALWAYS restore
+    }
+  }
+  // SCOOP segmented ring (CS012 P2) — a PERSISTENT upgrade, NOT a timed effect, so it's deliberately
+  // drawn OUTSIDE the POWERUP_DROP_TYPES loop above (game.scoopLevel is not in powerFx/powerBudget and
+  // never expires on a clock). Row index 0 (y = HUD_FX_BASE_Y), the stable floor of the bottom-left
+  // stack — the persistent upgrade anchors the bottom, the four timed rows (i = 0..3, above) float
+  // above it. ALWAYS drawn, even at level 0 (dim track, 0 lit segments) — matches the timed rows'
+  // always-shown-muted-when-idle treatment; segment count derives from SCOOP_MAX_LEVEL, never hardcoded.
+  // STROKE ONLY — the old pip row's fill dot is gone (GDD §3.2 no-fills exception list update).
+  {
+    const scoopY = HUD_FX_BASE_Y;
+    drawRingSegments(40, scoopY, HUD_FX_RING_R, SCOOP_MAX_LEVEL, game.scoopLevel,
+      POWERUP_COLOR.scoop, COLOR.dim);
+    drawText("SCOOP", 64, scoopY - 4, 13, POWERUP_COLOR.scoop, "left");
+    drawText(String(game.scoopLevel), 64, scoopY + 14, 16, POWERUP_COLOR.scoop, "left");
   }
   // when hauling, a chevron orbiting screen-center points toward the (maybe off-screen) dock
   if (game.chain.length && game.dock && !game.ship.dead) {
@@ -4620,10 +5966,20 @@ function loop(now) {
 // v3.4 P7: "playing" now routes to the player's SELECTED gameplay track (settings.musicTrack), not a
 // generic "play" bucket. This makes a mid-game track switch (Options, pause menu) fall straight out
 // of setState()'s existing crossfade — the state string just changes to a different track name.
-function musicStateFor(s) { return s === "playing" ? settings.musicTrack : s === "title" ? "title" : "off"; }
+// CS010 P7: the High Scores screen is a MENU (game.paused), so game.state alone can't name it —
+// consult the active menu screen first. Reading game.menu here is in-idiom (the function already
+// reads the settings module global). Switching in/out is then a normal setState() crossfade — no
+// new track-switch path. Every OTHER combination is byte-identical to the pre-P7 mapping.
+function musicStateFor(s) {
+  if (game.paused && game.menu.screen === "highscores") return "highscore";
+  return s === "playing" ? settings.musicTrack : s === "title" ? "title" : "off";
+}
 function updateMusic() {
   MusicSys.setState(musicStateFor(game.state));
-  MusicSys.setDuck(menuActive());
+  // CS010 P7: menu ducking (50%) exists to make room for gameplay audio under an overlaid menu. The
+  // High Scores screen has its OWN full-level track and nothing beneath it, so exempt it — otherwise
+  // a track that plays only while a menu is open would be permanently ducked. setDuck is idempotent.
+  MusicSys.setDuck(menuActive() && game.menu.screen !== "highscores");
   MusicSys.update();
 }
 
