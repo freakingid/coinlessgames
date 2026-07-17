@@ -129,6 +129,7 @@ const SHIELD_RECHARGE = 0.12;   // energy/sec while off
 const SHIELD_HIT_COST = 0.22;   // energy per deflection
 const SHIELD_RADIUS = 26;
 const AUTO_SHIELD_SCORE_PENALTY = 500; // PLAYTEST KNOB — score lost per auto-save. Flat (FLAG-4d).
+const AUTO_SHIELD_REGEN_PAUSE = 1.0; // sec — passive regen freezes this long after an auto-save. PLAYTEST KNOB (>= HIT_STUN_DURATION guarantees no recharge between i-frame end and next hit).
 
 const DEBRIS_SPEEDS = { 3: 70, 2: 110, 1: 160 };  // base drift speed by size
 const DEBRIS_RADII  = { 3: 46, 2: 26, 1: 13 };
@@ -239,7 +240,7 @@ const SCORES_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 // Minor = tweaks to existing systems. Patch = bug fixes, where "bug" includes the game not doing what
 // the design intends. Changeset = the CS### number, monotonically increasing, never resets — the 4th
 // segment IS the changeset number (this build shipped in CS010).
-const GAME_VERSION = "1.0.0.12";
+const GAME_VERSION = "1.0.0.13";
 const VERSION_STAMP_INSET_X = 16; // px in from the right edge of the viewport (title screen only)
 const VERSION_STAMP_INSET_Y = 16; // px in from the bottom edge of the viewport (title screen only)
 
@@ -2235,13 +2236,19 @@ function firstPressedButton() {
 // into menuInput(action); the rendering lives near draw() (drawMenu). Gameplay stays frozen the
 // whole time (update() early-returns on paused), so menu input can never move the ship.
 
-// The root ("PAUSED") screen is the paused-mid-game menu only (game.state "playing"). CS012 P4
-// (FORK-CS012-C → a) retired the separate system-menu root (the old MENU_ROOT_SYS =
-// ["Options","Achievements","Back"]): from title/gameover, O/Start/B now open OPTIONS directly
-// (openPause routes there off game.state), so Options is the sole hub and rootItems() has only the
-// one layout to return. update() skips the sim outside "playing", so game.paused is safe in any state.
-const MENU_ROOT_PLAY = ["Continue", "Options", "Quit"];      // paused mid-game — the only root layout now
-function rootItems() { return MENU_ROOT_PLAY; }
+// The root ("PAUSED"/"MENU") screen is context-aware. CS012 P4 (FORK-CS012-C → a) retired the
+// separate system-menu root (the old MENU_ROOT_SYS = ["Options","Achievements","Back"]): from
+// title, O/Start/B open OPTIONS directly (openPause routes there off game.state), so title has no
+// root layout at all. CS013 P1 (FORK-CS013-A → a) restores a root for gameover — a session-end state
+// with its own session verbs (Play Again / Quit to Title) — distinct from the paused-mid-game root
+// (Continue / Quit). rootItems() picks the layout off game.state; update() skips the sim outside
+// "playing", so game.paused is safe in any state.
+const MENU_ROOT_PLAY = ["Continue", "Options", "Quit"];             // paused mid-game
+const MENU_ROOT_OVER = ["Play Again", "Options", "Quit to Title"];  // gameover (CS013 P1)
+const MENU_HINT_SIZE = 16;  // CS013 P2: control-hint footer text size (drawMenuHint) — playtest knob
+const ACH_SCALE = 1.5;      // CS013 P3: Achievements-viewer text-size multiplier (readability pass) — playtest knob
+const ACH_SCROLL_STEP = 60; // CS013 P3: px per up/down scroll press in the Achievements viewer, ~one row — playtest knob
+function rootItems() { return game.state === "gameover" ? MENU_ROOT_OVER : MENU_ROOT_PLAY; }
 // menuOptions()/drawOptionsMenu() dispatch by LABEL (like menuRoot), not by hardcoded index, so
 // adding a row here is purely additive and can't silently shift the other handlers out from under
 // themselves. CS010 P4 (§9/§10a): the three volume sliders + Music Track moved OFF this screen onto
@@ -2287,9 +2294,12 @@ function menuActive() { return game.paused; } // paused <=> a pause-menu screen 
 // --- Open / close / quit ---
 function openPause() {
   game.paused = true;
-  // CS012 P4 (FORK-CS012-C → a): paused mid-game opens the root menu; from title/gameover, O/Start/B
-  // open OPTIONS directly (no separate system-menu root anymore) — openPause routes off game.state.
-  game.menu.screen = game.state === "playing" ? "root" : "options"; game.menu.index = 0; game.menu.row = 0; game.menu.col = 0;
+  // CS012 P4 (FORK-CS012-C → a): paused mid-game opens the root menu; from title, O/Start/B open
+  // OPTIONS directly (no separate system-menu root) — openPause routes off game.state. CS013 P1
+  // (FORK-CS013-A → a): gameover is a session-end state with real session verbs (Play Again/Quit to
+  // Title), so it now ALSO opens the root — a context-aware one, see rootItems(). Title alone has no
+  // session verbs and keeps going straight to Options.
+  game.menu.screen = (game.state === "playing" || game.state === "gameover") ? "root" : "options"; game.menu.index = 0; game.menu.row = 0; game.menu.col = 0;
   game.menu.rebinding = null;
   resetMenuNav();          // don't let a direction held at pause-time fire a phantom move
   AudioSys.thrust(false);  // kill the thrust loop immediately (update() would too, next frame)
@@ -2316,7 +2326,7 @@ function quitToTitle() {
 }
 function gotoScreen(s, index) {
   game.menu.screen = s;
-  game.menu.index = index || 0; game.menu.row = 0; game.menu.col = 0;
+  game.menu.index = index || 0; game.menu.row = 0; game.menu.col = 0; game.menu.scroll = 0;
   AudioSys.ui(true);
 }
 
@@ -2350,11 +2360,15 @@ function menuRoot(a) {
   if (a === "up")   { m.index = (m.index + N - 1) % N; AudioSys.ui(false); }
   else if (a === "down") { m.index = (m.index + 1) % N; AudioSys.ui(false); }
   else if (a === "confirm") {
-    // CS012 P4: the root is the paused-mid-game menu only — Continue / Options / Quit.
+    // CS013 P1: the root is context-aware (see rootItems()) — paused mid-game gives
+    // Continue/Options/Quit, gameover gives Play Again/Options/Quit to Title. Dispatch by label
+    // (menuOptions precedent) so the two layouts share one handler without an index branch.
     const label = items[m.index];
-    if (label === "Continue")     closePause();
-    else if (label === "Options") gotoScreen("options");
-    else if (label === "Quit")    quitToTitle();
+    if (label === "Continue")          closePause();
+    else if (label === "Play Again")   startGame();
+    else if (label === "Options")      gotoScreen("options");
+    else if (label === "Quit")         quitToTitle();
+    else if (label === "Quit to Title") quitToTitle();
   }
   else if (a === "back" || a === "pause") closePause();
 }
@@ -2372,11 +2386,12 @@ function menuOptions(a) {
     else if (label === "Achievements") gotoScreen("achievements"); // viewer (F9)
     else if (label === "High Scores") gotoScreen("highscores"); // CS010 P4 §8b: nested under Options
     else if (label === "Difficulty") gotoScreen("difficulty"); // Difficulty screen (v3.0 P5)
-    // CS012 P4: Back is context-aware — paused mid-game returns to the root menu (cursor on Options);
-    // from title/gameover, where Options is the top-level dialog, it closes the overlay entirely.
-    else if (label === "Back") { if (game.state === "playing") gotoScreen("root", rootItems().indexOf("Options")); else closePause(); }
+    // CS012 P4 / CS013 P1: Back is context-aware — paused mid-game OR gameover (both have a root)
+    // return to it (cursor on Options); from title, where Options is the top-level dialog, it closes
+    // the overlay entirely.
+    else if (label === "Back") { if (game.state === "playing" || game.state === "gameover") gotoScreen("root", rootItems().indexOf("Options")); else closePause(); }
   }
-  else if (a === "back") { if (game.state === "playing") gotoScreen("root", rootItems().indexOf("Options")); else closePause(); }
+  else if (a === "back") { if (game.state === "playing" || game.state === "gameover") gotoScreen("root", rootItems().indexOf("Options")); else closePause(); }
   else if (a === "pause") closePause();
 }
 
@@ -2423,6 +2438,12 @@ function menuSound(a) {
 // of confirm/back/pause exits back to Options (cursor left on the "Achievements" row).
 function menuAchievements(a) {
   if (a === "pause") closePause();
+  // CS013 P3: up/down drive the continuous vertical scroll (FLAG-2c) — the viewer has no row
+  // selection to conflict with. Keyboard and gamepad d-pad/L-stick both normalize to "up"/"down"
+  // through menuInput, so this covers both inputs uniformly. Clamped against the SAME achMaxScroll()
+  // drawAchievements() renders with, so input and render never disagree about the scroll ceiling.
+  else if (a === "up")   game.menu.scroll = Math.max(0, game.menu.scroll - ACH_SCROLL_STEP);
+  else if (a === "down") game.menu.scroll = Math.min(achMaxScroll(), game.menu.scroll + ACH_SCROLL_STEP);
   // CS012 P4: Achievements now lives ONLY under Options (reached the same way from title/gameover AND
   // from pause), so Back always returns to Options with the cursor on "Achievements" — the old
   // achReturn tracker (which distinguished a direct system-root entry) is retired.
@@ -2735,6 +2756,9 @@ const COLOR = {
   shield: "#40b0ff",
   text: "#a8d4ff",
   dim: "#3a5a80",
+  menuIdle: "#6f92bd",      // CS013 P2: unselected menu-item text — brighter than dim, dimmer than text.
+                            // Menu-item contrast only; COLOR.dim itself stays untouched (HUD rings/
+                            // chevrons/table headers/glyphs/slider frames all still read it).
   garbage: "#c8ff50",
   garbageLight: "#b8ffb0",   // low-mass Hunter scrap: a paler, mintier tint so it reads as "lighter / easier to tow" (F4)
   chain: "#8aa0ff",
@@ -2780,6 +2804,7 @@ class Ship {
     this.invuln = 0;        // hit-stun i-frames; set on each non-lethal hit (drives the blink)
     this.shieldOn = false;
     this.energy = 1;        // 0..1
+    this.autoShieldRegenLock = 0; // CS013 P4: passive-regen freeze window after an auto-save. Runtime only, no persistence.
     this.thrusting = false;
   }
   update(dt) {
@@ -2818,7 +2843,8 @@ class Ship {
       if (this.energy <= 0.02) this.shieldOn = false;
     } else {
       this.shieldOn = false;
-      this.energy = Math.min(1, this.energy + SHIELD_RECHARGE * dt);
+      // FLAG-3b: gate ONLY this passive recharge — manual shield-drain above is untouched.
+      if (this.autoShieldRegenLock <= 0) this.energy = Math.min(1, this.energy + SHIELD_RECHARGE * dt);
     }
 
     // Fire. The bullet cap flexes with the weapon powerups (F6): Rapid Fire raises it to
@@ -2850,6 +2876,7 @@ class Ship {
     }
 
     if (this.invuln > 0) this.invuln -= dt;
+    if (this.autoShieldRegenLock > 0) this.autoShieldRegenLock -= dt;
   }
   draw() {
     if (this.dead) return;
@@ -3499,7 +3526,7 @@ const game = {
   // Pause-menu state machine (F8): screen = null | "root" | "options" | "controls";
   // index = cursor for root/options; row/col = cursor for the controls grid;
   // rebinding = { action, device } while capturing a new binding, else null.
-  menu: { screen: null, index: 0, row: 0, col: 0, rebinding: null },
+  menu: { screen: null, index: 0, row: 0, col: 0, rebinding: null, scroll: 0 }, // scroll: CS013 P3, Achievements-viewer vertical offset
   ship: new Ship(),
   camera: { x: WORLD_W / 2, y: WORLD_H / 2 }, // world point at the center of the viewport
   debris: [], bullets: [], saucers: [], hunters: [], particles: [],
@@ -4273,6 +4300,7 @@ function damageShip(amount, srcX, srcY) {
     s.vx = Math.cos(ka) * KNOCKBACK_SPEED;
     s.vy = Math.sin(ka) * KNOCKBACK_SPEED;
     s.invuln = HIT_STUN_DURATION;
+    s.autoShieldRegenLock = AUTO_SHIELD_REGEN_PAUSE;
     s.shieldOn = true;
     // Penalty BYPASSES addScore by design (FLAG-4e / CLAUDE.md scoring exception): auto-save must NOT touch
     // game.nextRepair, so it can never trip the HP-repair milestone. Clamp the score at 0.
@@ -5117,6 +5145,12 @@ function drawText(str, x, y, size, color = COLOR.text, align = "center") {
   ctx.shadowBlur = 0;
 }
 
+// CS013 P2 (§2.2): the shared control-hint footer look — larger + higher-contrast than the old
+// literal size-12/COLOR.dim footers. Centered, like every menu footer.
+function drawMenuHint(text, cx, y) {
+  drawText(text, cx, y, MENU_HINT_SIZE, COLOR.menuIdle, "center");
+}
+
 // CS011 P2: Dan's on-screen caption — the voice channel's visible echo (settings.captions), centered near
 // the viewport bottom. In-play only (never over a menu / gameover / the title). Independent of Capture's H
 // HUD toggle by design (accessibility text, not a HUD readout) — a SIBLING of drawHUD() in draw(), not
@@ -5160,14 +5194,18 @@ function menuPanel(w, h, title) {
   return { x, y };
 }
 
+// CS013 P1: the "MENU" branch of the title ternary below, dead since CS012 P4 made the root
+// play-only, is reachable again — gameover now opens this same root (rootItems() gives it the
+// Play Again/Options/Quit to Title layout). Both root layouts are 3 items, so the 360x300 panel's
+// row math (fixed 46px step) needs no resize for the gameover case.
 function drawRootMenu() {
   const items = rootItems();
   const { y } = menuPanel(360, 300, game.state === "playing" ? "PAUSED" : "MENU");
   items.forEach((it, i) => {
     const sel = i === game.menu.index;
-    drawText((sel ? "▶ " : "   ") + it, VIEW_W / 2, y + 118 + i * 46, 24, sel ? COLOR.text : COLOR.dim);
+    drawText((sel ? "▶ " : "   ") + it, VIEW_W / 2, y + 118 + i * 46, 24, sel ? COLOR.text : COLOR.menuIdle);
   });
-  drawText("↑↓ move    ENTER / A select    ESC / B back", VIEW_W / 2, y + 272, 12, COLOR.dim);
+  drawMenuHint("↑↓ move    ENTER / A select    ESC / B back", VIEW_W / 2, y + 272);
 }
 
 // CS010 P4 (§9/§10a): now a pure nav list (Sound / Music, Controls, Achievements, High Scores,
@@ -5178,9 +5216,9 @@ function drawOptionsMenu() {
   const m = game.menu;
   MENU_OPTIONS.forEach((label, i) => {
     const sel = m.index === i;
-    drawText((sel ? "▶ " : "   ") + label, VIEW_W / 2, y + 118 + i * 42, 22, sel ? COLOR.text : COLOR.dim);
+    drawText((sel ? "▶ " : "   ") + label, VIEW_W / 2, y + 118 + i * 42, 22, sel ? COLOR.text : COLOR.menuIdle);
   });
-  drawText("↑↓ move    ENTER / A select    ESC / B back", VIEW_W / 2, y + 400, 12, COLOR.dim);
+  drawMenuHint("↑↓ move    ENTER / A select    ESC / B back", VIEW_W / 2, y + 400);
 }
 
 // Sound / Music sub-screen (CS010 P4, §9) — a relocation of the three volume sliders + Music Track
@@ -5193,7 +5231,7 @@ function drawSound() {
   SOUND_ROWS.forEach((label, i) => {
     if (label === "Back") return;
     const sel = m.index === i;
-    drawText(label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.dim, "left");
+    drawText(label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
     const vi = VOL_LABELS.indexOf(label);
     if (vi >= 0) { // volume slider
       const bx = x + 270, bw = 190, bh = 12, by = cy - 3;
@@ -5201,7 +5239,7 @@ function drawSound() {
       ctx.strokeRect(bx, by, bw, bh);
       ctx.fillStyle = sel ? COLOR.shield : COLOR.dim;
       ctx.fillRect(bx + 1, by + 1, (bw - 2) * AudioSys.vol[VOL_CATS[vi]], bh - 2);
-      drawText(Math.round(AudioSys.vol[VOL_CATS[vi]] * 100) + "%", bx + bw + 44, cy + 6, 16, sel ? COLOR.text : COLOR.dim, "right");
+      drawText(Math.round(AudioSys.vol[VOL_CATS[vi]] * 100) + "%", bx + bw + 44, cy + 6, 16, sel ? COLOR.text : COLOR.menuIdle, "right");
       if (sel) { drawText("◄", bx - 16, cy + 7, 16, COLOR.text); drawText("►", bx + bw + 16, cy + 7, 16, COLOR.text); }
     } else { // value-column rows — a single dispatch mirroring drawDifficulty's toggle layout
       const ox = x + 270;
@@ -5209,15 +5247,15 @@ function drawSound() {
       if (label === "Music Track")   val = MUSIC_TRACK_LABELS[settings.musicTrack];
       else if (label === "Voice")    val = VOICE_STYLE_LABELS[settings.voiceStyle];
       else if (label === "Captions") val = settings.captions ? "On" : "Off";
-      drawText(val, ox, cy + 6, 18, sel ? COLOR.text : COLOR.dim, "left");
+      drawText(val, ox, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
       if (sel) { drawText("◄", ox - 20, cy + 7, 16, COLOR.text); drawText("►", ox + 150, cy + 7, 16, COLOR.text); }
     }
     cy += 46;
   });
   cy += 14;
   const backSel = m.index === SOUND_ROWS.indexOf("Back");
-  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, cy + 6, 22, backSel ? COLOR.text : COLOR.dim);
-  drawText("↑↓ move    ◄► adjust    ENTER / A select    ESC / B back", VIEW_W / 2, y + 582, 12, COLOR.dim);
+  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, cy + 6, 22, backSel ? COLOR.text : COLOR.menuIdle);
+  drawMenuHint("↑↓ move    ◄► adjust    ENTER / A select    ESC / B back", VIEW_W / 2, y + 582);
 }
 
 // Difficulty screen renderer (v3.0 P5): two two-option toggle rows + Back. The active side of each
@@ -5236,7 +5274,7 @@ function drawDifficulty() {
   ];
   rows.forEach((r, i) => {
     const sel = m.index === i, cy = y + 122 + i * 58;
-    drawText(r.label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.dim, "left");
+    drawText(r.label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
     const ox = x + 360;
     drawText(r.left,  ox,       cy + 6, 18, r.rightActive ? COLOR.dim : COLOR.text, "left");
     drawText("|",     ox + 74,  cy + 6, 18, COLOR.dim, "left");
@@ -5250,9 +5288,9 @@ function drawDifficulty() {
     "Auto-raises shield at critical hull. -500 points per blocked hit.",
   ];
   const backSel = m.index === 3;
-  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 320, 22, backSel ? COLOR.text : COLOR.dim);
-  drawText(m.index < HELP.length ? HELP[m.index] : "", VIEW_W / 2, y + 364, 12, COLOR.dim);
-  drawText("↑↓ move    ◄► toggle    ENTER / A select    ESC / B back", VIEW_W / 2, y + 394, 12, COLOR.dim);
+  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 320, 22, backSel ? COLOR.text : COLOR.menuIdle);
+  if (m.index < HELP.length) drawMenuHint(HELP[m.index], VIEW_W / 2, y + 364);
+  drawMenuHint("↑↓ move    ◄► toggle    ENTER / A select    ESC / B back", VIEW_W / 2, y + 394);
 }
 
 function drawControlsMenu() {
@@ -5264,7 +5302,7 @@ function drawControlsMenu() {
   REBINDABLE.forEach((name, r) => {
     const ry = y + 122 + r * 42;
     const rowSel = m.row === r;
-    drawText(bindings[name].label, x + 36, ry, 17, rowSel ? COLOR.text : COLOR.dim, "left");
+    drawText(bindings[name].label, x + 36, ry, 17, rowSel ? COLOR.text : COLOR.menuIdle, "left");
     const capKb = m.rebinding && m.rebinding.action === name && m.rebinding.device === "key";
     const capGp = m.rebinding && m.rebinding.action === name && m.rebinding.device === "pad";
     drawBindCell(x + 250, ry, keyLabel(bindings[name]), rowSel && m.col === 0, capKb);
@@ -5275,9 +5313,9 @@ function drawControlsMenu() {
   const turnRow = REBINDABLE.length;
   drawTurnScaleRow(x, y + 122 + turnRow * 42, m.row === turnRow);
   const dRow = REBINDABLE.length + 1, bRow = dRow + 1;
-  drawText((m.row === dRow ? "▶ " : "   ") + "Return to Defaults", VIEW_W / 2, y + 122 + dRow * 42 + 26, 20, m.row === dRow ? COLOR.text : COLOR.dim);
-  drawText((m.row === bRow ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 122 + bRow * 42 + 26, 20, m.row === bRow ? COLOR.text : COLOR.dim);
-  drawText("↑↓ row    ◄► column / rotation    ENTER / A rebind    ESC / B back", VIEW_W / 2, y + 494, 12, COLOR.dim);
+  drawText((m.row === dRow ? "▶ " : "   ") + "Return to Defaults", VIEW_W / 2, y + 122 + dRow * 42 + 26, 20, m.row === dRow ? COLOR.text : COLOR.menuIdle);
+  drawText((m.row === bRow ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 122 + bRow * 42 + 26, 20, m.row === bRow ? COLOR.text : COLOR.menuIdle);
+  drawMenuHint("↑↓ row    ◄► column / rotation    ENTER / A rebind    ESC / B back", VIEW_W / 2, y + 494);
 }
 
 // One slider row for the ship-rotation preference on the Controls screen (§10b). Readout is a
@@ -5286,7 +5324,7 @@ function drawControlsMenu() {
 // when the value sits exactly on 100%. Menu rects are exempt from the HUD no-fills rule — this mirrors
 // the volume slider in drawOptionsMenu.
 function drawTurnScaleRow(x, ry, sel) {
-  drawText("Ship Rotation", x + 36, ry, 17, sel ? COLOR.text : COLOR.dim, "left");
+  drawText("Ship Rotation", x + 36, ry, 17, sel ? COLOR.text : COLOR.menuIdle, "left");
   const bx = x + 250, bw = 200, bh = 12, by = ry - 11;
   const span = SHIP_TURN_SCALE_MAX - SHIP_TURN_SCALE_MIN;
   const frac = (settings.shipTurnScale - SHIP_TURN_SCALE_MIN) / span;
@@ -5299,7 +5337,7 @@ function drawTurnScaleRow(x, ry, sel) {
   ctx.strokeStyle = COLOR.ach; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(tx, by - 4); ctx.lineTo(tx, by + bh + 4); ctx.stroke();
   const pct = Math.round(settings.shipTurnScale * 100) + "%";
-  drawText(atDefault ? pct + "  (default)" : pct, bx + bw + 30, ry, 16, atDefault ? COLOR.ach : (sel ? COLOR.text : COLOR.dim), "left");
+  drawText(atDefault ? pct + "  (default)" : pct, bx + bw + 30, ry, 16, atDefault ? COLOR.ach : (sel ? COLOR.text : COLOR.menuIdle), "left");
   if (sel) { drawText("◄", bx - 20, ry + 1, 16, COLOR.text); drawText("►", bx + bw + 8, ry + 1, 16, COLOR.text); }
 }
 
@@ -5310,7 +5348,7 @@ function drawBindCell(cx, cy, text, sel, capturing) {
     ctx.strokeRect(cx - 6, cy - 15, 200, 24);
   }
   const label = capturing ? "press…" : (text || "—");
-  drawText(label, cx, cy, 15, capturing ? COLOR.garbage : (sel ? COLOR.text : COLOR.dim), "left");
+  drawText(label, cx, cy, 15, capturing ? COLOR.garbage : (sel ? COLOR.text : COLOR.menuIdle), "left");
 }
 
 // Format the current bindings for display.
@@ -5332,27 +5370,72 @@ function axisLabel(a) {
   return "Axis " + a.index;
 }
 
-// ---------- Achievements viewer + unlock toasts (F9; 3-column since v3.0 P8) ----------
+// ---------- Achievements viewer + unlock toasts (F9; 3-column since v3.0 P8; ×1.5 + scroll CS013 P3) ----------
 // Read-only list reachable from Options -> Achievements. Three columns: this week's 5 (left) and the
 // lifetime set split across two columns (P8 grew it 12 -> 19, too many for one column), each row with
 // unlock status + a progress readout. Screen-fixed, drawn by drawMenu. Layout widths/split are a pure
 // look-call tunable (colW / xL / xM / xR / the ceil-half split) — see the P8 playtest ask in STATUS.
+//
+// CS013 P3: geometry hoisted to top-level consts (rather than locals inside drawAchievements) so
+// achMaxScroll() — called from menuAchievements(), which has no drawing context — derives the exact
+// same numbers drawAchievements() renders with. Panel position is deterministic (VIEW_W/H and the
+// panel's own w/h are fixed), so this is safe without re-invoking menuPanel() (which has fill/stroke/
+// text side effects and can't be called twice per frame).
+const ACH_PANEL_W = 1200, ACH_PANEL_H = 660;
+const ACH_PANEL_Y = (VIEW_H - ACH_PANEL_H) / 2;
+const ACH_ROW0_Y = ACH_PANEL_Y + 130;                // first row baseline (unchanged from pre-P3)
+const ACH_ROW_STEP = 40 * ACH_SCALE;                 // row-to-row baseline spacing (was a bare 40 pre-P3)
+const ACH_ROW_CLIP_TOP = ACH_ROW0_Y - 16;             // headroom above row 0, below the column headers (baseline y+108)
+const ACH_ROW_CLIP_BOTTOM = ACH_PANEL_Y + 620;        // headroom above the footer (drawn at ACH_PANEL_Y+644)
+const ACH_ROW_VISIBLE_H = ACH_ROW_CLIP_BOTTOM - ACH_ROW_CLIP_TOP;
+
+// Derives maxScroll from the ACTUAL row counts (not a hardcoded pixel total), so a future LIFETIME/
+// weekly resize keeps working — the "tallest column" is whichever of the weekly or split-lifetime
+// columns has more rows (today: 10 lifetime rows per column vs. 5 weekly). Shared by drawAchievements()
+// (render + clamp) and menuAchievements() (input clamp) so the two can never disagree about the ceiling.
+function achMaxScroll() {
+  const half = Math.ceil(Achievements.LIFETIME.length / 2);
+  const rowsTall = Math.max(Achievements.activeWeekly().length, half);
+  const contentH = (rowsTall - 1) * ACH_ROW_STEP + 22 + 10 * ACH_SCALE; // last row's baseline -> its description's bottom
+  return Math.max(0, contentH - ACH_ROW_VISIBLE_H);
+}
+
 function drawAchievements() {
   ctx.fillStyle = "rgba(4,10,20,0.88)"; // v3.3 P1: matches drawMenu's raised backdrop dim (look-call)
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  const { x, y } = menuPanel(1200, 660, "ACHIEVEMENTS");
-  drawText("WEEKLY SET " + Achievements.weekKey + " — resets each calendar week", VIEW_W / 2, y + 74, 12, COLOR.dim);
-  const colW = 350, xL = x + 30, xM = x + 430, xR = x + 820, ry0 = y + 130, step = 40;
-  drawText("THIS WEEK",        xL, y + 108, 15, COLOR.satellite, "left");
-  drawText("LIFETIME",         xM, y + 108, 15, COLOR.satellite, "left");
-  drawText("LIFETIME (cont.)", xR, y + 108, 15, COLOR.satellite, "left");
-  Achievements.activeWeekly().forEach((a, i) => drawAchRow(a, xL, ry0 + i * step, colW));
+  const { x, y } = menuPanel(ACH_PANEL_W, ACH_PANEL_H, "ACHIEVEMENTS");
+  drawText("WEEKLY SET " + Achievements.weekKey + " — resets each calendar week", VIEW_W / 2, y + 74, 12 * ACH_SCALE, COLOR.dim);
+  const colW = 350, xL = x + 30, xM = x + 430, xR = x + 820, ry0 = ACH_ROW0_Y, step = ACH_ROW_STEP;
+  drawText("THIS WEEK",        xL, y + 108, 15 * ACH_SCALE, COLOR.satellite, "left");
+  drawText("LIFETIME",         xM, y + 108, 15 * ACH_SCALE, COLOR.satellite, "left");
+  drawText("LIFETIME (cont.)", xR, y + 108, 15 * ACH_SCALE, COLOR.satellite, "left");
+
+  // CS013 P3 (§2.3.3): clamp against the same ceiling menuAchievements() uses, then clip the row
+  // region so scrolled rows can never spill past the panel or under the header/footer (FLAG-2c:
+  // continuous scroll, all three columns move together — no per-row selection to conflict with).
+  const maxScroll = achMaxScroll();
+  game.menu.scroll = Math.max(0, Math.min(maxScroll, game.menu.scroll));
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, ACH_ROW_CLIP_TOP, ACH_PANEL_W, ACH_ROW_VISIBLE_H);
+  ctx.clip(); // not a fill — GDD §3.2's no-fills rule gains no new exception here
+  Achievements.activeWeekly().forEach((a, i) => drawAchRow(a, xL, ry0 + i * step - game.menu.scroll, colW));
   const half = Math.ceil(Achievements.LIFETIME.length / 2);   // first half -> middle column, rest -> right
   Achievements.LIFETIME.forEach((a, i) => {
     const cx = i < half ? xM : xR, row = i < half ? i : i - half;
-    drawAchRow(a, cx, ry0 + row * step, colW);
+    drawAchRow(a, cx, ry0 + row * step - game.menu.scroll, colW);
   });
-  drawText("ESC / B / ENTER  return to Options", VIEW_W / 2, y + 644, 12, COLOR.dim);
+  ctx.restore();
+
+  // Scroll affordance (FLAG-2c): shown only while there's anything to scroll; ▲ additionally requires
+  // scroll > 0 (nothing above yet at the top) and ▼ additionally requires scroll < maxScroll (nothing
+  // below once fully scrolled) — both cues drawn OUTSIDE the clip, like the header/footer chrome.
+  if (maxScroll > 0) {
+    if (game.menu.scroll > 0)         drawText("▲", VIEW_W / 2, ACH_ROW_CLIP_TOP - 4, 16, COLOR.menuIdle, "center");
+    if (game.menu.scroll < maxScroll) drawText("▼", VIEW_W / 2, ACH_ROW_CLIP_BOTTOM + 10, 16, COLOR.menuIdle, "center");
+  }
+
+  drawMenuHint("ESC / B / ENTER  return to Options", VIEW_W / 2, y + 644);
 }
 
 // Thousands-grouped integer, locale-independent (deterministic across environments/tests).
@@ -5361,19 +5444,22 @@ function fmtCommas(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ","); 
 // One achievement row: name + status on the top line, description below.
 // Tiered lifetime rows show a tier badge + progress-to-next in the tier's colour (v3.0 P7);
 // single-goal rows keep the F9 look — a ✓ when earned (gold) or a cur/goal readout when not.
+// CS013 P3: sizes scaled by ACH_SCALE; description offset ry+15 -> ry+22; description and
+// locked/incomplete progress lifted dim -> menuIdle for contrast (unlocked stays ach gold, tier tints
+// unchanged).
 function drawAchRow(ach, x, ry, w) {
   if (ach.tiers) {
     const idx = Achievements.tierIndex(ach);
     const col = idx >= 0 ? TIER_COLOR[idx] : COLOR.text;   // badge/name in the current tier's tint
-    drawText(ach.name, x, ry, 15, col, "left");
-    drawText(Achievements.tierStatusText(ach), x + w, ry, 13, idx >= 0 ? col : COLOR.dim, "right");
-    drawText(ach.desc, x, ry + 15, 10, COLOR.dim, "left");
+    drawText(ach.name, x, ry, 15 * ACH_SCALE, col, "left");
+    drawText(Achievements.tierStatusText(ach), x + w, ry, 13 * ACH_SCALE, idx >= 0 ? col : COLOR.menuIdle, "right");
+    drawText(ach.desc, x, ry + 22, 10 * ACH_SCALE, COLOR.menuIdle, "left");
     return;
   }
   const done = Achievements.isUnlocked(ach);
-  drawText(ach.name, x, ry, 15, done ? COLOR.ach : COLOR.text, "left");
-  drawText(done ? "✓" : Achievements.progressText(ach), x + w, ry, 14, done ? COLOR.ach : COLOR.dim, "right");
-  drawText(ach.desc, x, ry + 15, 10, COLOR.dim, "left");
+  drawText(ach.name, x, ry, 15 * ACH_SCALE, done ? COLOR.ach : COLOR.text, "left");
+  drawText(done ? "✓" : Achievements.progressText(ach), x + w, ry, 14 * ACH_SCALE, done ? COLOR.ach : COLOR.menuIdle, "right");
+  drawText(ach.desc, x, ry + 22, 10 * ACH_SCALE, COLOR.menuIdle, "left");
 }
 
 // ---------- High Scores rendering (v3.6 P6) ----------
@@ -5626,7 +5712,10 @@ function draw() {
       drawScoreTable(VIEW_W/2, VIEW_H/2 + 60, game.lastScoreId);
       if (Math.floor(performance.now() / 600) % 2 === 0)
         drawText("PRESS ENTER TO PLAY AGAIN", VIEW_W/2, VIEW_H/2 + 280, 22);
-      drawText("OPTIONS / ACHIEVEMENTS: O    (controller: B)", VIEW_W/2, VIEW_H/2 + 312, 14, COLOR.ach);
+      // CS013 P1: gameover now opens a root (Play Again/Options/Quit to Title), not Options directly —
+      // the hint reads "MENU" here, distinct from the title's still-direct-to-Options "OPTIONS /
+      // ACHIEVEMENTS" copy at L5559 (unchanged, do not conflate the two).
+      drawText("MENU: O    (controller: B)", VIEW_W/2, VIEW_H/2 + 312, 14, COLOR.ach);
     }
   }
 
