@@ -37,7 +37,7 @@ const logParagraphs = d.logEntry.trim().split(/\n\s*\n/);
     }
 
     <section class="log" aria-label={`Log entry from ${d.logSignature}`}>
-      <p class="log__header">// SALVAGE LOG</p>
+      <p class="log__header">// {game.data.logLabel}</p>
       {logParagraphs.map((para) => <p class="log__line">{para}</p>)}
       <p class="log__sign">— {d.logSignature}</p>
     </section>

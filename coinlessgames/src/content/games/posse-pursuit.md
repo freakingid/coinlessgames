@@ -8,6 +8,23 @@ description: Lead a growing line of lawmen through outlaw country. Your guns
 status: Playable in browser
 playUrl: /play/posse-pursuit/
 draft: false
+logSignature: The Sheriff
+logEntry: >
+  Every town on this stretch has the same problem. Outlaws camp outside the
+  limits, wait for a payroll wagon or a fool with a full purse, and ride off
+  before anybody can rally a posse. So I quit waiting for a posse. I deputize
+  on the ride.
+
+
+  Knock a man down and he doesn't always stay down. Give him five seconds
+  sitting in the dirt looking dazed, and if I circle back through that window
+  he stands up wearing a badge instead of a grudge. Skip it and he dusts
+  himself off and goes back to being a problem for the next town.
+
+
+  Line keeps growing behind me, which is good, because the line is also the
+  only thing standing between my back and whatever's coming up on it. Lose the
+  Sheriff and the ride's over for everybody. So far, it hasn't been.
 ---
 #### You steer, they shoot
 Posse Pursuit is a single-screen arcade brawler about leading a line of lawmen that never stops moving. You don't aim and you don't shoot. Every rider behind you picks their own target and fires on their own, so your entire job is deciding where the line goes. Ride too close and you take a hit. Ride too far and your recruits walk away.

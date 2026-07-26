@@ -17,6 +17,7 @@ const games = defineCollection({
     order: z.number().default(1),
     tagline: z.string(),
     description: z.string(),
+    logLabel: z.string().default('SALVAGE LOG'),
     logEntry: z.string(),
     logSignature: z.string().default('Dan'),
     playUrl: z.string().optional(),

@@ -35,8 +35,9 @@ collections:
       - { label: "Status", name: "status", widget: "string", required: false, hint: "e.g. Playable in browser, In Development" }
       - { label: "Play URL", name: "playUrl", widget: "string", required: false, hint: "e.g. /play/orbital-overhaul/" }
       - { label: "Draft", name: "draft", widget: "boolean", default: false, hint: "Hide this game from the live site until it's ready." }
+      - { label: "Log Header Label", name: "logLabel", widget: "string", required: false, default: "SALVAGE LOG", hint: "Small label above the log entry, e.g. SALVAGE LOG or SHERIFF'S LOG." }
       - { label: "Log Signature", name: "logSignature", widget: "string", required: false, hint: "Who signs the in-world log entry, e.g. Dan" }
-      - { label: "Log Entry", name: "logEntry", widget: "text", required: false, hint: "Dan's in-world log, shown in the terminal/CRT block on the game page." }
+      - { label: "Log Entry", name: "logEntry", widget: "text", required: true, hint: "Dan's in-world log, shown in the terminal/CRT block on the game page." }
       - { label: "Body", name: "body", widget: "markdown", hint: "Publisher's note — plain-voice description below Dan's log." }
   - name: "pages"
     label: "Pages"
