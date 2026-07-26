@@ -9,6 +9,7 @@ description: A free, open-source vector arcade game about cleaning up orbital
 status: Playable in browser
 playUrl: /play/orbital-overhaul/
 draft: false
+logLabel: SALVAGE LOG
 logSignature: Dan
 logEntry: >
   People think orbit is empty. Orbit is a junkyard doing seventeen thousand
