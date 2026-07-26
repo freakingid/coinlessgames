@@ -8,6 +8,7 @@ description: Lead a growing line of lawmen through outlaw country. Your guns
 status: Playable in browser
 playUrl: /play/posse-pursuit/
 draft: false
+logLabel: SHERIFF'S LOG
 logSignature: The Sheriff
 logEntry: >
   Every town on this stretch has the same problem. Outlaws camp outside the
