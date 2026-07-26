@@ -5,6 +5,8 @@ tagline: Every outlaw is a deputy waiting to happen.
 description: Lead a growing line of lawmen through outlaw country. Your guns
   fire themselves — you just steer. Ten waves, about eight minutes, plays in
   your browser on a phone or a laptop.
+status: Playable in browser
+playUrl: /play/posse-pursuit/
 draft: false
 ---
 #### You steer, they shoot
