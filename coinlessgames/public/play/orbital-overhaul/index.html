@@ -131,7 +131,9 @@ const SHIELD_RADIUS = 26;
 const AUTO_SHIELD_SCORE_PENALTY = 500; // PLAYTEST KNOB — score lost per auto-save. Flat (FLAG-4d).
 const AUTO_SHIELD_REGEN_PAUSE = 1.0; // sec — passive regen freezes this long after an auto-save. PLAYTEST KNOB (>= HIT_STUN_DURATION guarantees no recharge between i-frame end and next hit).
 
-const DEBRIS_SPEEDS = { 3: 70, 2: 110, 1: 160 };  // base drift speed by size
+const DEBRIS_SPEEDS = { 3: 70, 2: 110, 1: 160 };  // base drift speed by size. The per-wave multiplier and
+                                 // its cap are CS017 P3 cycle knobs — see DEBRIS_SPEED_PER_WAVE /
+                                 // DEBRIS_SPEED_CAP in the difficulty-ramp block below.
 const DEBRIS_RADII  = { 3: 46, 2: 26, 1: 13 };
 const DEBRIS_SCORE  = { 3: 20, 2: 50, 1: 100 };
 const DEBRIS_GARBAGE = 4;       // canisters emitted at EVERY tier's destruction (F3). PLAYTEST KNOB:
@@ -240,7 +242,7 @@ const SCORES_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 // Minor = tweaks to existing systems. Patch = bug fixes, where "bug" includes the game not doing what
 // the design intends. Changeset = the CS### number, monotonically increasing, never resets — the 4th
 // segment IS the changeset number (this build shipped in CS010).
-const GAME_VERSION = "1.0.0.13";
+const GAME_VERSION = "1.0.0.17";
 const VERSION_STAMP_INSET_X = 16; // px in from the right edge of the viewport (title screen only)
 const VERSION_STAMP_INSET_Y = 16; // px in from the bottom edge of the viewport (title screen only)
 
@@ -289,17 +291,20 @@ const HUD_CAP_FLASH = 0.5;      // sec — reserved flash duration for a cap-rel
 // Radioactive salvage / tow chain / recycling dock
 // v3.3 P4 (9a): loose SINGLE canisters decay again (GARBAGE_DECAY) — decay is the GOVERNOR that keeps
 // the field readable now that Hunters always drop garbage (9b) reopens the 12-in/66-out amplifier.
-// This REVERSES the v3.2 P3 "garbage is permanent" rule (Paul signed off). Exits for a single are now
-// three: RECYCLED (towed to the dock), CONSUMED INTO A HUNTER (coalescence), or AGED OUT (decay).
-// A CLUMP (pieces > 1) still never decays — it is a target AND, as of 9c, a scoopable pickup, so
-// aging it out would steal the player's loot and their Hunter-prevention window (FORK-4: singles only).
+// This REVERSES the v3.2 P3 "garbage is permanent" rule (Paul signed off). CS015 P6 (item 10,
+// FLAG-CS015-a) reverses FORK-4 in turn: a CLUMP (pieces > 1) now ages out too — every piece, single or
+// clump, counts down a lifetime and dies at 0 — but a MERGE resets the survivor's clock to full, so an
+// actively-growing lineage never dies while a stalled one does (coalesceGarbage). Exits for a piece are
+// now three: RECYCLED (towed to the dock), CONSUMED INTO A HUNTER (coalescence), or AGED OUT (decay).
 // Chain nodes never decay (they're game.chain, not game.garbage). Severed garbage (Garbage.fromNode)
-// inherits this same one GARBAGE_DECAY — the old separate GARBAGE_SEVER_DECAY stays deleted. See §2.10.1.
+// still routes through the one ctor line, so it gets a normal (tunable) life — no separate constant.
+// `GARBAGE_DECAY` below is now a historical/shipped-value reference only; the live source of truth is
+// the `garbageLifetime` debug var (DEBUG_VARS, CS015 P6), default 10 s, seeded at Garbage ctor time.
 const GARBAGE_PICKUP = 18;      // pickup radius from ship center
-const GARBAGE_DECAY = 22;       // PLAYTEST KNOB (v3.3 P4, reintroduced). sec a loose SINGLE lives before it
-                                // ages out; must exceed GARBAGE_COALESCE_DELAY by a wide margin or nothing
-                                // ever clumps. The last ~GARBAGE_FADE sec it blinks as an expiry tell.
-const GARBAGE_FADE = 2.0;       // sec of blink-out before a decaying single dies (look-call)
+const GARBAGE_DECAY = 22;       // PRE-CS015-P6 SHIPPED VALUE (v3.3 P4, reintroduced; single-only back then).
+                                // Superseded by the `garbageLifetime` debug var (default 10, CS015 P6) —
+                                // kept here as the documented historical default, no longer read live.
+const GARBAGE_FADE = 2.0;       // sec of blink-out before a decaying piece (single OR clump) dies (look-call)
 
 // Garbage coalescence (v3.1 P3): uncollected canisters mutually attract and, on contact, fuse into a
 // growing clump; at HUNTER_COALESCE_COUNT pieces the clump collapses into a fresh large Hunter core
@@ -325,8 +330,27 @@ const HUNTER_COALESCE_COUNT = 12;      // pieces fused into one clump -> a new l
 const GARBAGE_CLUMP_MAXSPD = Infinity; // off-by-default playtest clamp on a piece's coalescence speed
 const GARBAGE_SHATTER_KICK = [40, 90]; // v3.2 P2: px/s outward kick range for shatterClump's emitted pieces (playtest knob)
 
+// Rare BONUS CANISTER (CS017 P5, FORK-CS017-D -> (b) PRE-LINKED CLUMP). It is NOT a new entity type:
+// it is an ordinary `Garbage` born with a high `pieces` count plus a `bonus` marker, so the existing
+// scoop-intake path (which already turns a multi-piece clump into `take` chain nodes), coalescence,
+// shatter and decay all handle it with zero new machinery. Design intent: a reward-flavoured reason to
+// keep playing the low-stakes early waves that INVITES GREED (a fat chain is riskier to protect)
+// without making survival itself harder. Its spawn chance is the ONE lever in CS017 that EASES OFF
+// rather than escalating — see DIFFICULTY-LEVERS.md and bonusSpawnChance() below.
+const BONUS_CANISTER_PIECES = 6;      // PLAYTEST KNOB: chain slots one bonus clump fills on a full scoop
+const BONUS_CANISTER_SCORE  = 250;    // PLAYTEST KNOB: points paid ONCE per clump, at the scoop
+const BONUS_SPAWN_CHANCE_EARLY = 0.5; // PLAYTEST KNOB: per-wave spawn probability at cycleWave 1
+const BONUS_SPAWN_CHANCE_LATE  = 0.1; // PLAYTEST KNOB: ... at the LAST wave of a cycle (cycleWave === CYCLE_LENGTH)
+const BONUS_RING_PAD = 5;             // px: gap between the clump's collision radius and its halo-ring tell (look-call)
+
 const CHAIN_LINK = 20;          // px between chain nodes
 const CHAIN_ITER = 4;           // verlet constraint relaxation passes/frame (B-8: 3→4 to keep a 20-node chain from sagging; §3.4 rule 7)
+// CS017 P6 (chain guard) — the ABSORBED-break tell. Deliberately fewer particles than boom()'s
+// `6 + size*6` (12 for a size-1 canister burst): a deflection should read as a spark shower, not a
+// detonation. The rest of the chain-guard tuning lives in DEBUG_VARS (chainGuardTime/Intercepts/MinTow).
+const GUARD_ABSORB_SPARKS = 7;  // PLAYTEST KNOB: guard-hued particles spat out where a break was absorbed
+const GUARD_CHAIN_WIDTH = 1.8;  // link stroke width while guarded (vs the normal 1.2) — the "armoured" read
+const GUARD_CHAIN_BLUR = 14;    // link glow blur while guarded (vs the normal 6)
 // Tow capacity (B-8): the cap is a runtime value (game.cargoMax) that GROWS during a run from
 // CARGO_BASE toward CARGO_CAP_MAX — capacity is earned by engaging the salvage loop (Pillar 5),
 // not handed out. The old fixed `CHAIN_MAX` (12) is now CARGO_BASE.
@@ -387,6 +411,26 @@ const STAR_NEAR_BRIGHT_MAX = 1.0;
 // threat parameter from an easy wave-1 floor up to a full-intensity ceiling (see §2.6/§2.13).
 const RAMP_WAVES = 8;           // THE knob: larger = slower ramp. Feeds difficultyFactor(wave);
                                 // ~0 at wave 1, ~0.9 by wave 20, plateauing near 1 by ~wave 25.
+// CS017 P1: the difficulty CYCLE clock. CS017 P3 wired it into the SAWTOOTH levers below (debris
+// count/speed, Hunter speed/turn). The FROZEN levers — everything else, saucers included — keep
+// sampling the absolute game.wave; that asymmetry is deliberate (GDD §2.13).
+const CYCLE_LENGTH = 9;         // PLAYTEST KNOB: waves per difficulty cycle; the sawtooth reset period
+const CYCLE_GAIN   = 0.12;      // PLAYTEST KNOB: per-cycle escalation multiplier (FORK-CS017-A -> spiral)
+// CS017 P3 — the sawtooth debris knobs. Count and speed ramp on game.cycleWave (so they RESET at every
+// cycle boundary) and are then multiplied by cycleValue(x, game.cycle), so cycle N+1 opens above cycle N.
+const DEBRIS_COUNT_MAX      = 12;   // PLAYTEST KNOB: in-cycle ceiling on 3 + cycleWave (was the inline
+                                    // literal 9). At CYCLE_LENGTH 9 the in-cycle top is exactly 3+9=12,
+                                    // so this ceiling only binds if CYCLE_LENGTH grows past 9.
+const DEBRIS_COUNT_HARD_MAX = 24;   // PLAYTEST KNOB: absolute ceiling AFTER the spiral gain — a deep run
+                                    // can never spawn an unbounded field. First binds at cycle 9 (~wave 90).
+const DEBRIS_SPEED_PER_WAVE = 0.08; // PLAYTEST KNOB: speed multiplier gained per cycle-wave (hoisted from
+                                    // the inline 0.08 that used to sit at BOTH debris-speed sites).
+const DEBRIS_SPEED_CAP = 2 * SHIP_MAX_SPEED; // 1040 px/s. FLAG-CS017-a GUARD RAIL, applied to the RESULTING
+                                    // per-entity speed in the DebrisSatellite ctor (never to the multiplier —
+                                    // the three sizes have different bases). Insurance, not a live constraint:
+                                    // at the shipped curve the fastest small debris reaches ~341 px/s
+                                    // (160 base x 1.64 top-of-cycle speedMul x 1.3 roll) against a 1040 cap;
+                                    // the cap only starts to bind around cycle 18 (~wave 171).
 // Saucer spawn gap (sec between saucers): wide early, tightening with difficulty.
 // Re-expresses the old `rand(12,22) - min(6,wave)` as an interpolated rand(min,max) range.
 const SAUCER_GAP_FLOOR_MIN = 20;  // wave-1 shortest gap between saucers
@@ -422,12 +466,20 @@ const POWERUP_RADIUS = 15;          // pickup icon radius = its collision radius
 // baseline as difficulty ramps. Ships DISABLED (pinned at start=2.0). See DIFFICULTY-LEVERS.md.
 const LEVER_POWERUP_SIZE = { enabled: false, start: 2.0, floor: 1.0 };
 const POWERUP_DECAY = 26;           // sec an uncollected powerup lingers before fading (v3.3 P3: 14->26, playtest knob — shot powerups should linger longer)
-const POWERUP_DROP_TYPES = ["rapid", "triple", "magnet", "engine"]; // TIMED effects the HUD/powerActive/powerBudget machinery understands — Health & Scoop are NOT here (see POWERUP_DROP_WEIGHTS)
+// CS017 P6: "guard" (the chain guard) APPENDED — it is a genuine timed effect, so it belongs on this
+// list (HUD row, powerActive/powerMode/powerBudget, the expiry latch). Appended, never inserted: the
+// order is load-bearing (it fixes each type's HUD row index — see drawHUD), so a new type must land
+// at the END or every existing row moves.
+const POWERUP_DROP_TYPES = ["rapid", "triple", "magnet", "engine", "guard"]; // TIMED effects the HUD/powerActive/powerBudget machinery understands — Health & Scoop are NOT here (see POWERUP_DROP_WEIGHTS)
 // v3.3 P3: what can actually DROP (weighted), a SEPARATE structure from POWERUP_DROP_TYPES above.
 // Favors the shot powerups; Scoop is droppable but is a persistent, non-timed upgrade, so it is
 // deliberately absent from POWERUP_DROP_TYPES (the timed-effect list). Weights are the playtest knob.
 // v3.6 P3: this is now the type-roll table for THREE unconditional emitters (dropPowerup) — see below.
-const POWERUP_DROP_WEIGHTS = { rapid: 3, triple: 3, scoop: 2, magnet: 1, engine: 1 };
+// CS017 P6: "guard" is the first CONDITIONAL entry — dropPowerup only admits it to the roll while the
+// player is towing >= DEBUG.chainGuardMinTow nodes (a guard with nothing to guard is a dead pickup).
+// Below that threshold the roll renormalises over the other five and is byte-identical to pre-P6.
+// Weight 1 puts it in the existing rare tier alongside magnet/engine — a PLAYTEST KNOB, like the rest.
+const POWERUP_DROP_WEIGHTS = { rapid: 3, triple: 3, scoop: 2, magnet: 1, engine: 1, guard: 1 };
 const POWERUP_HEALTH_GAP = [18, 26]; // sec between ambient Health spawns (saucer-like cadence)
 const POWERUP_HEALTH_AMOUNT = 25;    // +HP on Health pickup, capped at max (matches the F2 milestone repair)
 const POWERUP_HEALTH_MIN_DIST = 220; // ambient Health spawns in a ring this..MAX from the ship (reachable, visible)
@@ -468,6 +520,9 @@ const RAPID_SHOTS   = 40;           // trigger-pulls Rapid Fire lasts in "shots"
 const TRIPLE_SHOTS  = 30;           // trigger-pulls Triple Shot lasts in "shots" mode (a 3-fan is ONE pull)
 const MAGNET_PIECES = 40;           // canisters hooked the Magnet lasts in "pieces" mode (v3.4 P4: 20->40, counted at the hook)
 const POWERUP_BUDGET = { rapid: RAPID_SHOTS, triple: TRIPLE_SHOTS, magnet: MAGNET_PIECES }; // full budget by type
+// CS017 P6: "guard" is deliberately ABSENT here — its count-mode budget is the live, dev-tunable
+// DEBUG.chainGuardIntercepts, not a frozen const, so a panel change takes effect on the next pickup.
+// Read it through powerBudgetAmount(type) (the sibling of powerDuration(type)), never this table.
 // Scoop (v3.3 P3) — a PERSISTENT, non-timed ship upgrade, the first of its kind here. It lives on
 // game.scoopLevel (0..SCOOP_MAX_LEVEL), NOT in powerFx/powerBudget, and it only ever decays by TAKING
 // HITS (never on a clock). Each level widens/deepens an oriented capture BOX (the "mouth") on the
@@ -853,6 +908,36 @@ const AudioSys = {
     g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
     o.connect(g).connect(this.sfx);
     o.start(t); o.stop(t + 0.21);
+  },
+
+  secretArm() { // CS015 P4: the debug secret code armed a capture window — 3 quick ASCENDING blips
+    if (!this.ctx) return;
+    const t = this.now();
+    [440, 587, 784].forEach((f, i) => { // A4 - D5 - G5, rising
+      const o = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      o.type = "square";
+      o.frequency.setValueAtTime(f, t + i * 0.06);
+      g.gain.setValueAtTime(0.05, t + i * 0.06);
+      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.06 + 0.05);
+      o.connect(g).connect(this.sfx);
+      o.start(t + i * 0.06); o.stop(t + i * 0.06 + 0.06);
+    });
+  },
+
+  secretDisarm() { // CS015 P4: the debug secret-code window timed out / was cancelled — the same 3 blips DESCENDING
+    if (!this.ctx) return;
+    const t = this.now();
+    [784, 587, 440].forEach((f, i) => { // G5 - D5 - A4, falling
+      const o = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      o.type = "square";
+      o.frequency.setValueAtTime(f, t + i * 0.06);
+      g.gain.setValueAtTime(0.05, t + i * 0.06);
+      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.06 + 0.05);
+      o.connect(g).connect(this.sfx);
+      o.start(t + i * 0.06); o.stop(t + i * 0.06 + 0.06);
+    });
   }
 };
 
@@ -1587,11 +1672,19 @@ const VOICE_LINES = {
       phon: "T R AH1 K / IH Z / F UH1 L , L EH1 T S / G OW1 ." },
   ],
   chain_broken: [
-    { text: "Junk is gone!", phon: "JH AH1 NG K / IH Z / G AO1 N ." },
-    { text: "Lost my scrap!", phon: "L AO1 S T / M AY1 / S K R AE1 P ." },
-    { text: "Trash is loose!", phon: "T R AE1 SH / IH Z / L UW1 S ." },
-    { text: "There goes the garbage!", phon: "DH EH1 R / G OW1 Z / DH AH / G AA1 R B IH JH ." },
-    { text: "There goes my junk!", phon: "DH EH1 R / G OW1 Z / M AY1 / JH AH1 NG K ." },
+    { text: "Payload damaged.",         phon: "P EY1 L OW D / D AE1 M IH JH D ." },
+    { text: "Payload disrupted.",       phon: "P EY1 L OW D / D IH S R AH1 P T IH D ." },
+    { text: "Payload lost.",            phon: "P EY1 L OW D / L AO1 S T ." },
+    { text: "Payload adrift.",          phon: "P EY1 L OW D / AH D R IH1 F T ." },
+    { text: "Payload is getting away.", phon: "P EY1 L OW D / IH Z / G EH1 T IH NG / AH W EY1 ." },
+  ],
+  // CS017 P7 — fired from the guard-absorb branch at the top of breakChain (the single choke point,
+  // so a multi-node hit speaks once). Lab-composed and zero-err-verified by Paul in
+  // tools/voice-robot-lab.html; pasted verbatim.
+  chain_guard: [
+    { text: "Payload protected.",       phon: "P EY1 L OW D / P R AH T EH1 K T IH D ." },
+    { text: "Payload armor activated.", phon: "P EY1 L OW D / AA1 R M ER / AE1 K T IH V EY T IH D ." },
+    { text: "Payload shield on.",       phon: "P EY1 L OW D / SH IY1 L D / AA1 N ." },
   ],
 };
 
@@ -1640,7 +1733,7 @@ function levelPhon(n) {
 // a lower one that is currently playing; an equal/lower one is DROPPED (never queued — a queue would have
 // Dan narrating events that finished ten seconds ago). 3 = hull critical, 2 = health milestones, 1 = rest.
 const VOICE_COOLDOWN = 1.2;
-const VOICE_PRIORITY = { health_low: 3, health_relief: 2, health_full: 2, level: 2, chain_broken: 2 };
+const VOICE_PRIORITY = { health_low: 3, health_relief: 2, health_full: 2, level: 2, chain_broken: 2, chain_guard: 2 };
 
 // CS011 P2 — on-screen caption look/timing knobs (LOOK-CALL). The caption is Dan's VISIBLE echo, shown
 // whenever settings.captions is on — even with voice audio OFF — and gated by the SAME cooldown/priority
@@ -2078,6 +2171,32 @@ window.addEventListener("keydown", e => {
   const k = e.key.toLowerCase();
   AudioSys.init(); AudioSys.resume();
 
+  // CS015 P4: hidden Debug Options secret code — consulted before the three context branches below, but
+  // ONLY on the Title screen or a paused live game (never mid-play, gameover, a rebind capture, or
+  // initials entry), so its keystrokes can't collide with those exclusive input modes. The backtick ARMS
+  // a capture window and is consumed (return); each later single-char key accretes into DebugCode.buf
+  // (raw e.key, so case + shifted symbols like G/3/$ survive; multi-char keys — Shift/Arrow*/Enter/Esc —
+  // are dropped). When the buffer's tail matches DEBUG_CODE the panel opens (openDebug from title, else
+  // gotoScreen off the paused root). Non-backtick code chars fall through INERT — none are nav/confirm/
+  // pause/O keys — so nothing is visible until the code lands. The window self-expires on inactivity in
+  // loop(). Backtick keys are NOT preventDefault'd.
+  if (!game.menu.rebinding && !game.entry && (game.state === "title" || (game.paused && game.state === "playing"))) {
+    if (e.key === "`") {
+      DebugCode.armed = true; DebugCode.buf = ""; DebugCode.last = performance.now();
+      AudioSys.secretArm();
+      return;
+    } else if (DebugCode.armed && !e.repeat) {
+      DebugCode.last = performance.now();
+      if (e.key.length === 1) { // single-char keys only — modifiers/arrows/Enter/Esc have multi-char e.key
+        DebugCode.buf = (DebugCode.buf + e.key).slice(-DEBUG_CODE.length);
+        if (DebugCode.buf.endsWith(DEBUG_CODE)) {
+          DebugCode.armed = false; DebugCode.buf = "";
+          if (game.state === "title") openDebug(); else gotoScreen("debug");
+        }
+      }
+    }
+  }
+
   // (1) Rebind capture — exclusive; the key never reaches gameplay or nav.
   if (game.menu.rebinding) {
     e.preventDefault();
@@ -2120,12 +2239,22 @@ window.addEventListener("keydown", e => {
   // THE LOAD-BEARING GUARD (v3.6 P6, §10): without `&& !game.entry`, confirm would restart the run
   // instead of committing the initials — belt-and-suspenders alongside the early return above, in
   // case entry-handling is ever restructured.
+  //
+  // CS016 P2: these three lines are now unreachable at the TITLE — the title menu satisfies
+  // menuActive(), so branch (2) intercepts and routes to menuTitle (which handles confirm/"o"/ESC/Start
+  // itself). They are STILL REQUIRED at GAMEOVER, which has no menu open until the player opens one
+  // (game.menu.screen stays null, game.paused false), so the `game.state === "title"` operands are
+  // deliberately left in place rather than trimmed: gameover -> pause -> Quit to Title and boot both
+  // arrive at the title with a menu armed, but nothing guarantees a future state won't reach the title
+  // with a null screen, and the fallback costs nothing.
   if (bindings.confirm.keys.includes(k) && (game.state === "title" || game.state === "gameover") && !game.entry) startGame();
   if (bindings.pause.keys.includes(k) && game.state === "playing") openPause();
   // "O" opens OPTIONS directly from title/gameover (v3.0 P4 replaced the old P->options path; CS012 P4
   // FORK-CS012-C → a replaced the Options/Achievements system-menu root with Options itself). No game to
   // pause here — openPause() routes to the Options screen off game.state.
   // Guarded off during initials entry so O can't pop the menu mid-entry.
+  // CS016 P2: the title case now goes through handleMenuKey's "o" -> menuInput("options") -> menuTitle
+  // instead (see there); this line still serves gameover.
   if (k === "o" && (game.state === "title" || game.state === "gameover") && !game.entry) openPause();
 });
 window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
@@ -2184,6 +2313,11 @@ function handleGamepadMenu() {
   //           menu-branch case above).
   //   B     = context-aware  : title/gameover with no menu -> open OPTIONS directly (mirrors ESC/O).
   //   A     = confirm        : title/gameover -> start a game (never mid-play, where A is fire).
+  //
+  // CS016 P2: all three are now unreachable at the TITLE — the title menu satisfies menuActive(), so
+  // branch (2) above catches Start/A/B first and routes them to menuTitle, which reproduces every one
+  // of these behaviours deliberately (Start -> startGame, A -> confirm the focused row, B -> Options).
+  // They remain LIVE and REQUIRED at gameover, which has no menu open until the player opens one.
   const onTitleOrOver = game.state === "title" || game.state === "gameover";
   if (pressedStart) {
     if (game.state === "playing") openPause();
@@ -2231,10 +2365,14 @@ function firstPressedButton() {
 // ---------- Menu state machine, Options & Rebinding (F8) ----------
 // The game's first nested menu: playing --(pause)--> menu:root (Continue/Options/Quit) -->
 // menu:options (SFX/Music/Master sliders + Controls) --> menu:controls (rebind + Return to Defaults).
-// game.paused is true iff a menu is open; game.menu.screen names the current screen (null = closed).
+// game.menu.screen names the current screen (null = no menu). CS016 P1/P2: game.paused is no longer a
+// synonym for "a menu is open" — that is menuActive(), i.e. `paused || screen !== null`. The TITLE menu
+// (screen "titlemenu") owns input with game.paused FALSE, because there is no sim to freeze there;
+// every OTHER screen is an overlay opened via openPause()/openDebug(), which do set game.paused.
 // Both keyboard (keydown -> handleMenuKey) and gamepad (handleGamepadMenu) funnel discrete actions
-// into menuInput(action); the rendering lives near draw() (drawMenu). Gameplay stays frozen the
-// whole time (update() early-returns on paused), so menu input can never move the ship.
+// into menuInput(action); the rendering lives near draw() (drawMenu, plus drawTitleMenu for the
+// chrome-less title root). Gameplay stays frozen the whole time (update() early-returns on paused, and
+// on state !== "playing" for the title), so menu input can never move the ship.
 
 // The root ("PAUSED"/"MENU") screen is context-aware. CS012 P4 (FORK-CS012-C → a) retired the
 // separate system-menu root (the old MENU_ROOT_SYS = ["Options","Achievements","Back"]): from
@@ -2243,17 +2381,74 @@ function firstPressedButton() {
 // with its own session verbs (Play Again / Quit to Title) — distinct from the paused-mid-game root
 // (Continue / Quit). rootItems() picks the layout off game.state; update() skips the sim outside
 // "playing", so game.paused is safe in any state.
-const MENU_ROOT_PLAY = ["Continue", "Options", "Quit"];             // paused mid-game
+// CS016 P4 (§4): "Save" is a placeholder row — save-game itself is not implemented this round. It uses
+// the shared unavailable-row idiom (below): focusable, always COLOR.dim, confirm is inert. MENU_ROOT_OVER
+// is deliberately NOT given one — there is no run in progress at gameover for a save to apply to.
+const MENU_ROOT_PLAY = ["Continue", "Save", "Options", "Quit"];     // paused mid-game
 const MENU_ROOT_OVER = ["Play Again", "Options", "Quit to Title"];  // gameover (CS013 P1)
+// CS016 P2 (§1): the TITLE screen's own root menu — the third root layout, and the only one that is
+// not an overlay. It lives at game.menu.screen === "titlemenu" with game.paused staying FALSE (the
+// sim was never running at the title), which is exactly the concept split CS016 P1 opened up.
+// Achievements/High Scores are reachable ONLY from here as of this phase (single-parent IA,
+// FORK-CS016-A) — they are deliberately no longer under Options, and so no longer reachable mid-run
+// or at gameover. Cursor defaults to "Start Game" on every entry, so ENTER / A still starts a run
+// immediately (the existing muscle memory survives).
+const MENU_TITLE = ["Start Game", "Achievements", "High Scores", "Options"];
+// Title-menu layout (FORK-CS016-B → b: chrome-less, drawn straight onto the title art — no backdrop
+// dim, no menuPanel box). The rows sit in the band the two removed keyboard-legend lines vacated,
+// between "O V E R H A U L" (baseline VIEW_H/2 - 60) above and "BEWARE THE HUNTER SATELLITE"
+// (baseline VIEW_H/2 + 120) below. All four are PLAYTEST KNOBS.
+const TITLE_MENU_Y      = VIEW_H / 2 - 18;   // first row baseline (342 at VIEW_H 720)
+const TITLE_MENU_STEP   = 38;                // px between row baselines — 4 rows span 114px, ending at 456
+const TITLE_MENU_SIZE   = 24;                // row text size, matching drawRootMenu's rows
+const TITLE_MENU_HINT_Y = VIEW_H / 2 + 170;  // control-hint baseline, below the flavour line (530)
+// Routed through drawMenuHint() (the CS013 P2 shared-footer helper), not a fresh drawText literal.
+const TITLE_MENU_HINT   = "↑↓ move    ENTER / A select    ESC / B options";
 const MENU_HINT_SIZE = 16;  // CS013 P2: control-hint footer text size (drawMenuHint) — playtest knob
 const ACH_SCALE = 1.5;      // CS013 P3: Achievements-viewer text-size multiplier (readability pass) — playtest knob
 const ACH_SCROLL_STEP = 60; // CS013 P3: px per up/down scroll press in the Achievements viewer, ~one row — playtest knob
+// CS016 P5: the viewer's two tabs replace the old three columns. The default tab id lives up here
+// (not beside ACH_TABS down in the viewer section) because game.menu's object literals — evaluated
+// long before the viewer's consts — need it, and a `const` referenced ahead of its definition is a
+// TDZ throw at load, not an undefined. ACH_TABS[0].id reads this, so the two can't drift apart.
+const ACH_TAB_DEFAULT = "weekly";
+const ACH_HINT = "↑↓ scroll    ◄► switch tab    ESC / B / ENTER  return";
+// CS015 P1: the root/PAUSED panel's control hint, at MENU_HINT_SIZE 16, no longer fits the fixed
+// 360px panel width — hoisted to a const so drawRootMenu's width measurement and its drawMenuHint
+// call can't drift apart. ROOT_MENU_HINT_MARGIN is the side padding added to the measured text
+// width on each edge before it becomes the panel width — playtest knob.
+const ROOT_MENU_HINT = "↑↓ move    ENTER / A select    ESC / B back";
+const ROOT_MENU_HINT_MARGIN = 28;
+// --- CS016 P3: the modal confirmation dialog (the build's FIRST modal) ---
+// Layout deliberately reuses drawRootMenu's vertical rhythm one-for-one, so the dialog reads as the
+// same family of panel rather than a new widget: menuPanel's own title baseline (y+46), then the
+// prompt, then two rows at the root's 46px step / 24px size, then a drawMenuHint footer at y+272
+// inside a 300px-tall box. Width is MEASURED (CS015 P1's self-healing precedent), never fixed — the
+// prompt text is per-consumer, so a hardcoded width would clip the first long one someone adds.
+const MODAL_TITLE        = "CONFIRM";
+const MODAL_CANCEL_LABEL = "CANCEL";  // openModal's default cancelLabel — the safe row, always index 1
+const MODAL_HINT         = "↑↓ move    ENTER / A select    ESC / B cancel";
+const MODAL_MIN_W        = 420;       // floor, so a very short prompt still gets a dialog-sized box
+const MODAL_MARGIN       = 28;        // side padding added to the measured text on EACH edge (mirrors ROOT_MENU_HINT_MARGIN)
+const MODAL_H            = 300;       // same box height as the root panel
+const MODAL_TEXT_SIZE    = 20;        // the prompt line
+const MODAL_TEXT_Y       = 110;       // prompt baseline, relative to the panel top
+const MODAL_ROW_Y        = 172;       // first choice row (confirm), relative to the panel top
+const MODAL_ROW_STEP     = 46;        // px between the two choice rows — drawRootMenu's step
+const MODAL_ROW_SIZE     = 24;        // choice-row text size — drawRootMenu's size
+const MODAL_HINT_Y       = 272;       // control-hint baseline, relative to the panel top
 function rootItems() { return game.state === "gameover" ? MENU_ROOT_OVER : MENU_ROOT_PLAY; }
 // menuOptions()/drawOptionsMenu() dispatch by LABEL (like menuRoot), not by hardcoded index, so
 // adding a row here is purely additive and can't silently shift the other handlers out from under
 // themselves. CS010 P4 (§9/§10a): the three volume sliders + Music Track moved OFF this screen onto
 // the new "Sound / Music" sub-screen (SOUND_ROWS below); "High Scores" (§8b) moved IN, nested here.
-const MENU_OPTIONS = ["Sound / Music", "Controls", "Achievements", "High Scores", "Difficulty", "Back"];
+// CS016 P2 (§2, FORK-CS016-A): 6 rows -> 4. "Achievements" and "High Scores" moved OUT to MENU_TITLE
+// as their SOLE parent, reversing CS010 P4 §8b and CS012 P4 deliberately (see the GDD). Safe to do
+// positionally-blind: every consumer addresses rows by LABEL via MENU_OPTIONS.indexOf(...) — verified
+// by grep at all 6 remaining call sites plus the forEach renderer, no hardcoded index anywhere.
+// Options is now purely "change how the game behaves"; the title menu is "start playing, or look at
+// things".
+const MENU_OPTIONS = ["Sound / Music", "Controls", "Difficulty", "Back"];
 // CS010 P4 (§9): the Sound/Music sub-screen's rows, same template as DIFFICULTY_ROWS. CS010 P9 (§11c)
 // added the Voice Volume slider — SOUND_ROWS + VOL_LABELS + VOL_CATS grow together so the parallel
 // label→category lookup stays paired. CS011 P3 added "Voice" (style picker) + "Captions" (toggle),
@@ -2275,7 +2470,154 @@ const settings = {
   voiceStyle:      "comms", // CS011: selected Dan voice — "off" or a VOICE_STYLE_VALUES id. NOT persisted yet (later phase).
   captions:        true,    // CS011: show on-screen captions of Dan's lines. NOT persisted yet (later phase).
   autoShield:      false,   // CS012 P5: auto-raise the shield on a hit at critical hull (costs energy + AUTO_SHIELD_SCORE_PENALTY). Off by default.
+  chainGuardMode:  "time",  // CS017 P6: "time" | "count" — how the chain-guard powerup expires. Same dual-mode
+                            // pattern as shotPowerupMode/magnetMode, and the same "time" default, so the shipped
+                            // behaviour is the timed one until a player opts in via Options -> Difficulty.
 };
+
+// ---------- Debug Options (CS015 P4) — a hidden, data-driven tuning panel ----------
+// Reached only by a secret keystroke sequence (see DebugCode + the keydown listener); never listed in
+// any menu. DEBUG_VARS is the single source of truth (FLAG-CS015-h): one registry entry drives the
+// panel render, the adjust handler, AND persistence generically, so adding/removing a knob in a later
+// changeset is one registry edit + repointing its consumer — the same "tracks/lines are DATA" idiom
+// used elsewhere. Each entry's `def` derives from the shipped gameplay const (in display units) so
+// there is ONE source of truth for the default; `toNative` converts a display value (what the panel
+// shows/persists) into the native unit the consumer reads (identity when absent). P4 shipped exactly
+// one entry (item 5); P5 (items 7, 11, 12) adds four more entries only — no panel/persistence code
+// changes; P6 does the same.
+const DEBUG_VARS = [
+  { id: "autoShieldRegenPause", label: "Auto Shield Regen Pause", unit: "ms",
+    def: AUTO_SHIELD_REGEN_PAUSE * 1000, min: 0, max: 5000, step: 100, toNative: v => v / 1000 },
+  // CS015 P5 (items 7, 11, 12): four more knobs, same registry/toNative idiom — defaults derive from
+  // the shipped consts (SCOOP_HITS_PER_LEVEL, GARBAGE_COALESCE_DELAY/MAGNET_RANGE/MAGNET_PULL), which
+  // stay in place as the documented shipped values. No panel/persistence code changes.
+  { id: "scoopHitsPerLevel", label: "Hits before losing scoop", unit: "",
+    def: SCOOP_HITS_PER_LEVEL, min: 1, max: 20, step: 1 },
+  { id: "garbageAttractDelay", label: "Garbage attraction delay", unit: "ms",
+    def: GARBAGE_COALESCE_DELAY * 1000, min: 0, max: 10000, step: 250, toNative: v => v / 1000 },
+  { id: "garbageAttractRadius", label: "Garbage attraction radius", unit: "px",
+    def: GARBAGE_MAGNET_RANGE, min: 0, max: 600, step: 10 },
+  { id: "garbageAttractForce", label: "Garbage attraction force", unit: "px/s²",
+    def: GARBAGE_MAGNET_PULL, min: 0, max: 200, step: 5 },
+  // CS015 P6 (item 10, FLAG-CS015-a): garbage of ANY size now ages out on this lifetime (a merge
+  // resets the clock) — RESOLVED default 10s, not the old single-only GARBAGE_DECAY (22). The const
+  // stays in place as the documented pre-P6 shipped value; this knob is the live source of truth now.
+  { id: "garbageLifetime", label: "Garbage lifetime", unit: "s",
+    def: 10, min: 1, max: 60, step: 1 },
+  // CS017 P4: the time-in-level saucer pressure axis (FORK-CS017-B -> (b) COMPOSE). saucerPressureSecs
+  // is how long a level takes to reach full pressure; the two *Pressure knobs scale how much of the
+  // FLOOR..CEIL gap that pressure closes (0 disables the axis entirely, reproducing pre-P4 behaviour).
+  { id: "saucerPressureSecs", label: "Saucer pressure ramp time", unit: "s",
+    def: 90, min: 10, max: 300, step: 5 },
+  { id: "saucerAimPressure", label: "Saucer aim pressure scale", unit: "",
+    def: 0.5, min: 0, max: 1, step: 0.05 },
+  { id: "saucerGapPressure", label: "Saucer gap pressure scale", unit: "",
+    def: 0.5, min: 0, max: 1, step: 0.05 },
+  // CS017 P6: the chain-guard powerup's three knobs. chainGuardTime is powerDuration("guard") in TIME
+  // mode; chainGuardIntercepts is the seeded powerBudget in COUNT mode (see powerBudgetAmount); both are
+  // live values, NOT frozen consts, so the registry entry IS the source of truth for each default.
+  // chainGuardMinTow is the drop gate — "guard" only enters the dropPowerup roll while the player is
+  // towing at least this many nodes. 0 makes it always-eligible (the un-gated roll), which is the useful
+  // dev setting for exercising the powerup without first building a load.
+  { id: "chainGuardTime", label: "Chain guard duration", unit: "s",
+    def: 30, min: 5, max: 120, step: 5 },
+  { id: "chainGuardIntercepts", label: "Chain guard intercepts", unit: "",
+    def: 3, min: 1, max: 10, step: 1 },
+  { id: "chainGuardMinTow", label: "Chain guard min tow", unit: "",
+    def: 5, min: 0, max: 24, step: 1 },
+];
+const DEBUG = {};        // native-unit live values — what consumers read (e.g. seconds for the regen lock)
+const debugShown = {};   // display-unit values — what the panel shows and what persists in afd_settings_v1.debug
+function applyDebug(id, shown) {
+  const e = DEBUG_VARS.find(v => v.id === id);
+  debugShown[id] = shown;
+  DEBUG[id] = e.toNative ? e.toNative(shown) : shown;
+}
+for (const v of DEBUG_VARS) applyDebug(v.id, v.def);   // seed both maps from the registry defaults
+
+// Secret-code entry state for the debug panel (module-level; driven by the keydown listener + loop()).
+// The backtick ARMS a capture window; subsequent single-char keys accrete into `buf` until its tail
+// matches DEBUG_CODE, then the panel opens. The window self-expires after DEBUG_CODE_IDLE_MS of
+// inactivity — timed in loop() (which runs every frame), NOT update() (paused/title-gated, exactly the
+// states the code is armed in). The code's characters are deliberately none of the nav/confirm/pause/O
+// keys, so every keystroke stays inert on the title/pause screens until the full code lands (item 4.3).
+const DEBUG_CODE = "EvilG3niu$";
+const DEBUG_CODE_IDLE_MS = 4000;
+const DebugCode = { armed: false, buf: "", last: 0 };
+
+// ---------- Dev-only difficulty logging (CS017 P2) — nothing player-visible, nothing persisted ----------
+// One snapshot row per nextWave() call, kept only in memory (never touches localStorage) and exported by
+// hand from the DEBUG_CODE-gated debug panel below. DIFFLOG_FIELDS is the single source of truth for both
+// the row shape (logDifficultySnapshot) and the CSV column order (difficultyLogCSV) — the field list is
+// frozen by IMPLEMENTATION-PHASES-CS017.md P2 and must not change; only the expressions feeding each field
+// may be repointed as later phases (P3/P4) wire the levers for real.
+const DIFFLOG_MAX = 2000; // cap so a long dev session can't grow the buffer without bound; drops oldest
+const DiffLog = { rows: [] };
+const DIFFLOG_FIELDS = [
+  "t", "wave", "cycle", "cycleWave", "score",
+  "debrisCount", "debrisSpeedMul", "hunterSpeedFrac", "hunterTurnFrac",
+  "saucerAimErr", "saucerGapMin", "saucerGapMax",
+  "hunterCount", "chainLen", "cargoMax", "scoopLevel",
+];
+// Snapshots read every lever from the SAME expressions the live sites use — never a re-derived formula.
+// debrisCount/debrisSpeedMul are passed in verbatim from nextWave()'s own `count`/`speedMul` locals (the
+// exact values that wave's DebrisSatellite spawns just used). hunterSpeedFrac/hunterTurnFrac are today
+// IDENTICAL — both HunterSatellite's speed and turnRate ramp from the same HUNTER_FLOOR_FRAC floor up to
+// their own per-tier ceiling (see the ctor), so the ceiling cancels out of the ratio and both reduce to
+// this one fraction; logged as two fields (not one) because P4 may give them independent curves later.
+// CS017 P3 REPOINTED both to the cycle-wave sawtooth + cycleValue() spiral the HunterSatellite ctor now
+// samples — the field list is frozen, but what feeds it tracks the live sites (see the header note above).
+// Note these two can now exceed 1: they are a fraction OF THE CEILING, and the spiral term deliberately
+// carries deep cycles past it. saucerAimErr/saucerGapMin/saucerGapMax mirror the exact ramp() calls at the
+// saucer aim and spawn-gap sites (there is no cached variable to read at nextWave() time) — those are
+// FROZEN levers and still sample the absolute game.wave, which is exactly what makes this log able to
+// show the sawtooth/monotonic asymmetry side by side.
+function logDifficultySnapshot(debrisCount, debrisSpeedMul) {
+  DiffLog.rows.push({
+    t: performance.now(),
+    wave: game.wave,
+    cycle: game.cycle,
+    cycleWave: game.cycleWave,
+    score: game.score,
+    debrisCount,
+    debrisSpeedMul,
+    hunterSpeedFrac: cycleValue(ramp(HUNTER_FLOOR_FRAC, 1, game.cycleWave), game.cycle),
+    hunterTurnFrac: cycleValue(ramp(HUNTER_FLOOR_FRAC, 1, game.cycleWave), game.cycle),
+    saucerAimErr: ramp(SAUCER_AIM_ERR_FLOOR, SAUCER_AIM_ERR_CEIL, 1 + (game.wave - 1) * SAUCER_ACCURACY_RAMP_SCALE),
+    saucerGapMin: ramp(SAUCER_GAP_FLOOR_MIN, SAUCER_GAP_CEIL_MIN, game.wave),
+    saucerGapMax: ramp(SAUCER_GAP_FLOOR_MAX, SAUCER_GAP_CEIL_MAX, game.wave),
+    hunterCount: game.hunters.length, // FLAG-CS017-g: seeds the future music-intensity changeset
+    chainLen: game.chain.length,
+    cargoMax: game.cargoMax,
+    scoopLevel: game.scoopLevel,
+  });
+  if (DiffLog.rows.length > DIFFLOG_MAX) DiffLog.rows.shift(); // drop oldest, keep the cap
+}
+// CSV column order matches DIFFLOG_FIELDS exactly; one header line + one line per row.
+function difficultyLogCSV() {
+  const lines = [DIFFLOG_FIELDS.join(",")];
+  for (const row of DiffLog.rows) lines.push(DIFFLOG_FIELDS.map(f => row[f]).join(","));
+  return lines.join("\n");
+}
+// "Dump difficulty log" debug-panel action (item 5). Builds the CSV, triggers a Blob download, then
+// clears the buffer — clear only on a successful dump. An empty buffer does nothing but the negative
+// blip (no download). The download path is wrapped so a headless/no-DOM environment (or a test stub
+// missing Blob/URL/click) can never throw; the run still counts as a successful dump.
+function dumpDifficultyLog() {
+  if (!DiffLog.rows.length) { AudioSys.ui(false); return; }
+  const csv = difficultyLogCSV();
+  try {
+    const blob = new Blob([csv], { type: "text/csv" });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `orbital-difficulty-${ts}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  } catch (e) { /* headless/no-DOM: download silently unavailable, buffer still clears below */ }
+  DiffLog.rows = [];
+  AudioSys.ui(true);
+}
 
 // CS011: Dan speaks only when a real voice style is selected. voiceStyle "off" mutes him without disturbing
 // VOICE_PARAMS (which keeps the last real style so the acoustic engine always has a valid full object).
@@ -2289,7 +2631,19 @@ const MUSIC_TRACK_LABELS = { zen: "Zen", derelict: "Derelict", drift: "Drift", w
 // CS011 P3: display labels for the Voice-style picker, parallel to VOICE_STYLE_VALUES.
 const VOICE_STYLE_LABELS = { off: "Off", comms: "Comms", comms_f: "Comms ♀", flat: "Monotone", flat_f: "Monotone ♀", vintage: "Computer", vintage_f: "Computer ♀" };
 
-function menuActive() { return game.paused; } // paused <=> a pause-menu screen is open
+// CS016 P1: split from a bare `game.paused` so "a menu owns input" (this) and "the sim is frozen"
+// (game.paused) can diverge — the title menu is input-owning but never pauses (update() already
+// early-returns on game.state !== "playing").
+// CS016 P2 resolves FLAG-CS016-l: the second operand was `=== "titlemenu"`, which only covered the
+// title's ROOT screen. gotoScreen("achievements"|"highscores") from the title menu sets
+// game.menu.screen to THAT name while game.paused stays false, so the old check read false again the
+// instant either screen was reached — killing Up/Down/Back on them and letting Confirm fall through
+// to the title's startGame() shortcut (Enter on the High Scores table would silently start a run).
+// `!== null` is the invariant that actually holds: game.menu.screen is non-null iff some menu screen
+// owns input, and it covers every present and future title-descendant screen without an OR chain.
+// The `game.paused ||` term is kept as belt-and-braces (a paused-with-null-screen state is
+// unreachable today — openPause/openDebug set both, closePause/quitToTitle clear both together).
+function menuActive() { return game.paused || game.menu.screen !== null; }
 
 // --- Open / close / quit ---
 function openPause() {
@@ -2300,7 +2654,7 @@ function openPause() {
   // Title), so it now ALSO opens the root — a context-aware one, see rootItems(). Title alone has no
   // session verbs and keeps going straight to Options.
   game.menu.screen = (game.state === "playing" || game.state === "gameover") ? "root" : "options"; game.menu.index = 0; game.menu.row = 0; game.menu.col = 0;
-  game.menu.rebinding = null;
+  game.menu.rebinding = null; game.menu.modal = null;   // CS016 P3: modal mirrors rebinding at every menu-state reset
   resetMenuNav();          // don't let a direction held at pause-time fire a phantom move
   AudioSys.thrust(false);  // kill the thrust loop immediately (update() would too, next frame)
   AudioSys.lowhp(false); game.lowHpSiren = false; // same — the siren must not drone through a pause menu
@@ -2308,14 +2662,38 @@ function openPause() {
   AudioSys.ui(true);
 }
 function closePause() {
+  // CS016 P2: at the TITLE there is no "no menu" state to close back to — the title menu IS the
+  // title's base UI, not an overlay. Every remaining route here from a title-context screen (the
+  // `pause` action on any Options sub-screen, debugReturn() out of the hidden panel) must therefore
+  // land on "titlemenu", or the title would render with no cursor and menuActive() would read false,
+  // leaving the whole screen dead to input. menuOptions' Back branches call returnToTitleMenu()
+  // directly (they're the designed path); this delegation is the catch-all for the rest.
+  if (game.state === "title") { returnToTitleMenu(); return; }
   game.paused = false;
-  game.menu.screen = null; game.menu.rebinding = null;
+  game.menu.screen = null; game.menu.rebinding = null; game.menu.modal = null;
   game.menu.index = 0; game.menu.row = 0; game.menu.col = 0;
+  AudioSys.ui(false);
+}
+// CS016 P2 (§2): the title menu's re-entry point, used by every Back/close that lands on the title.
+// It also CLEARS game.paused — openPause() sets it true so Options keeps its dimmed-panel chrome even
+// when opened from the title, and that flag must not survive back onto the paused-free title menu.
+// Cursor lands on "Options" (where the player just was); label lookup, never a hardcoded index.
+function returnToTitleMenu() {
+  game.paused = false;
+  game.menu.screen = "titlemenu";
+  game.menu.index = MENU_TITLE.indexOf("Options");
+  game.menu.row = 0; game.menu.col = 0; game.menu.scroll = 0;
+  game.menu.modal = null;  // CS016 P3: a clear site the P3 plan could not name — this helper post-dates it
   AudioSys.ui(false);
 }
 function quitToTitle() {
   game.paused = false;
-  game.menu.screen = null; game.menu.rebinding = null;
+  // CS016 P2: the title is a navigable menu now, so quitting to it must ARM that menu, not close all
+  // menus (screen = null would leave the title cursor-less and dead to input). Cursor resets to
+  // "Start Game" (index 0) rather than inheriting the root's — a stale index 2 ("Quit") would land on
+  // "High Scores" here.
+  game.menu.screen = "titlemenu"; game.menu.rebinding = null; game.menu.modal = null;
+  game.menu.index = 0; game.menu.row = 0; game.menu.col = 0; game.menu.scroll = 0;
   game.state = "title";
   AudioSys.thrust(false); AudioSys.saucer(false); // stop any continuous voices
   AudioSys.lowhp(false); game.lowHpSiren = false;
@@ -2327,7 +2705,56 @@ function quitToTitle() {
 function gotoScreen(s, index) {
   game.menu.screen = s;
   game.menu.index = index || 0; game.menu.row = 0; game.menu.col = 0; game.menu.scroll = 0;
+  game.menu.modal = null;  // CS016 P3: a dialog belongs to the screen that raised it and never survives a screen change
+  game.menu.achTab = ACH_TAB_DEFAULT;  // CS016 P5: sits beside the scroll reset — re-entry is always Weekly, unscrolled
   AudioSys.ui(true);
+}
+// CS015 P4: open the hidden Debug Options panel straight from the Title screen (where there is no root
+// menu to route through). Sibling of openPause — sets game.paused so update() freezes and menuActive()
+// reads true; from a paused live game the secret-code path uses gotoScreen("debug") instead (the game is
+// already paused). Not listed in any menu; reachable only by the secret code.
+function openDebug() {
+  game.paused = true;
+  game.menu.screen = "debug"; game.menu.index = 0; game.menu.row = 0; game.menu.col = 0;
+  game.menu.rebinding = null; game.menu.modal = null;
+  resetMenuNav();          // a direction held while typing the code must not fire a phantom first move
+  AudioSys.ui(true);
+}
+
+// --- CS016 P3: modal confirmation dialogs ---
+// The build's first modal. State is ONE nullable field on game.menu, mirroring `rebinding`: a mode
+// that owns menu input while it is non-null. `onConfirm` is a plain closure, so a consumer wires a
+// dialog with one call and no per-screen state.
+//
+// index 1 (CANCEL) IS THE SAFETY PROPERTY, not a default worth "tidying" to 0. Every consumer here is
+// destructive, and ENTER is the same key that opened the dialog — with index 0 a double-tap of ENTER
+// (or a held key that got past the e.repeat guard) would wipe a run or a rebind set with no
+// deliberate act. The player must move the cursor to destroy something.
+function openModal(text, confirmLabel, onConfirm, cancelLabel = MODAL_CANCEL_LABEL) {
+  game.menu.modal = { text, confirmLabel, cancelLabel, index: 1, onConfirm };
+  AudioSys.ui(true);
+}
+// The exclusive handler. Two rows only, so every direction is the same toggle — up/down is the
+// natural gesture for a vertical list, left/right costs nothing and stops a stick nudge reading as
+// dead input. No per-screen handler knows modals exist; menuInput's guard keeps them all unreached.
+function menuModal(a) {
+  const md = game.menu.modal;
+  if (a === "up" || a === "down" || a === "left" || a === "right") { md.index = 1 - md.index; AudioSys.ui(false); }
+  else if (a === "confirm") {
+    if (md.index === 0) {
+      // Capture, then CLEAR BEFORE INVOKING: onConfirm is free to navigate (quitToTitle re-arms the
+      // title menu, gotoScreen changes screen), and a teardown running after it would clobber the
+      // state the callback just set — or, worse, resurrect a dialog it had already dismissed.
+      const run = md.onConfirm;
+      game.menu.modal = null;
+      if (run) run();
+      AudioSys.ui(true);
+    } else { game.menu.modal = null; AudioSys.ui(false); } // ENTER on CANCEL is a dismissal, so the back tone
+  }
+  // `pause` is treated as cancel, NOT passed through: it must never close the whole menu out from
+  // under an open confirmation (closePause() from here would leave the dialog's question unanswered
+  // and the player back in the game with no idea which way it went).
+  else if (a === "back" || a === "pause") { game.menu.modal = null; AudioSys.ui(false); }
 }
 
 // --- Keyboard -> menu action mapping (arrows + WASD nav; Enter/Esc/P via the binding table) ---
@@ -2339,12 +2766,25 @@ function handleMenuKey(k) {
   else if (bindings.confirm.keys.includes(k)) menuInput("confirm"); // Enter
   else if (bindings.back.keys.includes(k)) menuInput("back");       // Esc
   else if (bindings.pause.keys.includes(k)) menuInput("pause");     // P
+  // CS016 P2: "o" as a menu-level action. The title now satisfies menuActive(), so branch (2) of the
+  // keydown listener swallows every key before the old title-only `if (k === "o") openPause()` in
+  // branch (3) can see it — that shortcut (existing muscle memory, FLAG-CS016-e) would have gone inert.
+  // Mapping it here keeps the one-action-vocabulary architecture: only menuTitle acts on "options";
+  // every other screen handler is an if/else-if chain over known actions, so it's an inert no-op there.
+  else if (k === "o") menuInput("options");
 }
 
 // --- The dispatcher: one entry point, both input methods feed it ---
 function menuInput(action) {
   if (game.menu.rebinding) return; // capture mode owns all input; ignore stray nav
+  // CS016 P3: the second exclusive mode, and it stays SECOND on purpose. Rebinding is a live hardware
+  // capture — the very next keypress is data, not navigation — so it must out-rank everything,
+  // including an open dialog. (The two are mutually exclusive in practice: you cannot reach a modal's
+  // opener while capturing, nor a rebind row while a modal is up. The order is the guarantee, not the
+  // observed behaviour.) Placed BEFORE the screen switch so no per-screen handler sees the action.
+  if (game.menu.modal) { menuModal(action); return; }
   switch (game.menu.screen) {
+    case "titlemenu":    menuTitle(action); break;   // CS016 P2: the title screen's own root
     case "root":         menuRoot(action); break;
     case "options":      menuOptions(action); break;
     case "sound":        menuSound(action); break;
@@ -2352,7 +2792,43 @@ function menuInput(action) {
     case "difficulty":   menuDifficulty(action); break;
     case "achievements": menuAchievements(action); break;
     case "highscores":   menuHighScores(action); break;
+    case "debug":        menuDebug(action); break;   // CS015 P4: hidden, secret-code-only
   }
+}
+
+// CS016 P2 (§1): the TITLE screen's root menu. Follows the menuRoot template exactly — dispatch by
+// LABEL, never by index, so reordering MENU_TITLE can't silently shift a branch out from under itself.
+//
+// Three actions do more than the plan's first sketch, each to avoid a silent regression that only
+// exists because the title now satisfies menuActive() and so shadows keydown branch (3) /
+// handleGamepadMenu branch (3), which used to handle these at the title:
+//   "options" — keyboard "o" (see handleMenuKey). Was branch (3)'s `k === "o"` title shortcut.
+//   "back"    — ESC (keyboard) AND B (gamepad) both normalize to "back". B on the title already
+//               opened Options (handleGamepadMenu branch (3), `pressedBack && onTitleOrOver`), so
+//               leaving "back" inert here would REGRESS the pad. Making it open Options preserves that
+//               and simultaneously delivers §7 / FLAG-CS016-e's "ESC opens Options from the title"
+//               (ESC was inert at the title before — it resolves to "back", and branch (3) only had a
+//               pause handler gated on state === "playing"). There is nothing to back OUT to from a
+//               root, so the action was free.
+//   "pause"   — gamepad Start (keyboard has no distinct pause key: both back and pause bind ESC, and
+//               handleMenuKey resolves back first). Start on the title already STARTED A GAME
+//               (branch (3), `pressedStart` -> startGame() outside "playing"); routed through here so
+//               it still does, with no state-sniffing special case bolted onto the pad dispatcher.
+function menuTitle(a) {
+  const m = game.menu, N = MENU_TITLE.length;
+  if (a === "up")   { m.index = (m.index + N - 1) % N; AudioSys.ui(false); }
+  else if (a === "down") { m.index = (m.index + 1) % N; AudioSys.ui(false); }
+  else if (a === "confirm") {
+    const label = MENU_TITLE[m.index];
+    if (label === "Start Game")        startGame();
+    else if (label === "Achievements") gotoScreen("achievements");
+    else if (label === "High Scores")  gotoScreen("highscores");
+    // openPause() (not gotoScreen) on purpose: it sets game.paused, which is what keeps Options and
+    // its sub-screens on their existing dimmed-panel drawMenu() chrome when opened from the title.
+    else if (label === "Options")      openPause();
+  }
+  else if (a === "back" || a === "options") openPause();   // ESC / B / "o" -> Options shortcut
+  else if (a === "pause") startGame();                     // gamepad Start -> start a run
 }
 
 function menuRoot(a) {
@@ -2364,10 +2840,17 @@ function menuRoot(a) {
     // Continue/Options/Quit, gameover gives Play Again/Options/Quit to Title. Dispatch by label
     // (menuOptions precedent) so the two layouts share one handler without an index branch.
     const label = items[m.index];
+    // CS016 P4 (§4): "Save" is deliberately given no branch — an unmatched label falls off this chain
+    // as a no-op (no state change, no AudioSys.ui() blip), which is the inert half of the shared
+    // unavailable-row idiom. drawRootMenu renders it in COLOR.dim so the cursor visibly stops there.
     if (label === "Continue")          closePause();
     else if (label === "Play Again")   startGame();
     else if (label === "Options")      gotoScreen("options");
-    else if (label === "Quit")         quitToTitle();
+    // CS016 P3: the two Quit rows split here, and label dispatch already tells them apart with no
+    // game.state sniffing. Mid-run "Quit" throws away a live run, so it is confirmed. Gameover's
+    // "Quit to Title" is deliberately NOT — the run is already over and there is nothing left to
+    // destroy, so a dialog there would be pure friction on the most-pressed row of that screen.
+    else if (label === "Quit")         openModal("Quit to title? Progress in this run will be lost.", "QUIT", quitToTitle);
     else if (label === "Quit to Title") quitToTitle();
   }
   else if (a === "back" || a === "pause") closePause();
@@ -2383,15 +2866,15 @@ function menuOptions(a) {
   else if (a === "confirm") {
     if (label === "Sound / Music") gotoScreen("sound"); // CS010 P4 §9
     else if (label === "Controls") gotoScreen("controls");
-    else if (label === "Achievements") gotoScreen("achievements"); // viewer (F9)
-    else if (label === "High Scores") gotoScreen("highscores"); // CS010 P4 §8b: nested under Options
+    // CS016 P2 (§2): the "Achievements" and "High Scores" rows are GONE from MENU_OPTIONS — the title
+    // menu is now their sole parent, so there are no dispatch branches for them here either.
     else if (label === "Difficulty") gotoScreen("difficulty"); // Difficulty screen (v3.0 P5)
     // CS012 P4 / CS013 P1: Back is context-aware — paused mid-game OR gameover (both have a root)
-    // return to it (cursor on Options); from title, where Options is the top-level dialog, it closes
-    // the overlay entirely.
-    else if (label === "Back") { if (game.state === "playing" || game.state === "gameover") gotoScreen("root", rootItems().indexOf("Options")); else closePause(); }
+    // return to it (cursor on Options). CS016 P2: from the title the `else` no longer closes the
+    // overlay entirely — the title has a menu of its own to return to, with game.paused cleared.
+    else if (label === "Back") { if (game.state === "playing" || game.state === "gameover") gotoScreen("root", rootItems().indexOf("Options")); else returnToTitleMenu(); }
   }
-  else if (a === "back") { if (game.state === "playing" || game.state === "gameover") gotoScreen("root", rootItems().indexOf("Options")); else closePause(); }
+  else if (a === "back") { if (game.state === "playing" || game.state === "gameover") gotoScreen("root", rootItems().indexOf("Options")); else returnToTitleMenu(); }
   else if (a === "pause") closePause();
 }
 
@@ -2434,50 +2917,107 @@ function menuSound(a) {
   else if (a === "pause") closePause();
 }
 
-// Achievements viewer (F9): a read-only list — no rows to select, so nav does nothing and any
-// of confirm/back/pause exits back to Options (cursor left on the "Achievements" row).
+// Achievements viewer (F9): a read-only list — no rows to select, so nav only scrolls/switches tab
+// and any of confirm/back/pause exits (cursor left on the "Achievements" row of its parent screen).
 function menuAchievements(a) {
   if (a === "pause") closePause();
+  // CS016 P5: left/right switch tabs. These two actions were UNUSED on this screen (it handled only
+  // up/down/confirm/back/pause), so there was no input to displace. WRAPPING, not clamping: with
+  // exactly two tabs either direction always lands on the other one — a player who taps ◄ on the
+  // Weekly tab gets Lifetime rather than a dead key — and setAchTab's modulo keeps that a carousel
+  // if a third tab is ever added.
+  else if (a === "left")  setAchTab(achTabIndex() - 1);
+  else if (a === "right") setAchTab(achTabIndex() + 1);
   // CS013 P3: up/down drive the continuous vertical scroll (FLAG-2c) — the viewer has no row
   // selection to conflict with. Keyboard and gamepad d-pad/L-stick both normalize to "up"/"down"
   // through menuInput, so this covers both inputs uniformly. Clamped against the SAME achMaxScroll()
   // drawAchievements() renders with, so input and render never disagree about the scroll ceiling.
   else if (a === "up")   game.menu.scroll = Math.max(0, game.menu.scroll - ACH_SCROLL_STEP);
   else if (a === "down") game.menu.scroll = Math.min(achMaxScroll(), game.menu.scroll + ACH_SCROLL_STEP);
-  // CS012 P4: Achievements now lives ONLY under Options (reached the same way from title/gameover AND
-  // from pause), so Back always returns to Options with the cursor on "Achievements" — the old
-  // achReturn tracker (which distinguished a direct system-root entry) is retired.
-  else if (a === "confirm" || a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Achievements"));
+  // CS012 P4: Achievements has exactly ONE parent, so Back is a hardcoded destination with the cursor
+  // restored to its own row — no achReturn tracker. CS016 P2 (§2, FORK-CS016-A) repoints that single
+  // parent from Options to the TITLE MENU; still one parent, still no return-context machinery, only
+  // the screen it names changed. Accepted cost: the viewer is now unreachable mid-run and at gameover
+  // (unlock toasts during play remain the in-run feedback).
+  else if (a === "confirm" || a === "back") gotoScreen("titlemenu", MENU_TITLE.indexOf("Achievements"));
 }
 
-// High Scores viewer: read-only top-10 table, nested under Options (CS010 P4 §8b) — reachable from
-// BOTH title/gameover (via Options) and the pause menu mid-game, unlike the old root-only entry. One
-// entry point -> one back-destination, no return-context tracker needed (like Achievements as of CS012 P4).
+// High Scores viewer: read-only top-10 table. One entry point -> one back-destination, no
+// return-context tracker (like Achievements). CS016 P2 (§2, FORK-CS016-A) moves that one parent from
+// Options (where CS010 P4 §8b nested it specifically to be reachable from pause) to the TITLE MENU —
+// a deliberate reversal, signed off: the gameover screen already renders the top-10 table inline with
+// the fresh entry highlighted, which covers the end-of-run case this gives up.
 function menuHighScores(a) {
   if (a === "pause") closePause();
-  else if (a === "confirm" || a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("High Scores"));
+  else if (a === "confirm" || a === "back") gotoScreen("titlemenu", MENU_TITLE.indexOf("High Scores"));
 }
 
 // Difficulty screen (v3.0 P5, B-4/B-5): two left/right mode toggles + Back. Left picks the timed
 // default, right picks the count variant, matching the on-screen "Time | Shots/Pieces" layout.
 // Structured to grow with future difficulty knobs (FLAG B-4-c): add a row here + a case in the
 // switch and the renderer picks it up.
-const DIFFICULTY_ROWS = ["shot", "magnet", "autoshield", "back"];
+// CS017 P6: "chainguard" appended before "back" — the fourth value row. Adding it here + a branch in the
+// switch below + an entry in drawDifficulty's rows/HELP arrays is the whole change; the CS016 P4 mid-run
+// lock (`row !== "back"`) and the value-row renderer both pick it up with no further edit.
+const DIFFICULTY_ROWS = ["shot", "magnet", "autoshield", "chainguard", "back"];
+// CS016 P4 (§5): a live run's rules can't change mid-run — retroactively flipping shot/magnet/
+// auto-shield would corrupt the meaning of that run's score and achievement progress. Keyed on
+// game.state === "playing" specifically (NOT game.paused, which the title also carries as of CS016 P2;
+// NOT gameover, where the run is already over and changing settings for the next one is harmless).
+// The three value rows stay focusable (so the player can still READ them) and render COLOR.dim — the
+// shared unavailable-row idiom (see MENU_ROOT_PLAY's "Save" above); "back" is unaffected.
+const DIFFICULTY_LOCK_HELP = "Difficulty can't be changed during a run.";
 function menuDifficulty(a) {
   const m = game.menu, N = DIFFICULTY_ROWS.length;
   const row = DIFFICULTY_ROWS[m.index];
+  const locked = game.state === "playing" && row !== "back";
   if (a === "up")   { m.index = (m.index + N - 1) % N; AudioSys.ui(false); }
   else if (a === "down") { m.index = (m.index + 1) % N; AudioSys.ui(false); }
-  else if (a === "left" || a === "right") {
+  else if ((a === "left" || a === "right") && !locked) {
     if (row === "shot")        { settings.shotPowerupMode = a === "right" ? "shots"  : "time"; saveSettings(); AudioSys.ui(false); }
     else if (row === "magnet") { settings.magnetMode      = a === "right" ? "pieces" : "time"; saveSettings(); AudioSys.ui(false); }
     else if (row === "autoshield") { settings.autoShield  = a === "right"; saveSettings(); AudioSys.ui(false); }
+    else if (row === "chainguard") { settings.chainGuardMode = a === "right" ? "count" : "time"; saveSettings(); AudioSys.ui(false); } // CS017 P6
   }
   else if (a === "confirm") {
     if (row === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Difficulty"));
   }
   else if (a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Difficulty"));
   else if (a === "pause") closePause();
+}
+
+// Hidden Debug Options panel handler (CS015 P4). Generic over DEBUG_VARS: N value rows, then a trailing
+// "Dump difficulty log" ACTION row (CS017 P2 — no value, no chevrons, left/right is a no-op on it same as
+// Back), then Back. up/down move the cursor; left/right adjust the focused var by its step (clamped
+// [min,max]) then applyDebug + persist immediately; confirm on the dump row triggers dumpDifficultyLog(),
+// confirm on Back — or back anywhere — returns to context. Reached only by the secret code (see the
+// keydown listener), so there is no "Debug" menu row to restore the cursor to on return: debugReturn
+// mirrors menuOptions' routing and lands on the always-present Options row when a root exists. Adding a
+// debug var later touches nothing here — the registry drives the row count (CS015 P5 lesson: derive
+// dumpRow/backRow from DEBUG_VARS.length, never a literal).
+function menuDebug(a) {
+  const m = game.menu, N = DEBUG_VARS.length, dumpRow = N, backRow = N + 1, ROWS = N + 2;
+  if (a === "up")   { m.index = (m.index + ROWS - 1) % ROWS; AudioSys.ui(false); }
+  else if (a === "down") { m.index = (m.index + 1) % ROWS; AudioSys.ui(false); }
+  else if (a === "left" || a === "right") {
+    if (m.index < N) { // a value row (not the dump action or Back)
+      const e = DEBUG_VARS[m.index];
+      const next = Math.max(e.min, Math.min(e.max, debugShown[e.id] + (a === "right" ? e.step : -e.step)));
+      applyDebug(e.id, next);
+      saveSettings();
+      AudioSys.ui(false);
+    }
+  }
+  else if (a === "confirm") {
+    if (m.index === dumpRow) dumpDifficultyLog();
+    else if (m.index === backRow) debugReturn();
+  }
+  else if (a === "back") debugReturn();
+  else if (a === "pause") closePause();
+}
+function debugReturn() {
+  if (game.state === "playing" || game.state === "gameover") gotoScreen("root", rootItems().indexOf("Options"));
+  else closePause();
 }
 
 function menuControls(a) {
@@ -2498,7 +3038,10 @@ function menuControls(a) {
   else if (a === "confirm") {
     if (m.row < ACTIONS.length) startRebind(ACTIONS[m.row], m.col === 0 ? "key" : "pad");
     // turnRow has no confirm action — it's a ◄/► slider (Paul: rotation returns to default manually).
-    else if (m.row === defaultsRow) { returnToDefaults(); AudioSys.ui(true); }
+    // CS016 P3: was an immediate `returnToDefaults(); AudioSys.ui(true);`. Now gated behind a
+    // confirmation — this row silently discards every rebind the player has made, and it sits one
+    // step from the Back row. returnToDefaults() itself is untouched; openModal plays the blip.
+    else if (m.row === defaultsRow) openModal("Reset all controls to defaults?", "RESET", returnToDefaults);
     else if (m.row === backRow) gotoScreen("options", MENU_OPTIONS.indexOf("Controls")); // back to Options, cursor on "Controls"
   }
   else if (a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Controls"));
@@ -2570,7 +3113,9 @@ function saveSettings() {
       musicTrack: settings.musicTrack,                                            // v3.4 P6 (additive)
       shipTurnScale: settings.shipTurnScale,                                      // CS010 §10b (additive)
       voiceStyle: settings.voiceStyle, captions: settings.captions,               // CS011 P3 (additive)
-      autoShield: settings.autoShield };                                          // CS012 P5 (additive)
+      autoShield: settings.autoShield,                                            // CS012 P5 (additive)
+      chainGuardMode: settings.chainGuardMode,                                    // CS017 P6 (additive)
+      debug: { ...debugShown } };                                                 // CS015 P4 (additive sub-object, display units)
     for (const name of REBINDABLE) {
       const b = bindings[name];
       data.bindings[name] = { keys: b.keys, buttons: b.buttons || [], axis: b.axis || null };
@@ -2622,6 +3167,20 @@ function loadSettings() {
     if (typeof data.captions === "boolean") settings.captions = data.captions;
     // CS012 P5: auto-shield is an additive boolean — missing/non-boolean leaves the runtime default (false) in place.
     if (typeof data.autoShield === "boolean") settings.autoShield = data.autoShield;
+    // CS017 P6: chain-guard mode is additive on the SAME frozen key (no schema bump, no rename). Same
+    // known-value-else-default rule as shotPowerupMode/magnetMode above — a missing key (every save
+    // written before this phase) or a hand-edited junk value leaves the "time" default in place, so an
+    // older save can never leave the player stuck in a mode the menu can't name.
+    if (data.chainGuardMode === "time" || data.chainGuardMode === "count") settings.chainGuardMode = data.chainGuardMode;
+    // CS015 P4: debug variables persist as an additive sub-object (display units; no new frozen key). Each
+    // registry entry is validated independently — a finite in-[min,max] stored value applies via applyDebug,
+    // anything else (missing / NaN / out of range / hand-edited garbage) leaves the seeded default in place.
+    if (data.debug) {
+      for (const e of DEBUG_VARS) {
+        const dv = data.debug[e.id];
+        if (Number.isFinite(dv) && dv >= e.min && dv <= e.max) applyDebug(e.id, dv);
+      }
+    }
   } catch (e) { /* corrupt / unreadable — fall back to defaults, don't crash */ }
 }
 loadSettings(); // apply saved settings (if any) over the shipped defaults, once at startup
@@ -2641,6 +3200,12 @@ function difficultyFactor(wave) {
 function ramp(floor, ceil, wave) {
   return floor + (ceil - floor) * difficultyFactor(wave);
 }
+// CS017 P4 (FORK-CS017-B -> (b) COMPOSE): time-in-level pressure, 0 at level start rising to 1
+// once game.waveTime (P1) reaches DEBUG.saucerPressureSecs. Composes ON TOP of the wave-based
+// opening value at the saucer aim/gap sites — it never replaces it.
+function wavePressure() {
+  return Math.min(1, game.waveTime / DEBUG.saucerPressureSecs);
+}
 
 // A difficulty lever scales a quantity from `start` (wave 1) toward `floor` (full difficulty)
 // along the SHIPPED difficultyFactor() curve — levers never get their own curve. When
@@ -2650,6 +3215,31 @@ function ramp(floor, ceil, wave) {
 function leverScale(lever, wave) {
   const s = lever.enabled ? ramp(lever.start, lever.floor, wave) : lever.start;
   return Math.max(lever.floor, s);
+}
+
+// CS017 P1: the FORK-CS017-A spiral term — each difficulty cycle's values are multiplied by this so
+// cycle N+1 starts above where cycle N started, even though the in-cycle sawtooth resets every
+// CYCLE_LENGTH waves. CS017 P3 wired it: the four SAWTOOTH levers (debris count, debris speed at both
+// sites, Hunter speed, Hunter turn rate) all read ramp/base off game.cycleWave and pass the result
+// through here with game.cycle. Every FROZEN lever bypasses this entirely and still samples game.wave.
+function cycleValue(base, cycle) {
+  return base * (1 + cycle * CYCLE_GAIN);
+}
+
+// CS017 P5: the bonus canister's per-wave spawn probability — the ONE lever in this changeset that
+// EASES OFF instead of escalating. Common at the start of a cycle (the learning window right after a
+// sawtooth reset), rare at its end. Reads game.cycleWave, so it breathes with the sawtooth group.
+//
+// DELIBERATE DEVIATION from DIFFICULTY-LEVERS.md 2.6 ("no lever gets its own curve"), documented
+// there: this is a straight LINEAR interpolation across the cycle, not ramp()/difficultyFactor().
+// The two constants are defined as the CYCLE'S ENDPOINTS, and difficultyFactor() is asymptotic — over
+// CYCLE_LENGTH (9) waves it only reaches 1-exp(-8/8) = 0.63, so a ramp() lever would top out near
+// 0.25 and BONUS_SPAWN_CHANCE_LATE would never be the value it says it is. A knob that lies is worse
+// than a private curve; this one hits both endpoints exactly.
+function bonusSpawnChance() {
+  const t = CYCLE_LENGTH > 1 ? (game.cycleWave - 1) / (CYCLE_LENGTH - 1) : 1; // 0 at cycleWave 1, 1 at the cycle's last wave
+  const f = Math.min(1, Math.max(0, t));  // clamp: cycleWave is always in 1..CYCLE_LENGTH, but never trust a knob retune
+  return BONUS_SPAWN_CHANCE_EARLY + (BONUS_SPAWN_CHANCE_LATE - BONUS_SPAWN_CHANCE_EARLY) * f;
 }
 
 function wrap(obj) {
@@ -2761,6 +3351,10 @@ const COLOR = {
                             // chevrons/table headers/glyphs/slider frames all still read it).
   garbage: "#c8ff50",
   garbageLight: "#b8ffb0",   // low-mass Hunter scrap: a paler, mintier tint so it reads as "lighter / easier to tow" (F4)
+  garbageBonus: "#ffe23a",   // CS017 P5: the rare bonus canister. Deliberately still in the SALVAGE hue family
+                             // (a hot yellow pushed off garbage's yellow-green) so it never reads as a new hazard,
+                             // but unmistakably hotter at a glance; paired with a halo ring in Garbage.draw so the
+                             // tell survives colour-blindness and the expiry blink. LOOK-CALL — tune freely.
   chain: "#8aa0ff",
   dock: "#70ffa0",
   hp: "#5fe08a",
@@ -2784,11 +3378,16 @@ const POWERUP_COLOR = {
   health: "#ff6b6b",   // Health — red (cross)
   magnet: "#8ab6ff",   // Magnet — blue
   engine: "#7dffb0",   // Engine — mint green
-  scoop:  "#c07bff"    // Scoop — violet (v3.3 P3; no other purple in the palette, so it's an
+  scoop:  "#c07bff",   // Scoop — violet (v3.3 P3; no other purple in the palette, so it's an
                        // unmistakable pickup and never reads as a hazard tell — look-call, tunable)
+  guard:  "#ff9a3c"    // Chain Guard — orange (CS017 P6). The only orange in the whole palette: the
+                       // hazard tells are teal/blue (Hunter/debris/saucer) and the salvage family is
+                       // yellow-green, so it can never read as either. Deliberately pushed well off
+                       // Rapid's amber (#ffd24a, a yellow) — LOOK-CALL, tune freely after a playtest.
 };
 const POWERUP_LABEL = {
-  rapid: "RAPID", triple: "TRIPLE", health: "+HP", magnet: "MAGNET", engine: "ENGINE", scoop: "SCOOP"
+  rapid: "RAPID", triple: "TRIPLE", health: "+HP", magnet: "MAGNET", engine: "ENGINE", scoop: "SCOOP",
+  guard: "GUARD"
 };
 
 // ---------- Entities ----------
@@ -3038,7 +3637,12 @@ class DebrisSatellite {
     this.size = size;
     this.radius = DEBRIS_RADII[size];
     this.damage = DEBRIS_DAMAGE[size];   // contact damage to the ship (F2)
-    const sp = DEBRIS_SPEEDS[size] * speedMul * rand(0.7, 1.3);
+    // CS017 P3 (FLAG-CS017-a): clamp the RESULTING speed, never the multiplier — the three sizes have
+    // different bases (70/110/160), so clamping the shared multiplier would squash the tier spread.
+    // GUARD RAIL only: at the shipped curve the fastest small debris reaches ~341 px/s (160 x the 1.64
+    // top-of-cycle speedMul x the 1.3 roll) against a 1040 cap, so this never binds in real play — it is
+    // insurance against a future CYCLE_GAIN / DEBRIS_SPEED_PER_WAVE retune, not a live constraint.
+    const sp = Math.min(DEBRIS_SPEEDS[size] * speedMul * rand(0.7, 1.3), DEBRIS_SPEED_CAP);
     const a = rand(0, TAU);
     this.vx = Math.cos(a) * sp;
     this.vy = Math.sin(a) * sp;
@@ -3086,10 +3690,18 @@ class HunterSatellite {
     // v3.3 P4 (9b, FORK-5): the `bornOfScrap` flag is GONE. Every Hunter of every origin now drops
     // garbage at its tier counts — the v3.2 P3 suppression is reversed. 9a's single-decay is the new
     // governor for the 12-in/66-out amplifier that flag used to close.
-    // Wave-scaled from a gentle floor (HUNTER_FLOOR_FRAC × ceiling) up to the full ceiling.
-    // game.wave is fixed for a Hunter's lifetime (Hunters block wave-clear), so sample once.
-    this.speed    = ramp(HUNTER_SPEED_CEIL[size] * HUNTER_FLOOR_FRAC, HUNTER_SPEED_CEIL[size], game.wave);
-    this.turnRate = ramp(HUNTER_TURN_CEIL[size]  * HUNTER_FLOOR_FRAC, HUNTER_TURN_CEIL[size],  game.wave);
+    // Scaled from a gentle floor (HUNTER_FLOOR_FRAC × ceiling) up to the full ceiling. CS017 P3: the
+    // ramp now samples game.cycleWave — the SAWTOOTH, which resets every CYCLE_LENGTH waves — and the
+    // result is multiplied by the cycleValue() spiral term, so each cycle opens above the last
+    // (FORK-CS017-A). See GDD §2.13.
+    // SAMPLED ONCE, AT SPAWN, and never re-sampled. (The comment that used to sit here claimed
+    // "game.wave is fixed for a Hunter's lifetime (Hunters block wave-clear)" — that has been FALSE
+    // since CS015 P3, which removed Hunters from the wave-clear gate.) A Hunter can now carry across
+    // several waves and even across a cycle boundary, keeping its SPAWN cycle's speed and turn rate for
+    // life — so a Hunter born late in one cycle stays fast after the field around it has reset. That is
+    // ACCEPTED DESIGN (Paul's explicit call), not an oversight; do not "fix" it by re-sampling.
+    this.speed    = cycleValue(ramp(HUNTER_SPEED_CEIL[size] * HUNTER_FLOOR_FRAC, HUNTER_SPEED_CEIL[size], game.cycleWave), game.cycle);
+    this.turnRate = cycleValue(ramp(HUNTER_TURN_CEIL[size]  * HUNTER_FLOOR_FRAC, HUNTER_TURN_CEIL[size],  game.cycleWave), game.cycle);
     if (size === 3) {
       // Large core: passive drift toward the ship's position AT SPAWN — no continuous re-aim
       // (confirmed design). Only its drift *speed* scales with difficulty, not its behavior.
@@ -3217,8 +3829,11 @@ class Saucer {
     if (this.fireTimer <= 0 && !game.ship.dead) {
       let a;
       if (this.small) {
-        // aimed, but the error widens toward a barely-aimed spray at low waves (F10)
-        const err = ramp(SAUCER_AIM_ERR_FLOOR, SAUCER_AIM_ERR_CEIL, 1 + (game.wave - 1) * SAUCER_ACCURACY_RAMP_SCALE);
+        // aimed, but the error widens toward a barely-aimed spray at low waves (F10). CS017 P4: the
+        // wave-scaled value is the level's OPENING error; time-in-level (wavePressure) then tightens
+        // it further toward SAUCER_AIM_ERR_CEIL (the tighter/more-precise value) on top of that.
+        const base = ramp(SAUCER_AIM_ERR_FLOOR, SAUCER_AIM_ERR_CEIL, 1 + (game.wave - 1) * SAUCER_ACCURACY_RAMP_SCALE);
+        const err  = base + (SAUCER_AIM_ERR_CEIL - base) * wavePressure() * DEBUG.saucerAimPressure;
         a = angleTo(this, game.ship) + rand(-err, err);
       } else {
         a = rand(0, TAU); // random
@@ -3282,24 +3897,32 @@ function drawCanister(x, y, angle, alpha, color = COLOR.garbage, scale = 1) {
 }
 
 class Garbage {
-  // v3.3 P4 (9a): a loose SINGLE decays again on GARBAGE_DECAY (see update()). Not a ctor param — every
-  // piece is born a single with a full life; a clump (pieces > 1) simply never counts it down (FORK-4).
+  // v3.3 P4 (9a): a loose piece decays on a lifetime clock (see update()). Not a ctor param — every
+  // piece is born with a full life. CS015 P6 (item 10): EVERY piece counts its clock down regardless
+  // of `pieces` — a clump no longer lives forever (FORK-4 reversed); a merge resets the clock instead
+  // (see coalesceGarbage), so an actively-growing lineage never dies but a stalled one does.
   constructor(x, y, vx = 0, vy = 0, mass = 1.0) {
     this.x = x; this.y = y;
     this.vx = vx; this.vy = vy;
     this.spin = rand(0, TAU);
     this.spinRate = rand(-1.5, 1.5);
     this.mass = mass;   // towing weight (F5): 1.0 for Debris scrap; lighter scrap tows easier
-    this.decay = GARBAGE_DECAY; // v3.3 P4: single-canister life clock; counts down only while pieces === 1
+    this.decay = DEBUG.garbageLifetime; // CS015 P6: tunable live (captured per-piece at ctor time, like coalesceDelay)
     // Coalescence (v3.2 P1). These constructor defaults are inherited by all three emission sites
     // AND Garbage.fromNode. `coalesceDelay` counts down in update(); a piece is "active" (attracts +
     // can merge) once it hits 0. `pieces` is the 1..11 threat counter (at 12 the clump transforms).
     // v3.2 P1 reverses FORK-2: on merge `mass` now SUMS and `radius` DERIVES from pieces (a clump is
     // a real, heavy, big, un-hookable body — you must shoot it apart first). radius = 7*sqrt(pieces),
     // so a single piece still reads 7 (the base canister radius).
-    this.coalesceDelay = GARBAGE_COALESCE_DELAY;
+    this.coalesceDelay = DEBUG.garbageAttractDelay; // CS015 P5: tunable live (captured per-piece at ctor time)
     this.pieces = 1;
     this.radius = 7 * Math.sqrt(this.pieces);
+    // CS017 P5: the rare bonus-canister marker. Default FALSE for every emission site (debris drops,
+    // Hunter drops, shatter children, Garbage.fromNode) — only nextWave()'s bonus spawn sets it true.
+    // It drives (a) the draw tell and (b) the one-shot BONUS_CANISTER_SCORE payout at the scoop, which
+    // CLEARS it on the way through — that clear is what makes "paid once per clump" true for a partial
+    // scoop, whose leftover is the SAME object. See the pickup block and GDD 2.10.1.
+    this.bonus = false;
     this.dead = false;
   }
   static fromNode(n) { // chain node knocked loose -> free garbage (v3.2 P3: no decay)
@@ -3311,13 +3934,12 @@ class Garbage {
     this.x += this.vx * dt; this.y += this.vy * dt;
     this.spin += this.spinRate * dt;
     wrap(this);
-    // v3.3 P4 (9a): a loose SINGLE ages out — GARBAGE_DECAY is the density governor. A CLUMP (pieces > 1)
-    // never decays (FORK-4: a clump is a target and a scoopable pickup). Chain nodes aren't Garbage, so
-    // they never reach here. A pickup still sets `dead` externally; coalescence still consumes pieces.
-    if (this.pieces === 1) {
-      this.decay -= dt;
-      if (this.decay <= 0) this.dead = true;
-    }
+    // CS015 P6 (item 10): EVERY piece ages out now, single or clump — the density governor no longer
+    // exempts clumps (FORK-4 reversed; a merge resets the clock instead, see coalesceGarbage). Chain
+    // nodes aren't Garbage, so they never reach here. A pickup still sets `dead` externally; coalescence
+    // still consumes pieces.
+    this.decay -= dt;
+    if (this.decay <= 0) this.dead = true;
     // `coalesceDelay` still gates attraction/merge (see coalesceGarbage).
     if (this.coalesceDelay > 0) this.coalesceDelay -= dt;
   }
@@ -3325,7 +3947,9 @@ class Garbage {
     if (this.pieces === 1) {
       // A single centered canister. v3.3 P4 (9a): in its last GARBAGE_FADE sec it blinks out as an
       // expiry tell — otherwise byte-identical to the pre-decay single render.
-      const color = this.mass < 1 ? COLOR.garbageLight : COLOR.garbage;
+      // CS017 P5: `bonus` wins the colour branch. A bonus clump is normally pieces > 1, but this path
+      // is covered too so a BONUS_CANISTER_PIECES retune down to 1 still renders the tell.
+      const color = this.bonus ? COLOR.garbageBonus : this.mass < 1 ? COLOR.garbageLight : COLOR.garbage;
       let alpha = 0.9;
       if (this.decay < GARBAGE_FADE) {
         // fast on/off blink (skip the "off" frames) that fades as death nears
@@ -3333,6 +3957,7 @@ class Garbage {
         alpha = 0.9 * Math.max(0.2, this.decay / GARBAGE_FADE);
       }
       drawCanister(this.x, this.y, this.spin, alpha, color);
+      if (this.bonus) this.drawBonusRing(alpha);
       return;
     }
     // v3.5 P2 (reverses v3.3 P1): a clump (pieces > 1) draws as ONE ordinary canister scaled up by
@@ -3341,9 +3966,28 @@ class Garbage {
     // exactly equal this.radius, so the visual and the (unchanged) collision radius agree by
     // construction. v3.6 P1a: colour now follows the same per-piece-mass rule as a single (the red
     // proximity-to-Hunter lerp is gone) — size (radius = 7*sqrt(pieces)) is the only remaining tell
-    // that a clump is nearing the Hunter transform.
-    const color = (this.mass / this.pieces) < 1 ? COLOR.garbageLight : COLOR.garbage;
-    drawCanister(this.x, this.y, this.spin, 0.9, color, this.radius / 7);
+    // that a clump is nearing the Hunter transform. CS015 P6 (item 10): a clump now ages out too (a
+    // merge resets its clock), so it gets the same expiry blink tell as a single, mirrored verbatim.
+    // CS017 P5: a bonus clump overrides the per-piece-mass colour with COLOR.garbageBonus and adds a
+    // halo ring below — the size tell (radius) is already spoken for by the Hunter-transform warning,
+    // so the bonus needs its own channel.
+    const color = this.bonus ? COLOR.garbageBonus
+                : (this.mass / this.pieces) < 1 ? COLOR.garbageLight : COLOR.garbage;
+    let alpha = 0.9;
+    if (this.decay < GARBAGE_FADE) {
+      if (Math.sin(this.decay * 18) < 0) return;
+      alpha = 0.9 * Math.max(0.2, this.decay / GARBAGE_FADE);
+    }
+    drawCanister(this.x, this.y, this.spin, alpha, color, this.radius / 7);
+    if (this.bonus) this.drawBonusRing(alpha);
+  }
+  // CS017 P5: the second half of the bonus tell — a halo just outside the collision radius. STROKE
+  // ONLY, via the shared drawRingArc/glowStroke path (no new fill exception, GDD 3.2; frac 1 = a full
+  // turn). drawCanister leaves globalAlpha at 1, so the blink/expiry alpha is re-applied here.
+  drawBonusRing(alpha) {
+    ctx.globalAlpha = alpha;
+    drawRingArc(this.x, this.y, this.radius + BONUS_RING_PAD, 1, COLOR.garbageBonus, 1.5, 8);
+    ctx.globalAlpha = 1;
   }
 }
 
@@ -3384,6 +4028,13 @@ function drawPowerupGlyph(type, x, y, r, color) {
       break;
     case "scoop":  // a widening funnel / collector mouth (v3.3 P3): narrow throat, flaring open forward
       ctx.moveTo(-8, -7); ctx.lineTo(-3, 4); ctx.lineTo(3, 4); ctx.lineTo(8, -7);
+      break;
+    case "guard":  // CS017 P6 — a heater shield over a chain link: the payload, armoured. Stroke only
+                   // (no fill, GDD §3.2), and no closePath on the link so it reads as a link, not a ring.
+      ctx.moveTo(-7, -7); ctx.lineTo(7, -7); ctx.lineTo(7, 0);      // shield: flat top, shoulders...
+      ctx.lineTo(0, 8); ctx.lineTo(-7, 0); ctx.closePath();          // ...tapering to a point
+      ctx.moveTo(-3, -3); ctx.lineTo(3, -3);                         // the link inside it
+      ctx.moveTo(-3, 1);  ctx.lineTo(3, 1);
       break;
   }
   glowStroke(color, 1.6, 8);
@@ -3526,16 +4177,22 @@ const game = {
   // Pause-menu state machine (F8): screen = null | "root" | "options" | "controls";
   // index = cursor for root/options; row/col = cursor for the controls grid;
   // rebinding = { action, device } while capturing a new binding, else null.
-  menu: { screen: null, index: 0, row: 0, col: 0, rebinding: null, scroll: 0 }, // scroll: CS013 P3, Achievements-viewer vertical offset
+  // CS016 P2: boots on the title's own menu (state starts "title"), NOT null — the title screen is a
+  // navigable menu now, and a null screen there would render cursor-less and read menuActive() false.
+  // index 0 = "Start Game", so ENTER / A on a cold boot still starts a run immediately.
+  menu: { screen: "titlemenu", index: 0, row: 0, col: 0, rebinding: null, scroll: 0, modal: null, achTab: ACH_TAB_DEFAULT }, // scroll: CS013 P3, Achievements-viewer vertical offset; modal: CS016 P3, the open confirmation dialog (null = none); achTab: CS016 P5, the viewer's active tab id
   ship: new Ship(),
   camera: { x: WORLD_W / 2, y: WORLD_H / 2 }, // world point at the center of the viewport
   debris: [], bullets: [], saucers: [], hunters: [], particles: [],
   garbage: [], chain: [], floaters: [], dock: null,
   powerups: [],                                        // free-floating Powerup pickups (F6)
-  powerFx: { rapid: 0, triple: 0, magnet: 0, engine: 0 }, // remaining sec per timed effect (0 = inactive)
-  powerBudget: { rapid: 0, triple: 0, magnet: 0 },    // remaining shots/pieces in count mode (P5; Engine is always timed)
-  powerBank: { rapid: 0, triple: 0, magnet: 0, engine: 0 },    // CS009 P5: sec of bank-flash left per type (0 = none)
-  powerBankAmt: { rapid: 0, triple: 0, magnet: 0, engine: 0 }, // CS009 P5: the "+Ns" badge amount for the current flash
+  // CS017 P6: every one of these four gains a `guard` key. powerBudget's is the one that matters most —
+  // powerActive("guard") reads it in count mode, and a missing key would make the guard read as
+  // permanently expired. Keep these in step with POWERUP_DROP_TYPES and with startGame()'s resets below.
+  powerFx: { rapid: 0, triple: 0, magnet: 0, engine: 0, guard: 0 }, // remaining sec per timed effect (0 = inactive)
+  powerBudget: { rapid: 0, triple: 0, magnet: 0, guard: 0 },   // remaining shots/pieces/intercepts in count mode (P5; Engine is always timed)
+  powerBank: { rapid: 0, triple: 0, magnet: 0, engine: 0, guard: 0 },    // CS009 P5: sec of bank-flash left per type (0 = none)
+  powerBankAmt: { rapid: 0, triple: 0, magnet: 0, engine: 0, guard: 0 }, // CS009 P5: the "+Ns" badge amount for the current flash
   hudHull: 1,                                          // CS009 P1: eased HUD hull fraction, chases
                                                         // ship.hp/SHIP_MAX_HP so a hit/heal reads as a
                                                         // drain/fill, not a jump. Advanced in update(),
@@ -3550,6 +4207,13 @@ const game = {
                                                         // a bug instead of a promotion. Decayed in update().
   deliveryCount: 0, offloadTimer: 0,
   score: 0, wave: 0,
+  // CS017 P1: the difficulty cycle clock. wave stays the ABSOLUTE player-facing counter — every
+  // achievement, the HUD LEVEL readout, high-score records and musicStateFor keep reading game.wave,
+  // untouched. cycle/cycleWave are DERIVED from it in nextWave() (the sawtooth); waveTime is a per-wave
+  // seconds-elapsed accumulator ticked in update(). All three are inert this phase.
+  cycle: 0,      // 0-based difficulty cycle index
+  cycleWave: 1,  // 1-based wave within the current cycle
+  waveTime: 0,   // seconds elapsed in the current wave
   nextRepair: REPAIR_MILESTONE,   // next score threshold that repairs the hull (F2)
   saucerTimer: 0,
   hunterTimer: 0,
@@ -3569,7 +4233,9 @@ const game = {
   hpFullVoice: true,
   // CS010 P9: previous powerActive() state per timed type, for the powerup-EXPIRED voice's falling edge.
   // Keyed through powerActive() (not powerFx) so it correctly covers count modes too.
-  powerVoiced: { rapid: false, triple: false, magnet: false, engine: false },
+  // CS017 P6: `guard` is latched here like every other timed type so the loop stays fully generic, but
+  // it deliberately has NO expire_ line to fire — see the expiry loop in update().
+  powerVoiced: { rapid: false, triple: false, magnet: false, engine: false, guard: false },
   // CS010 P3: the low-health pulse PHASE ACCUMULATOR. Advanced by 2π·lowhpPulseRate(t)·dt in update()
   // while engaged; read as Math.sin(game.lowHpPhase) by BOTH the critical-hull ring pulse AND the corner
   // glow, so they lock to each other and (via the shared rate helper) to the siren — one alarm. An
@@ -3596,20 +4262,32 @@ function startGame() {
   game.paused = false;
   game.deathT = 0; game.shake = 0;   // v3.6 P5: a fresh run never carries death-spectacle state over
   game.entry = null; game.lastScoreId = null; // v3.6 P6: nor any stale initials-entry/highlight state
-  game.menu = { screen: null, index: 0, row: 0, col: 0, rebinding: null }; // ensure no menu carries in
+  // CS016 P2: screen back to null — in play there is no menu (the title menu belongs to the title).
+  // Confirmed correct as-is; the only entry point that now reaches here from a menu is menuTitle's
+  // "Start Game", and this reset already clears it.
+  // CS016 P3: `modal` is added to BOTH this reset and the game literal, per the standing note that
+  // `scroll` was only ever added to the literal (see STATUS.md Known issues) — a new game.menu field
+  // that lands in one and not the other is `undefined` for the whole of a run. CS016 P5's `achTab`
+  // follows the same rule (achTabIndex() defends against a bad id anyway, but the field should never
+  // BE undefined in the first place).
+  game.menu = { screen: null, index: 0, row: 0, col: 0, rebinding: null, modal: null, achTab: ACH_TAB_DEFAULT }; // ensure no menu carries in
+  DiffLog.rows = []; // CS017 P2: dev log is per-run, never carries into a fresh game
   game.stats = resetGameStats();  // fresh per-game achievement tracking (F9)
   game.toasts = [];               // clear any lingering unlock toasts
   game.score = 0;
   game.wave = 0;
+  // CS017 P1: fresh run never carries a stale cycle/cycleWave/waveTime — nextWave() (called at the end
+  // of this function) derives cycle/cycleWave for wave 1 and zeroes waveTime, same as every other wave.
+  game.cycle = 0; game.cycleWave = 1; game.waveTime = 0;
   game.nextRepair = REPAIR_MILESTONE;
   game.debris = []; game.bullets = []; game.saucers = [];
   game.hunters = []; game.particles = [];
   game.garbage = []; game.chain = []; game.floaters = [];
   game.powerups = [];
-  game.powerFx = { rapid: 0, triple: 0, magnet: 0, engine: 0 };
-  game.powerBudget = { rapid: 0, triple: 0, magnet: 0 }; // count-mode budgets reset with the run (P5)
-  game.powerBank = { rapid: 0, triple: 0, magnet: 0, engine: 0 };    // bank-flash state resets with the run (P5)
-  game.powerBankAmt = { rapid: 0, triple: 0, magnet: 0, engine: 0 };
+  game.powerFx = { rapid: 0, triple: 0, magnet: 0, engine: 0, guard: 0 };
+  game.powerBudget = { rapid: 0, triple: 0, magnet: 0, guard: 0 }; // count-mode budgets reset with the run (P5; guard CS017 P6)
+  game.powerBank = { rapid: 0, triple: 0, magnet: 0, engine: 0, guard: 0 };    // bank-flash state resets with the run (P5)
+  game.powerBankAmt = { rapid: 0, triple: 0, magnet: 0, engine: 0, guard: 0 };
   game.scoopLevel = 0; game.scoopHits = 0;               // persistent scoop upgrade resets each run (v3.3 P3)
   game.healthTimer = rand(POWERUP_HEALTH_GAP[0], POWERUP_HEALTH_GAP[1]);
   game.cargoMax = CARGO_BASE;      // tow cap resets to base each run; grows with deliveries (B-8)
@@ -3627,7 +4305,7 @@ function startGame() {
   // "brand new ship" at wave start); powerVoiced all false. reset() clears any in-flight line + cooldown.
   game.lowHpVoiced = false;
   game.hpFullVoice = true;
-  game.powerVoiced = { rapid: false, triple: false, magnet: false, engine: false };
+  game.powerVoiced = { rapid: false, triple: false, magnet: false, engine: false, guard: false };
   game.caption = { text: "", life: 0, dur: 0 }; // CS011 P2: no stale caption carries into a fresh run
   VoiceSys.reset();
   nextWave();
@@ -3635,6 +4313,12 @@ function startGame() {
 
 function nextWave() {
   game.wave++;
+  // CS017 P1: derive the sawtooth cycle clock from the absolute wave counter. game.wave itself is
+  // UNTOUCHED and stays the player-facing absolute counter — every achievement, the HUD LEVEL readout,
+  // high-score records and musicStateFor keep reading game.wave, not cycle/cycleWave.
+  game.cycle     = Math.floor((game.wave - 1) / CYCLE_LENGTH);
+  game.cycleWave = ((game.wave - 1) % CYCLE_LENGTH) + 1;
+  game.waveTime  = 0;
   VoiceSys.sayLevel(game.wave); // CS011 P4 — announces Level 1 too (VoiceSys.reset() ran just above in startGame)
   // v3.4 P7: intensity recomputed ONLY on wave change, never per-frame — keeps updateMusic()'s
   // per-frame path clean. Runs at wave 1 too (startGame calls nextWave()), so a fresh run starts
@@ -3651,8 +4335,14 @@ function nextWave() {
   // F3 first-pass balance: trimmed from min(4+wave, 11) to offset the ~8x higher garbage
   // volume from guaranteed 3-per-tier drops. (v3.2 P3: garbage no longer decays; density is now
   // held by coalescence + shatter-to-harvest, not a decay timer — see GDD §2.10.1.)
-  const count = Math.min(3 + game.wave, 9);
-  const speedMul = 1 + (game.wave - 1) * 0.08;
+  // CS017 P3 — the sawtooth. Both levers ramp on game.cycleWave, so they RESET at every cycle boundary,
+  // and both are then multiplied by the cycleValue() spiral term so cycle N+1 opens above cycle N: the
+  // player feels the reset as relief while the game still escalates over a long run (FORK-CS017-A).
+  // DEBRIS_COUNT_HARD_MAX is the absolute backstop on the spiralled count.
+  const count = Math.min(
+    Math.round(cycleValue(Math.min(3 + game.cycleWave, DEBRIS_COUNT_MAX), game.cycle)),
+    DEBRIS_COUNT_HARD_MAX);
+  const speedMul = cycleValue(1 + (game.cycleWave - 1) * DEBRIS_SPEED_PER_WAVE, game.cycle);
   for (let i = 0; i < count; i++) {
     // spawn in a ring around the ship's current world position so the wave is
     // reachable (min distance keeps it off the ship, max keeps it from being
@@ -3662,6 +4352,24 @@ function nextWave() {
     const p = wrapPos({ x: game.ship.x + Math.cos(a) * d, y: game.ship.y + Math.sin(a) * d });
     game.debris.push(new DebrisSatellite(p.x, p.y, 3, speedMul));
   }
+  // CS017 P5 — the rare bonus canister (FORK-CS017-D -> (b) PRE-LINKED CLUMP). ONE roll per wave, on
+  // the EASING-OFF curve (bonusSpawnChance()): common right after a cycle reset, rare at the cycle's
+  // end. Placed by the SAME ring-around-the-ship rule as the debris above, so it is reachable without
+  // being dumped on the player. Nothing here is new intake machinery — it is a plain Garbage whose
+  // `pieces`/`mass`/`radius` are set by the same three expressions coalescence and the partial-scoop
+  // leftover already use, so every downstream system (scoop, shatter, coalesce, decay) just works.
+  if (Math.random() < bonusSpawnChance()) {
+    const ba = rand(0, TAU);
+    const bd = rand(SPAWN_MIN_DIST, SPAWN_MAX_DIST);
+    const bp = wrapPos({ x: game.ship.x + Math.cos(ba) * bd, y: game.ship.y + Math.sin(ba) * bd });
+    const bonusClump = new Garbage(bp.x, bp.y);
+    bonusClump.pieces = BONUS_CANISTER_PIECES;
+    bonusClump.mass   = BONUS_CANISTER_PIECES;          // per-piece mass 1.0 — the Debris-scrap default, so mass sums to the piece count
+    bonusClump.radius = 7 * Math.sqrt(bonusClump.pieces); // the ONE clump-radius expression (never a hardcoded px)
+    bonusClump.bonus  = true;
+    game.garbage.push(bonusClump);
+  }
+  logDifficultySnapshot(count, speedMul); // CS017 P2: dev-only, one row per wave (see DiffLog above)
 }
 
 function addScore(pts) {
@@ -3703,7 +4411,10 @@ function destroyDebris(a, awardScore = true) {
   }
   // Large -> 3 mediums, medium -> 3 smalls, small -> destroyed (F3: 3-way splits)
   if (a.size > 1) {
-    const speedMul = 1 + (game.wave - 1) * 0.08;
+    // CS017 P3: the SECOND debris-speed site. Kept byte-identical to nextWave()'s speedMul expression —
+    // a split child must move like a freshly-spawned piece of the same wave, so if one site is retuned
+    // the other has to move with it. (These two are the only places debris speed is derived.)
+    const speedMul = cycleValue(1 + (game.cycleWave - 1) * DEBRIS_SPEED_PER_WAVE, game.cycle);
     for (let i = 0; i < 3; i++) {
       game.debris.push(new DebrisSatellite(a.x, a.y, a.size - 1, speedMul));
     }
@@ -3781,6 +4492,9 @@ function destroySaucer(s) {
 // disperses before it can start re-clumping), and an outward kick that inherits a fraction of the
 // clump's own drift — same fan-out shape as destroyDebris/destroyHunter. No score: the reward is
 // the hookable canisters themselves.
+// CS017 P5: the emitted pieces are FRESH Garbage, so a bonus marker is deliberately NOT inherited —
+// shooting a bonus canister apart forfeits BONUS_CANISTER_SCORE (scoop it intact or lose it). That's
+// the opposite call from coalescence, which does carry the marker; both are argued in GDD 2.10.1.
 function shatterClump(g) {
   g.dead = true;
   const pieceMass = g.mass / g.pieces;
@@ -3797,17 +4511,30 @@ function shatterClump(g) {
 // ---------- Powerups (F6) ----------
 // Which expiry mode governs a timed effect (v3.0 P5). Rapid + Triple follow shotPowerupMode; Magnet
 // follows magnetMode; Engine is always time-based (never player-configurable). Health is instant.
+// CS017 P6: Chain Guard follows chainGuardMode ("time" | "count"), the third player-configurable mode.
 function powerMode(type) {
   if (type === "rapid" || type === "triple") return settings.shotPowerupMode;
   if (type === "magnet") return settings.magnetMode;
+  if (type === "guard") return settings.chainGuardMode;
   return "time";
 }
 // v3.4 P4: how long a timed effect lasts in "time" mode, by type. Magnet is the one long effect
 // (MAGNET_DURATION, 30 s); the other three share POWERUP_DURATION (15 s). Mirrors powerMode(type).
 // THREE call sites: applyPowerup (sets powerFx) and the HUD active-effect bar's DENOMINATOR (reads it).
 // Miss the HUD one and the magnet bar renders permanently over-full.
+// CS017 P6: Chain Guard's duration is the LIVE debug knob (default 30 s), not a frozen const, so the
+// dev panel retunes it without a reload. Same three call sites as the others — including the HUD ring's
+// denominator, which is why this must be a function and never an inlined POWERUP_DURATION.
 function powerDuration(type) {
+  if (type === "guard") return DEBUG.chainGuardTime;
   return type === "magnet" ? MAGNET_DURATION : POWERUP_DURATION;
+}
+// CS017 P6: the count-mode sibling of powerDuration(type) — how much budget one pickup grants. The three
+// original types read the frozen POWERUP_BUDGET table; Chain Guard reads its live debug knob instead.
+// applyPowerup is the only consumer (the += and the bank badge), and it must never read POWERUP_BUDGET
+// directly again, or guard banks `undefined` and NaNs its own budget.
+function powerBudgetAmount(type) {
+  return type === "guard" ? DEBUG.chainGuardIntercepts : POWERUP_BUDGET[type];
 }
 // Is a timed effect currently ACTIVE, honouring its expiry mode? In "time" mode it's live while
 // seconds remain (game.powerFx); in a count mode while budget remains (game.powerBudget). Every call
@@ -3847,10 +4574,16 @@ function maxBullets() {
 function dropPowerup(x, y, vx = 0, vy = 0) {
   // weighted roll over POWERUP_DROP_WEIGHTS (favors the shot powerups), NOT a flat pick over
   // POWERUP_DROP_TYPES — the two structures are deliberately separate (Scoop drops but isn't a timed effect).
+  // CS017 P6: "guard" is CONDITIONAL — it only enters the roll while the player is towing at least
+  // DEBUG.chainGuardMinTow nodes (dropping a chain guard at an empty chain is a wasted pickup). An
+  // ineligible key is skipped in BOTH the total and the walk, so the surviving weights RENORMALISE
+  // rather than leaving a dead slot that would silently drop nothing. Below the threshold this reduces
+  // to exactly the pre-P6 table (total 10, same walk order, one Math.random() call) — byte-identical.
+  const eligible = k => k !== "guard" || game.chain.length >= DEBUG.chainGuardMinTow;
   let total = 0;
-  for (const k in POWERUP_DROP_WEIGHTS) total += POWERUP_DROP_WEIGHTS[k];
+  for (const k in POWERUP_DROP_WEIGHTS) if (eligible(k)) total += POWERUP_DROP_WEIGHTS[k];
   let r = Math.random() * total, type;
-  for (const k in POWERUP_DROP_WEIGHTS) { r -= POWERUP_DROP_WEIGHTS[k]; if (r < 0) { type = k; break; } }
+  for (const k in POWERUP_DROP_WEIGHTS) { if (!eligible(k)) continue; r -= POWERUP_DROP_WEIGHTS[k]; if (r < 0) { type = k; break; } }
   game.powerups.push(new Powerup(x, y, type, vx, vy));
 }
 
@@ -3898,9 +4631,9 @@ function applyPowerup(type) {
   } else {
     if (powerActive(type)) {
       game.powerBank[type] = HUD_BANK_FLASH;
-      game.powerBankAmt[type] = POWERUP_BUDGET[type];
+      game.powerBankAmt[type] = powerBudgetAmount(type); // CS017 P6: never POWERUP_BUDGET directly — guard isn't in it
     }
-    game.powerBudget[type] += POWERUP_BUDGET[type]; // count mode: banks the shots/pieces budget too (same rule)
+    game.powerBudget[type] += powerBudgetAmount(type); // count mode: banks the shots/pieces/intercepts budget too (same rule)
   }
   // Achievement stats (F9): any pickup counts for "No Powerups Needed"; Health picks gate "Glass
   // Cannon"; the four drop types feed "Powered Up" (use all four).
@@ -3912,7 +4645,11 @@ function applyPowerup(type) {
   // CS010 P9: the four timed types announce their pickup (Health has no collect line — it speaks via the
   // hull-full latch instead). A same-type BANK re-pickup re-fires collect_<type>; the §11e cooldown drops
   // the second line if it lands inside the window (a decided, acceptable behavior — see STATUS.md).
-  if (type !== "health") VoiceSys.say("collect_" + type);
+  // CS017 P6: "guard" is excluded too. Chain Guard's ONLY voice event is the chain_guard INTERCEPT line
+  // (added in P7, once Paul's lab-verified phon exists) — it has no collect_ line by design, so this
+  // never builds a "collect_guard" event string. say() would no-op on the missing key anyway; the
+  // explicit gate is what makes "this phase ships silent" a property of the code, not an accident of data.
+  if (type !== "health" && type !== "guard") VoiceSys.say("collect_" + type);
 }
 
 // ---------- Achievements (F9) ----------
@@ -4300,7 +5037,7 @@ function damageShip(amount, srcX, srcY) {
     s.vx = Math.cos(ka) * KNOCKBACK_SPEED;
     s.vy = Math.sin(ka) * KNOCKBACK_SPEED;
     s.invuln = HIT_STUN_DURATION;
-    s.autoShieldRegenLock = AUTO_SHIELD_REGEN_PAUSE;
+    s.autoShieldRegenLock = DEBUG.autoShieldRegenPause; // CS015 P4: now tunable live from the Debug panel (default = AUTO_SHIELD_REGEN_PAUSE)
     s.shieldOn = true;
     // Penalty BYPASSES addScore by design (FLAG-4e / CLAUDE.md scoring exception): auto-save must NOT touch
     // game.nextRepair, so it can never trip the HP-repair milestone. Clamp the score at 0.
@@ -4338,7 +5075,7 @@ function damageShip(amount, srcX, srcY) {
   // A shielded / i-frame hit early-returned above, so it never reaches here.
   if (game.scoopLevel > 0) {
     game.scoopHits++;
-    if (game.scoopHits >= SCOOP_HITS_PER_LEVEL) {
+    if (game.scoopHits >= DEBUG.scoopHitsPerLevel) {
       game.scoopLevel = Math.max(0, game.scoopLevel - 1);
       game.scoopHits = 0;
       game.floaters.push(new FloatText("SCOOP -1", s.x, s.y - 22, POWERUP_COLOR.scoop));
@@ -4447,7 +5184,7 @@ function coalesceGarbage(dt) {
       const b = gs[j];
       if (b.dead || b.coalesceDelay > 0) continue;        // both pieces must be active
       const d2 = dist2(a, b);
-      if (d2 >= GARBAGE_MAGNET_RANGE * GARBAGE_MAGNET_RANGE) continue;
+      if (d2 >= DEBUG.garbageAttractRadius * DEBUG.garbageAttractRadius) continue;
       const [dx, dy] = shortDelta(a.x, a.y, b.x, b.y);     // shortest vector a -> b (wrap-aware)
       if (d2 < GARBAGE_MERGE_DIST * GARBAGE_MERGE_DIST) {
         // Merge (v3.2 P1, reverses FORK-2): survivor's velocity is the MOMENTUM sum (with PRE-merge
@@ -4461,6 +5198,14 @@ function coalesceGarbage(dt) {
         a.mass = mt;
         a.pieces += b.pieces;
         a.radius = 7 * Math.sqrt(a.pieces);
+        a.decay = DEBUG.garbageLifetime; // CS015 P6 (item 10): a merge is activity — clock resets to full,
+                                          // so an actively-growing lineage never ages out, only a stalled one
+        // CS017 P5: an unclaimed bonus marker survives a merge onto the survivor. Coalescence is not
+        // something the player controls, so a bonus canister quietly absorbed into a passing clump
+        // shouldn't silently stop being one. It can't double-pay: there is exactly one survivor object
+        // and the payout clears the flag. (Shatter is the opposite call by design — its children are
+        // fresh Garbage and inherit nothing, so shooting a bonus clump forfeits it. See GDD 2.10.1.)
+        a.bonus = a.bonus || b.bonus;
         b.dead = true;
         if (a.pieces >= HUNTER_COALESCE_COUNT) {
           // Clump collapses into a new large Hunter core. Independent of game.hunterTimer (FORK-1).
@@ -4480,7 +5225,7 @@ function coalesceGarbage(dt) {
       // loose singles fall into. Momentum-conserving (m_a·acc_a == m_b·acc_b). Reduces EXACTLY to the
       // shipped symmetric pull when both masses are 1.0, so GARBAGE_MAGNET_PULL needs no retune.
       const d = Math.sqrt(d2) || 0.0001;
-      const ux = (dx / d) * GARBAGE_MAGNET_PULL * dt, uy = (dy / d) * GARBAGE_MAGNET_PULL * dt;
+      const ux = (dx / d) * DEBUG.garbageAttractForce * dt, uy = (dy / d) * DEBUG.garbageAttractForce * dt;
       a.vx += ux * b.mass; a.vy += uy * b.mass;
       b.vx -= ux * a.mass; b.vy -= uy * a.mass;
       if (GARBAGE_CLUMP_MAXSPD !== Infinity) { // off-by-default playtest clamp
@@ -4546,6 +5291,26 @@ function updateChain(dt) {
 function breakChain(i) { // node i destroyed; everything aft breaks loose
   const chain = game.chain;
   const hit = chain[i];
+  // CS017 P6 — CHAIN GUARD. This function is the single HOSTILE break choke point: both call sites (a
+  // hostile bullet vs a node, and a debris/Hunter body vs a node) route through here, and each severs
+  // everything aft of node i in ONE call, so one hostile hit is absorbed exactly once no matter how many
+  // nodes it would have cut loose. Two separate hits in the same frame are two separate absorptions,
+  // which is correct — they are two events, not one.
+  //   FORK-CS017-E resolved (a): this covers HOSTILE breaks ONLY. scatterChain() (ship death) is
+  //   deliberately NOT guarded — death still scatters the whole load, and stays unambiguously terminal.
+  if (powerActive("guard")) {
+    // TIME mode: the clock alone governs — nothing is spent per intercept. COUNT mode: one charge each.
+    if (powerMode("guard") === "count") game.powerBudget.guard = Math.max(0, game.powerBudget.guard - 1);
+    // The tell. Deliberately NOT boom() — that carries AudioSys.explosion() and would sound like the
+    // canister died. shieldPing() is the shipped "a hit was blocked" voice (the same one the ship's own
+    // shield uses), and the particles are pushed straight in, in the guard hue, so the burst reads as a
+    // deflection rather than a detonation. The persistent state tell is the guard-lit chain in drawChain.
+    for (let p = 0; p < GUARD_ABSORB_SPARKS; p++) game.particles.push(new Particle(hit.x, hit.y, POWERUP_COLOR.guard));
+    game.floaters.push(new FloatText("GUARDED", hit.x, hit.y - 18, POWERUP_COLOR.guard));
+    AudioSys.shieldPing();
+    VoiceSys.say("chain_guard"); // CS017 P7 — same single choke point: a multi-node hit speaks once
+    return; // no node severed, deliveryCount untouched — the load is byte-identical
+  }
   boom(hit.x, hit.y, 1, COLOR.garbage);
   for (let j = i + 1; j < chain.length; j++) {
     game.garbage.push(Garbage.fromNode(chain[j]));
@@ -4561,20 +5326,30 @@ function scatterChain() { // ship destroyed: whole load breaks loose
   game.deliveryCount = 0;
 }
 
-function drawLink(x1, y1, x2, y2) {
+// CS017 P6: `guarded` lights the link up — full alpha instead of 0.7, a wider stroke, a much bigger glow
+// blur, and the guard hue. Same glowStroke idiom, same single path, no new geometry and no fill
+// (GDD §3.2). Computed ONCE per frame by drawChain and passed down rather than re-read per link.
+function drawLink(x1, y1, x2, y2, guarded = false) {
   const [dx, dy] = shortDelta(x1, y1, x2, y2);
   if (Math.hypot(dx, dy) > 120) return; // don't streak across the wrap seam
   ctx.beginPath();
   ctx.moveTo(x1, y1);
   ctx.lineTo(x1 + dx, y1 + dy);
-  ctx.globalAlpha = 0.7;
-  glowStroke(COLOR.chain, 1.2, 6);
+  ctx.globalAlpha = guarded ? 1 : 0.7;
+  glowStroke(guarded ? POWERUP_COLOR.guard : COLOR.chain,
+    guarded ? GUARD_CHAIN_WIDTH : 1.2, guarded ? GUARD_CHAIN_BLUR : 6);
   ctx.globalAlpha = 1;
 }
 
 function drawChain() {
   const chain = game.chain;
   if (!chain.length) return;
+  // CS017 P6: while the chain guard is up the whole tow reads "armoured" — links and canisters both
+  // take the guard hue and the links glow harder. NOTE the deliberate trade: a guarded node no longer
+  // shows its mass tint (COLOR.garbageLight for low-mass Hunter scrap vs COLOR.garbage), because
+  // "this load cannot be cut" is the more urgent read and the guard window is short. Reversible
+  // look-call — playtest ask, see STATUS.md.
+  const guarded = powerActive("guard");
   // Chain nodes trail the ship but can straddle the world seam; map each point to
   // its nearest image relative to the camera so links/canisters render next to the ship.
   const cam = game.camera;
@@ -4585,14 +5360,14 @@ function drawChain() {
   if (!game.ship.dead) {
     const a = img(chainAnchor());
     const c0 = img(chain[0]);
-    drawLink(a.x, a.y, c0.x, c0.y);
+    drawLink(a.x, a.y, c0.x, c0.y, guarded);
   }
   for (let i = 1; i < chain.length; i++) {
     const p = img(chain[i - 1]), q = img(chain[i]);
-    drawLink(p.x, p.y, q.x, q.y);
+    drawLink(p.x, p.y, q.x, q.y, guarded);
   }
   for (const n of chain) { const p = img(n); drawCanister(p.x, p.y, n.spin, 1,
-    n.mass < 1 ? COLOR.garbageLight : COLOR.garbage); }
+    guarded ? POWERUP_COLOR.guard : (n.mass < 1 ? COLOR.garbageLight : COLOR.garbage)); }
 }
 
 // ---------- Update ----------
@@ -4736,6 +5511,10 @@ function update(dt) {
   // Achievements (F9): per-game clock (Speed Recycler's 60s window) + lifetime play time & periodic save
   game.stats.gameTime += dt;
   Achievements.tick(dt);
+  // CS017 P1: seconds elapsed in the current wave — inert this phase (P4 wires it to saucer pressure).
+  // Lives here, not loop(), so it FREEZES while paused and at the title, same rationale as
+  // game.lowHpPhase (CS010 P3): this early-return above already gates on game.state === "playing" && !game.paused.
+  game.waveTime += dt;
   game.debris.forEach(a => a.update(dt));
   game.bullets.forEach(b => b.update(dt));
   game.saucers.forEach(s => s.update(dt));
@@ -4772,6 +5551,18 @@ function update(dt) {
     // scoopLevel 0 inScoopBox is always false, so this is byte-identical to the pre-scoop pickup.
     if (game.chain.length < game.cargoMax &&
         (dist2(g, game.ship) < pickR * pickR || inScoopBox(g))) {
+      // CS017 P5: the bonus canister pays ONCE, HERE — at the moment of capture, above the
+      // single/clump branch so both paths trip it, and inside the capture gate so only a real scoop
+      // counts. Deliberately NOT proportional to how many pieces actually fit: reaching the clump is
+      // what's being rewarded, so a nearly-full chain still banks the full BONUS_CANISTER_SCORE.
+      // Clearing the flag is load-bearing — a partial scoop's leftover is the SAME object and would
+      // otherwise pay again when the player comes back for it. Routed through addScore() normally
+      // (this is a gain, not the AUTO_SHIELD_SCORE_PENALTY bypass case — see CLAUDE.md).
+      if (g.bonus) {
+        g.bonus = false;
+        addScore(BONUS_CANISTER_SCORE);
+        game.floaters.push(new FloatText("+" + BONUS_CANISTER_SCORE, g.x, g.y, COLOR.garbageBonus));
+      }
       if (g.pieces === 1) {
         // A single hooks onto the chain as one node (unchanged behavior).
         g.dead = true;
@@ -4810,7 +5601,7 @@ function update(dt) {
           g.pieces -= take;
           g.mass  -= take * pMass;
           g.radius = 7 * Math.sqrt(g.pieces);
-          g.coalesceDelay = GARBAGE_COALESCE_DELAY;
+          g.coalesceDelay = DEBUG.garbageAttractDelay;
           const [ax, ay] = shortDelta(game.ship.x, game.ship.y, g.x, g.y); // ship -> leftover (wrap-aware)
           const d = Math.hypot(ax, ay) || 0.0001;
           g.vx += (ax / d) * SCOOP_SPILL_KICK;
@@ -4832,7 +5623,8 @@ function update(dt) {
     p.update(dt);
     if (!p.dead && !game.ship.dead) {
       const r = p.radius + SHIP_RADIUS;
-      if (dist2(p, game.ship) < r * r) { p.dead = true; applyPowerup(p.type); }
+      // CS015 P3 (item 8): scoop mouth also captures powerups — scoop only, no magnet multiplier.
+      if (dist2(p, game.ship) < r * r || inScoopBox(p)) { p.dead = true; applyPowerup(p.type); }
     }
   }
   for (const k in game.powerFx) {
@@ -4842,9 +5634,13 @@ function update(dt) {
   // powerActive() (never powerFx directly) so it correctly catches BOTH time mode (clock ran out) AND
   // count mode (shots/pieces budget hit 0) — hooking powerFx would silently miss the count modes. Runs
   // after the powerFx decay and after this frame's budget spends, so powerActive() is current.
+  // CS017 P6: "guard" joined POWERUP_DROP_TYPES, so it is latched here like every other type — but it has
+  // NO expire_ line (its only voice event is the P7 chain_guard intercept), so the say() is skipped for it
+  // and the string "expire_guard" is never built. The latch still tracks, so adding a line later stays a
+  // one-line data edit plus deleting the `t !== "guard"` clause.
   for (const t of POWERUP_DROP_TYPES) {
     const active = powerActive(t);
-    if (!active && game.powerVoiced[t]) VoiceSys.say("expire_" + t);
+    if (!active && game.powerVoiced[t] && t !== "guard") VoiceSys.say("expire_" + t);
     game.powerVoiced[t] = active;
   }
   for (const k in game.powerBank) {
@@ -4943,8 +5739,13 @@ function update(dt) {
     game.saucers.push(new Saucer(small));
     AudioSys.saucer(true, small);
     // Longer gaps between saucers early, tightening toward the shipped cadence at full difficulty.
-    const gapMin = ramp(SAUCER_GAP_FLOOR_MIN, SAUCER_GAP_CEIL_MIN, game.wave);
-    const gapMax = ramp(SAUCER_GAP_FLOOR_MAX, SAUCER_GAP_CEIL_MAX, game.wave);
+    // CS017 P4: the wave-scaled value is the level's OPENING gap; time-in-level (wavePressure) then
+    // shortens it further toward each bound's own _CEIL on top of that (FORK-CS017-B -> COMPOSE).
+    const gapMinBase = ramp(SAUCER_GAP_FLOOR_MIN, SAUCER_GAP_CEIL_MIN, game.wave);
+    const gapMaxBase = ramp(SAUCER_GAP_FLOOR_MAX, SAUCER_GAP_CEIL_MAX, game.wave);
+    const gapPressure = wavePressure() * DEBUG.saucerGapPressure;
+    const gapMin = gapMinBase + (SAUCER_GAP_CEIL_MIN - gapMinBase) * gapPressure;
+    const gapMax = gapMaxBase + (SAUCER_GAP_CEIL_MAX - gapMaxBase) * gapPressure;
     game.saucerTimer = rand(gapMin, gapMax);
   }
 
@@ -5098,8 +5899,9 @@ function update(dt) {
   game.powerups = game.powerups.filter(p => !p.dead);
   if (hadSaucer && game.saucers.length === 0) AudioSys.saucer(false);
 
-  // --- Wave clear ---
-  if (game.debris.length === 0 && game.hunters.length === 0) {
+  // --- Wave clear --- CS015 P3: clears on debris-empty alone; Hunters and loose garbage
+  // carry over by design (not wiped by nextWave()) and can accumulate if neglected.
+  if (game.debris.length === 0) {
     game.waveClearTimer += dt;
     if (game.waveClearTimer > 2.5) {
       game.waveClearTimer = 0;
@@ -5178,6 +5980,54 @@ function drawMenu() {
   else if (s === "difficulty") drawDifficulty();
   else if (s === "achievements") drawAchievements();
   else if (s === "highscores") drawHighScores();
+  else if (s === "debug") drawDebug();   // CS015 P4: hidden, secret-code-only
+  drawModal();  // CS016 P3: LAST, unconditionally — it must paint over whichever panel raised it
+}
+
+// CS016 P3: the confirmation dialog's render. Self-gating (no-op when no modal is open) so drawMenu()
+// can call it unconditionally as its final act — a dialog is always on top of the screen that raised
+// it, and ordering it last is what makes that true without a z-index concept.
+//
+// Width is MEASURED, never fixed (the CS015 P1 self-healing precedent that drawRootMenu set): both the
+// per-consumer prompt AND the fixed hint are measured at their real render sizes and the wider one
+// wins, so a longer prompt added later widens the box instead of bleeding through the border.
+// menuPanel's own fill is opaque enough (0.95) to hide the panel underneath wherever they overlap, so
+// no extra backdrop dim is painted here — drawMenu already laid one over the world.
+function drawModal() {
+  const md = game.menu.modal;
+  if (!md) return;
+  ctx.font = MODAL_TEXT_SIZE + "px monospace";
+  const textW = Math.ceil(ctx.measureText(md.text).width);
+  ctx.font = MENU_HINT_SIZE + "px monospace";
+  const hintW = Math.ceil(ctx.measureText(MODAL_HINT).width);
+  const w = Math.max(MODAL_MIN_W, Math.max(textW, hintW) + 2 * MODAL_MARGIN);
+  const { y } = menuPanel(w, MODAL_H, MODAL_TITLE);
+  drawText(md.text, VIEW_W / 2, y + MODAL_TEXT_Y, MODAL_TEXT_SIZE, COLOR.text);
+  // Two rows, confirm first (index 0) and cancel second (index 1) — the same "▶ " prefix and
+  // COLOR.text / COLOR.menuIdle convention every other menu list uses, so the selection reads
+  // identically here. Order is fixed; it is the default INDEX (1) that keeps cancel safe.
+  [md.confirmLabel, md.cancelLabel].forEach((label, i) => {
+    const sel = i === md.index;
+    drawText((sel ? "▶ " : "   ") + label, VIEW_W / 2, y + MODAL_ROW_Y + i * MODAL_ROW_STEP,
+             MODAL_ROW_SIZE, sel ? COLOR.text : COLOR.menuIdle);
+  });
+  drawMenuHint(MODAL_HINT, VIEW_W / 2, y + MODAL_HINT_Y);
+}
+
+// CS016 P2 (§1.2, FORK-CS016-B → b): the title screen's own menu — the ONE menu that deliberately
+// does NOT go through drawMenu(). No backdrop dim, no menuPanel box: the title art and the drifting
+// titleDebris field stay fully visible, which is the whole point on the one screen whose job is to
+// look good. Called from draw()'s title branch (not drawMenu's dispatch), so it can never pick up that
+// function's chrome by accident. Row look reuses the established idioms exactly — the "▶ " selection
+// prefix and the COLOR.text (selected) / COLOR.menuIdle (idle) convention from drawRootMenu, and the
+// shared drawMenuHint() footer from CS013 P2. Every y here is a TITLE_MENU_* playtest knob.
+function drawTitleMenu() {
+  MENU_TITLE.forEach((label, i) => {
+    const sel = i === game.menu.index;
+    drawText((sel ? "▶ " : "   ") + label, VIEW_W / 2, TITLE_MENU_Y + i * TITLE_MENU_STEP,
+             TITLE_MENU_SIZE, sel ? COLOR.text : COLOR.menuIdle);
+  });
+  drawMenuHint(TITLE_MENU_HINT, VIEW_W / 2, TITLE_MENU_HINT_Y);
 }
 
 function menuPanel(w, h, title) {
@@ -5200,17 +6050,35 @@ function menuPanel(w, h, title) {
 // row math (fixed 46px step) needs no resize for the gameover case.
 function drawRootMenu() {
   const items = rootItems();
-  const { y } = menuPanel(360, 300, game.state === "playing" ? "PAUSED" : "MENU");
+  // CS015 P1: measure the control hint at its real render size/font before sizing the panel, so a
+  // future hint or font-size change self-heals instead of silently bleeding past the border again.
+  ctx.font = MENU_HINT_SIZE + "px monospace";
+  const w = Math.max(360, Math.ceil(ctx.measureText(ROOT_MENU_HINT).width) + 2 * ROOT_MENU_HINT_MARGIN);
+  // CS016 P4: height DERIVED from items.length (same self-healing principle as the width above) rather
+  // than a hardcoded 300, so the 3-row gameover root and the 4-row pause root (Save added) both fit
+  // through this one function with no branch. Rows start at y+118 and step 46px apart (unchanged); the
+  // hint sits 62px below the last row's baseline (extra breathing room beyond the row step), and the
+  // panel keeps 28px of margin below the hint. h = 118 + (N-1)*46 + 62 + 28 reproduces the old fixed
+  // 300 exactly at N=3.
+  const hintY = 118 + (items.length - 1) * 46 + 62;
+  const h = hintY + 28;
+  const { y } = menuPanel(w, h, game.state === "playing" ? "PAUSED" : "MENU");
   items.forEach((it, i) => {
     const sel = i === game.menu.index;
-    drawText((sel ? "▶ " : "   ") + it, VIEW_W / 2, y + 118 + i * 46, 24, sel ? COLOR.text : COLOR.menuIdle);
+    // CS016 P4 (§4): "Save" is the shared unavailable-row idiom — always COLOR.dim, focused or not,
+    // so silence (no confirm blip) reads as "this row does nothing" rather than "nothing happened".
+    const color = it === "Save" ? COLOR.dim : (sel ? COLOR.text : COLOR.menuIdle);
+    drawText((sel ? "▶ " : "   ") + it, VIEW_W / 2, y + 118 + i * 46, 24, color);
   });
-  drawMenuHint("↑↓ move    ENTER / A select    ESC / B back", VIEW_W / 2, y + 272);
+  drawMenuHint(ROOT_MENU_HINT, VIEW_W / 2, y + hintY);
 }
 
-// CS010 P4 (§9/§10a): now a pure nav list (Sound / Music, Controls, Achievements, High Scores,
-// Difficulty, Back) — the value rows (volume sliders + Music Track) moved to drawSound() below, so
-// this mirrors drawRootMenu's plain centered-list layout instead of the old split value/nav layout.
+// CS010 P4 (§9/§10a): a pure nav list — the value rows (volume sliders + Music Track) moved to
+// drawSound() below, so this mirrors drawRootMenu's plain centered-list layout instead of the old split
+// value/nav layout. CS016 P2: down to four rows (Sound / Music, Controls, Difficulty, Back) now that
+// Achievements + High Scores live on the title menu. The forEach is label-driven, so the shrink needs
+// no layout edit; the 600x420 panel is left as-is (it just carries more whitespace) — resizing it is a
+// look call for Paul, and drawRootMenu's derived-height work is CS016 P4's scope, not this phase's.
 function drawOptionsMenu() {
   const { y } = menuPanel(600, 420, "OPTIONS");
   const m = game.menu;
@@ -5264,33 +6132,76 @@ function drawSound() {
 function drawDifficulty() {
   // Panel grown +58 (from 360) vs. pre-CS012-P5 to seat the third value row (Auto-shield); Back and the
   // help/hint lines shift down by the same 58 so the layout below the rows is unchanged in spirit.
-  const { x, y } = menuPanel(620, 418, "DIFFICULTY");
+  // CS017 P6: +58 again (418 -> 476) for the fourth value row (Chain guard), and the three anchors below
+  // the rows shift by the same 58 — Back 320 -> 378, help 364 -> 422, hint 394 -> 452.
+  const { x, y } = menuPanel(620, 476, "DIFFICULTY");
   const m = game.menu;
+  // CS016 P4 (§5): mid-run, all three value rows render dim regardless of focus — the shared
+  // unavailable-row idiom — so a player who lands on one can still read it but sees plainly that it
+  // won't respond. "back" is excluded; it stays fully live at every game.state.
+  const locked = game.state === "playing";
   // Each row draws as "left | right" with the ACTIVE side lit. rightActive=true lights the right label.
   const rows = [
     { label: "Shot powerups expire", left: "Time", right: "Shots",  rightActive: settings.shotPowerupMode === "shots" },
     { label: "Magnet expires",       left: "Time", right: "Pieces", rightActive: settings.magnetMode === "pieces" },
     { label: "Auto-shield",          left: "Off",  right: "On",     rightActive: settings.autoShield },
+    { label: "Chain guard expires",  left: "Time", right: "Intercepts", rightActive: settings.chainGuardMode === "count" }, // CS017 P6
   ];
   rows.forEach((r, i) => {
     const sel = m.index === i, cy = y + 122 + i * 58;
-    drawText(r.label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
+    drawText(r.label, x + 40, cy + 6, 18, locked ? COLOR.dim : (sel ? COLOR.text : COLOR.menuIdle), "left");
     const ox = x + 360;
-    drawText(r.left,  ox,       cy + 6, 18, r.rightActive ? COLOR.dim : COLOR.text, "left");
+    drawText(r.left,  ox,       cy + 6, 18, locked ? COLOR.dim : (r.rightActive ? COLOR.dim : COLOR.text), "left");
     drawText("|",     ox + 74,  cy + 6, 18, COLOR.dim, "left");
-    drawText(r.right, ox + 92,  cy + 6, 18, r.rightActive ? COLOR.text : COLOR.dim, "left");
-    if (sel) { drawText("◄", ox - 24, cy + 7, 16, COLOR.text); drawText("►", ox + 178, cy + 7, 16, COLOR.text); }
+    drawText(r.right, ox + 92,  cy + 6, 18, locked ? COLOR.dim : (r.rightActive ? COLOR.text : COLOR.dim), "left");
+    if (sel) { drawText("◄", ox - 24, cy + 7, 16, locked ? COLOR.dim : COLOR.text); drawText("►", ox + 178, cy + 7, 16, locked ? COLOR.dim : COLOR.text); }
   });
-  // Per-row help line under the rows — describes the FOCUSED row only (Back has no help line).
+  // Per-row help line under the rows — describes the FOCUSED row only (Back has no help line). CS016 P4:
+  // while locked it's replaced by DIFFICULTY_LOCK_HELP for all three value rows — routed through the
+  // SAME line (drawMenuHint at the same y) rather than a second help mechanism.
   const HELP = [
     "Time = today's 15-second timer.   Shots = expire by use, not the clock.",
     "Time = today's 15-second timer.   Pieces = expire by use, not the clock.",
     "Auto-raises shield at critical hull. -500 points per blocked hit.",
+    // CS017 P6: the only INTERPOLATED help line. Both of chain guard's numbers are live DEBUG_VARS
+    // knobs (unlike the siblings' 15 s, which is the frozen POWERUP_DURATION const), so a literal here
+    // would silently go stale the moment the dev panel is touched. HELP is rebuilt every frame anyway.
+    `Tows can't be cut while it holds. Time = a ${DEBUG.chainGuardTime}-second timer.   ` +
+      `Intercepts = ${DEBUG.chainGuardIntercepts} blocked breaks.`,
   ];
-  const backSel = m.index === 3;
-  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 320, 22, backSel ? COLOR.text : COLOR.menuIdle);
-  if (m.index < HELP.length) drawMenuHint(HELP[m.index], VIEW_W / 2, y + 364);
-  drawMenuHint("↑↓ move    ◄► toggle    ENTER / A select    ESC / B back", VIEW_W / 2, y + 394);
+  // Back is the row AFTER the value rows — derived from rows.length, never a literal, so the next
+  // difficulty knob is a one-line push to `rows` + `HELP` (CS015 P5's derive-the-index lesson).
+  const backSel = m.index === rows.length;
+  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 378, 22, backSel ? COLOR.text : COLOR.menuIdle);
+  if (m.index < HELP.length) drawMenuHint(locked ? DIFFICULTY_LOCK_HELP : HELP[m.index], VIEW_W / 2, y + 422);
+  drawMenuHint("↑↓ move    ◄► toggle    ENTER / A select    ESC / B back", VIEW_W / 2, y + 452);
+}
+
+// Hidden Debug Options panel renderer (CS015 P4) — generic over DEBUG_VARS, following drawSound's
+// value-row layout (left-aligned label + value + ◄► chevrons on the focused row) plus a centered Back
+// row. Panel height grows with the registry, so P5/P6 knobs slot in with no layout edit. CS017 P2 adds
+// one more row between the values and Back: "Dump difficulty log" — an ACTION row, rendered like Back
+// (centered, ▶ marker, no value, no chevrons even when selected) rather than like a value row.
+function drawDebug() {
+  const N = DEBUG_VARS.length, h = 220 + (N + 1) * 46;
+  const { x, y } = menuPanel(560, h, "DEBUG OPTIONS");
+  const m = game.menu;
+  let cy = y + 100;
+  DEBUG_VARS.forEach((e, i) => {
+    const sel = m.index === i;
+    drawText(e.label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
+    const ox = x + 340;
+    drawText(debugShown[e.id] + (e.unit ? " " + e.unit : ""), ox, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
+    if (sel) { drawText("◄", ox - 24, cy + 7, 16, COLOR.text); drawText("►", ox + 120, cy + 7, 16, COLOR.text); }
+    cy += 46;
+  });
+  const dumpSel = m.index === N;
+  drawText((dumpSel ? "▶ " : "   ") + "Dump difficulty log", VIEW_W / 2, cy + 6, 18, dumpSel ? COLOR.text : COLOR.menuIdle);
+  cy += 46;
+  cy += 14;
+  const backSel = m.index === N + 1;
+  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, cy + 6, 22, backSel ? COLOR.text : COLOR.menuIdle);
+  drawMenuHint("↑↓ move    ◄► adjust    ENTER / A select    ESC / B back", VIEW_W / 2, y + h - 30);
 }
 
 function drawControlsMenu() {
@@ -5370,11 +6281,13 @@ function axisLabel(a) {
   return "Axis " + a.index;
 }
 
-// ---------- Achievements viewer + unlock toasts (F9; 3-column since v3.0 P8; ×1.5 + scroll CS013 P3) ----------
-// Read-only list reachable from Options -> Achievements. Three columns: this week's 5 (left) and the
-// lifetime set split across two columns (P8 grew it 12 -> 19, too many for one column), each row with
-// unlock status + a progress readout. Screen-fixed, drawn by drawMenu. Layout widths/split are a pure
-// look-call tunable (colW / xL / xM / xR / the ceil-half split) — see the P8 playtest ask in STATUS.
+// ---------- Achievements viewer + unlock toasts (F9; ×1.5 + scroll CS013 P3; 2-tab since CS016 P5) ----------
+// Read-only list reachable from the title menu -> Achievements. CS016 P5 replaced the old three
+// 350px-wide columns (weekly | lifetime | lifetime-cont.) with TWO TABS — Weekly and Lifetime —
+// showing one pool at a time down a SINGLE full-width column, each row with unlock status + a
+// progress readout. That resolves CS013 P3's own complaint that colW=350 was marginal for a long
+// description at ACH_SCALE 1.5: the column is now ACH_COL_W (1140) wide, better than 3x the room.
+// Screen-fixed, drawn by drawMenu.
 //
 // CS013 P3: geometry hoisted to top-level consts (rather than locals inside drawAchievements) so
 // achMaxScroll() — called from menuAchievements(), which has no drawing context — derives the exact
@@ -5382,21 +6295,55 @@ function axisLabel(a) {
 // panel's own w/h are fixed), so this is safe without re-invoking menuPanel() (which has fill/stroke/
 // text side effects and can't be called twice per frame).
 const ACH_PANEL_W = 1200, ACH_PANEL_H = 660;
+const ACH_PANEL_X = (VIEW_W - ACH_PANEL_W) / 2;      // CS016 P5: the x sibling of ACH_PANEL_Y (menuPanel's own maths)
 const ACH_PANEL_Y = (VIEW_H - ACH_PANEL_H) / 2;
+const ACH_COL_X = ACH_PANEL_X + 30;                  // CS016 P5: the single column's left edge (the old xL)
+const ACH_COL_W = ACH_PANEL_W - 60;                  // CS016 P5: full panel width less a 30px gutter each side
+const ACH_TAB_Y = 108;                               // tab-header baseline, relative to the panel top (the old column-header y)
+const ACH_TAB_STEP = 260;                            // px between tab labels — playtest knob
 const ACH_ROW0_Y = ACH_PANEL_Y + 130;                // first row baseline (unchanged from pre-P3)
-const ACH_ROW_STEP = 40 * ACH_SCALE;                 // row-to-row baseline spacing (was a bare 40 pre-P3)
-const ACH_ROW_CLIP_TOP = ACH_ROW0_Y - 16;             // headroom above row 0, below the column headers (baseline y+108)
+const ACH_STATUS_DY = 24;                            // CS015 P2: status line's y-offset below the row's name baseline (playtest knob)
+const ACH_DESC_DY = 46;                              // CS015 P2: description line's y-offset below the row's name baseline (playtest knob)
+const ACH_ROW_STEP = 48 * ACH_SCALE;                 // row-to-row baseline spacing (was 40*ACH_SCALE pre-CS015-P2; three stacked lines need more headroom)
+const ACH_ROW_CLIP_TOP = ACH_ROW0_Y - 16;             // headroom above row 0, below the tab header (baseline y+ACH_TAB_Y)
 const ACH_ROW_CLIP_BOTTOM = ACH_PANEL_Y + 620;        // headroom above the footer (drawn at ACH_PANEL_Y+644)
 const ACH_ROW_VISIBLE_H = ACH_ROW_CLIP_BOTTOM - ACH_ROW_CLIP_TOP;
 
-// Derives maxScroll from the ACTUAL row counts (not a hardcoded pixel total), so a future LIFETIME/
-// weekly resize keeps working — the "tallest column" is whichever of the weekly or split-lifetime
-// columns has more rows (today: 10 lifetime rows per column vs. 5 weekly). Shared by drawAchievements()
-// (render + clamp) and menuAchievements() (input clamp) so the two can never disagree about the ceiling.
+// CS016 P5: the two tabs are DATA. `rows` is a thunk, not a snapshot — activeWeekly() re-derives from
+// the live weekly rotation every frame, and a test that swaps Achievements.LIFETIME still sees the swap.
+// achTabIndex()/achRows()/achMaxScroll()/drawAchievements() all read this one table, so a third tab
+// would be one more entry here and no new branch anywhere.
+const ACH_TABS = [
+  { id: ACH_TAB_DEFAULT, label: "WEEKLY",   rows: () => Achievements.activeWeekly() },
+  { id: "lifetime",      label: "LIFETIME", rows: () => Achievements.LIFETIME }
+];
+// Resolves game.menu.achTab to a table position, defaulting to tab 0 for any unknown/undefined id —
+// so a stale or missing field degrades to "show Weekly", never to a crash or a blank screen.
+function achTabIndex() {
+  const i = ACH_TABS.findIndex(t => t.id === game.menu.achTab);
+  return i < 0 ? 0 : i;
+}
+function achRows() { return ACH_TABS[achTabIndex()].rows(); }
+// Switching tabs ALWAYS zeroes the scroll: the two tabs are very different heights (5 weekly rows vs.
+// 20 lifetime ones), so carrying a Lifetime offset onto the Weekly tab would open it scrolled into
+// empty space. `i` wraps in both directions (see menuAchievements).
+function setAchTab(i) {
+  const n = ACH_TABS.length;
+  game.menu.achTab = ACH_TABS[((i % n) + n) % n].id;
+  game.menu.scroll = 0;
+  AudioSys.ui(false);
+}
+
+// Derives maxScroll from the ACTIVE TAB's ACTUAL row count (not a hardcoded pixel total), so a future
+// LIFETIME/weekly resize — or a third tab — keeps working. CS016 P5 made this tab-aware: pre-P5 it took
+// the tallest of three columns (max(weekly, ceil(LIFETIME/2))); now each tab is its own single column,
+// so the Lifetime tab's content is no longer halved and is roughly twice as tall as it used to be.
+// Shared by drawAchievements() (render + clamp) and menuAchievements() (input clamp) so the two can
+// never disagree about the ceiling — that shared-ceiling contract is why CS013 P3 hoisted this to a
+// top-level helper in the first place, and the renderer must never grow its own copy of this maths.
 function achMaxScroll() {
-  const half = Math.ceil(Achievements.LIFETIME.length / 2);
-  const rowsTall = Math.max(Achievements.activeWeekly().length, half);
-  const contentH = (rowsTall - 1) * ACH_ROW_STEP + 22 + 10 * ACH_SCALE; // last row's baseline -> its description's bottom
+  const rowsTall = achRows().length;
+  const contentH = (rowsTall - 1) * ACH_ROW_STEP + ACH_DESC_DY + 10 * ACH_SCALE; // last row's baseline -> its description's bottom
   return Math.max(0, contentH - ACH_ROW_VISIBLE_H);
 }
 
@@ -5405,26 +6352,26 @@ function drawAchievements() {
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
   const { x, y } = menuPanel(ACH_PANEL_W, ACH_PANEL_H, "ACHIEVEMENTS");
   drawText("WEEKLY SET " + Achievements.weekKey + " — resets each calendar week", VIEW_W / 2, y + 74, 12 * ACH_SCALE, COLOR.dim);
-  const colW = 350, xL = x + 30, xM = x + 430, xR = x + 820, ry0 = ACH_ROW0_Y, step = ACH_ROW_STEP;
-  drawText("THIS WEEK",        xL, y + 108, 15 * ACH_SCALE, COLOR.satellite, "left");
-  drawText("LIFETIME",         xM, y + 108, 15 * ACH_SCALE, COLOR.satellite, "left");
-  drawText("LIFETIME (cont.)", xR, y + 108, 15 * ACH_SCALE, COLOR.satellite, "left");
+
+  // CS016 P5: the tab header replaces the three column headers, in the established selected/idle
+  // convention every other menu uses (COLOR.text lit / COLOR.menuIdle dim) rather than the old
+  // uniform COLOR.satellite — these are now a cursor position, not three static captions.
+  const ti = achTabIndex();
+  ACH_TABS.forEach((t, i) => {
+    drawText(t.label, ACH_COL_X + i * ACH_TAB_STEP, y + ACH_TAB_Y, 15 * ACH_SCALE, i === ti ? COLOR.text : COLOR.menuIdle, "left");
+  });
 
   // CS013 P3 (§2.3.3): clamp against the same ceiling menuAchievements() uses, then clip the row
   // region so scrolled rows can never spill past the panel or under the header/footer (FLAG-2c:
-  // continuous scroll, all three columns move together — no per-row selection to conflict with).
+  // continuous scroll, the whole column moves together — no per-row selection to conflict with).
   const maxScroll = achMaxScroll();
   game.menu.scroll = Math.max(0, Math.min(maxScroll, game.menu.scroll));
   ctx.save();
   ctx.beginPath();
   ctx.rect(x, ACH_ROW_CLIP_TOP, ACH_PANEL_W, ACH_ROW_VISIBLE_H);
   ctx.clip(); // not a fill — GDD §3.2's no-fills rule gains no new exception here
-  Achievements.activeWeekly().forEach((a, i) => drawAchRow(a, xL, ry0 + i * step - game.menu.scroll, colW));
-  const half = Math.ceil(Achievements.LIFETIME.length / 2);   // first half -> middle column, rest -> right
-  Achievements.LIFETIME.forEach((a, i) => {
-    const cx = i < half ? xM : xR, row = i < half ? i : i - half;
-    drawAchRow(a, cx, ry0 + row * step - game.menu.scroll, colW);
-  });
+  // Only the ACTIVE tab's rows are drawn — one full-width column, so no per-column x/row juggling.
+  achRows().forEach((a, i) => drawAchRow(a, ACH_COL_X, ACH_ROW0_Y + i * ACH_ROW_STEP - game.menu.scroll, ACH_COL_W));
   ctx.restore();
 
   // Scroll affordance (FLAG-2c): shown only while there's anything to scroll; ▲ additionally requires
@@ -5435,31 +6382,38 @@ function drawAchievements() {
     if (game.menu.scroll < maxScroll) drawText("▼", VIEW_W / 2, ACH_ROW_CLIP_BOTTOM + 10, 16, COLOR.menuIdle, "center");
   }
 
-  drawMenuHint("ESC / B / ENTER  return to Options", VIEW_W / 2, y + 644);
+  // CS016 P5: the hint gains the ◄► tab control and drops the stale "to Options" destination — CS016
+  // P2 repointed this viewer's one parent to the title menu, which this footer had never caught up with.
+  drawMenuHint(ACH_HINT, VIEW_W / 2, y + 644);
 }
 
 // Thousands-grouped integer, locale-independent (deterministic across environments/tests).
 function fmtCommas(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
 
-// One achievement row: name + status on the top line, description below.
+// One achievement row: name, status, and description on three stacked lines.
 // Tiered lifetime rows show a tier badge + progress-to-next in the tier's colour (v3.0 P7);
 // single-goal rows keep the F9 look — a ✓ when earned (gold) or a cur/goal readout when not.
-// CS013 P3: sizes scaled by ACH_SCALE; description offset ry+15 -> ry+22; description and
-// locked/incomplete progress lifted dim -> menuIdle for contrast (unlocked stays ach gold, tier tints
-// unchanged).
+// CS013 P3: sizes scaled by ACH_SCALE; description and locked/incomplete progress lifted dim ->
+// menuIdle for contrast (unlocked stays ach gold, tier tints unchanged).
+// CS015 P2: name/status moved off the shared top line onto their own stacked lines (name @ry,
+// status @ry+ACH_STATUS_DY, desc @ry+ACH_DESC_DY) — at ACH_SCALE 1.5 a long name and a long
+// status/medal string sharing one line and colW could run into each other in the middle; status
+// stays right-aligned at x+w, just on its own row now.
+// CS016 P5: unchanged — the tab rebuild only changed the `w` it is handed (350 -> ACH_COL_W) and how
+// many callers there are (three columns -> one), never the three-line shape itself.
 function drawAchRow(ach, x, ry, w) {
   if (ach.tiers) {
     const idx = Achievements.tierIndex(ach);
     const col = idx >= 0 ? TIER_COLOR[idx] : COLOR.text;   // badge/name in the current tier's tint
     drawText(ach.name, x, ry, 15 * ACH_SCALE, col, "left");
-    drawText(Achievements.tierStatusText(ach), x + w, ry, 13 * ACH_SCALE, idx >= 0 ? col : COLOR.menuIdle, "right");
-    drawText(ach.desc, x, ry + 22, 10 * ACH_SCALE, COLOR.menuIdle, "left");
+    drawText(Achievements.tierStatusText(ach), x + w, ry + ACH_STATUS_DY, 13 * ACH_SCALE, idx >= 0 ? col : COLOR.menuIdle, "right");
+    drawText(ach.desc, x, ry + ACH_DESC_DY, 10 * ACH_SCALE, COLOR.menuIdle, "left");
     return;
   }
   const done = Achievements.isUnlocked(ach);
   drawText(ach.name, x, ry, 15 * ACH_SCALE, done ? COLOR.ach : COLOR.text, "left");
-  drawText(done ? "✓" : Achievements.progressText(ach), x + w, ry, 14 * ACH_SCALE, done ? COLOR.ach : COLOR.menuIdle, "right");
-  drawText(ach.desc, x, ry + 22, 10 * ACH_SCALE, COLOR.menuIdle, "left");
+  drawText(done ? "✓" : Achievements.progressText(ach), x + w, ry + ACH_STATUS_DY, 14 * ACH_SCALE, done ? COLOR.ach : COLOR.menuIdle, "right");
+  drawText(ach.desc, x, ry + ACH_DESC_DY, 10 * ACH_SCALE, COLOR.menuIdle, "left");
 }
 
 // ---------- High Scores rendering (v3.6 P6) ----------
@@ -5637,12 +6591,12 @@ function draw() {
   if (game.state === "title") {
     drawText("ORBITAL", VIEW_W/2, VIEW_H/2 - 120, 64);
     drawText("O V E R H A U L", VIEW_W/2, VIEW_H/2 - 60, 32, COLOR.satellite);
-    drawText("ROTATE: ←→ / A D      THRUST: ↑ / W", VIEW_W/2, VIEW_H/2 + 30, 20, COLOR.dim);
-    drawText("FIRE: SPACE      SHIELD: SHIFT      PAUSE: ESC", VIEW_W/2, VIEW_H/2 + 62, 20, COLOR.dim);
+    // CS016 P2 (§1.2, FORK-CS016-B → b): the two keyboard control-legend lines, the blinking
+    // "PRESS ENTER TO START", and the "OPTIONS / ACHIEVEMENTS: O" hint are all GONE — the legend is
+    // redundant now that Options -> Controls is a visible navigable destination that lists every
+    // binding authoritatively (and it never served a gamepad player), and the blink/hint are replaced
+    // by the menu itself plus one drawMenuHint footer. The flavour line stays, at its original y.
     drawText("BEWARE THE HUNTER SATELLITE", VIEW_W/2, VIEW_H/2 + 120, 18, COLOR.satellite);
-    if (Math.floor(performance.now() / 600) % 2 === 0)
-      drawText("PRESS ENTER TO START", VIEW_W/2, VIEW_H/2 + 180, 26);
-    drawText("OPTIONS / ACHIEVEMENTS: O    (controller: B)", VIEW_W/2, VIEW_H/2 + 220, 14, COLOR.ach);
     // CS010 P0 — build stamp, lower-right corner. Not a design element: small, dim, out of the way.
     drawText("v" + GAME_VERSION, VIEW_W - VERSION_STAMP_INSET_X, VIEW_H - VERSION_STAMP_INSET_Y,
               12, COLOR.dim, "right");
@@ -5655,7 +6609,16 @@ function draw() {
       if (a.y > VIEW_H + 60) a.y -= VIEW_H + 120;
       a.draw();
     });
-    if (game.paused) drawMenu();  // the menu (Options + its sub-screens) overlays the title (v3.0 P4; CS012 P4)
+    // CS016 P2: two render paths, mutually exclusive by construction. The title's OWN root menu draws
+    // chrome-less, straight over the art and debris. Any DEEPER title-descendant screen still routes
+    // through drawMenu()'s dim-plus-panel chrome, unchanged.
+    //
+    // The condition is game.menu.screen, NOT the old `if (game.paused)`: P1 decoupled the two, and
+    // Achievements / High Scores reached from the title menu are input-owning WITHOUT being paused
+    // (gotoScreen doesn't set the flag; only openPause does). A `game.paused` test would have rendered
+    // nothing at all on those two screens — a blank title with live input.
+    if (game.menu.screen === "titlemenu") drawTitleMenu();
+    else if (game.menu.screen !== null) drawMenu(); // Options + sub-screens, Achievements, High Scores, debug
     drawToasts();                 // keep unlock banners on top even on the title
     return;
   }
@@ -5845,8 +6808,16 @@ function drawHUD() {
   // i = index in POWERUP_DROP_TYPES) — activating/expiring a powerup no longer moves any other row,
   // because nothing is compacted anymore (the old `slot` cursor + `!powerActive(t) continue` skip are
   // gone). An inactive row is a muted track: dim glyph/label/number, no value arc, no low pulse, no
-  // bank pop. Row index 0 (y = HUD_FX_BASE_Y) is RESERVED for the SCOOP segmented ring below; the four
-  // timed rows float above it, i = 0..3.
+  // bank pop. Row index 0 (y = HUD_FX_BASE_Y) is RESERVED for the SCOOP segmented ring below; the timed
+  // rows float above it.
+  //
+  // CS017 P6: the stack is now SIX rows deep — Scoop at 640 plus five timed rows at 600/560/520/480/440,
+  // Chain Guard being the new topmost (i = 4). Nothing here changed to get that: the loop is generic over
+  // POWERUP_DROP_TYPES and the y is derived from the index, so appending the type was the whole edit.
+  // (Note for the record: the P6 prompt predicted y = HUD_FX_BASE_Y - 6*HUD_FX_ROW_H = 400 for the new
+  // row. The shipped formula is HUD_FX_BASE_Y - (i+1)*HUD_FX_ROW_H over a 0-based POWERUP_DROP_TYPES
+  // index, so the 6th row of the stack is the 5th TIMED row, i = 4, y = 440 — the figure the CS017
+  // planning doc's FLAG-CS017-c also gives. Verified against the code, not assumed.)
   for (let i = 0; i < POWERUP_DROP_TYPES.length; i++) {
     const t = POWERUP_DROP_TYPES[i];
     const y = HUD_FX_BASE_Y - (i + 1) * HUD_FX_ROW_H;
@@ -5908,16 +6879,20 @@ function drawHUD() {
   // SCOOP segmented ring (CS012 P2) — a PERSISTENT upgrade, NOT a timed effect, so it's deliberately
   // drawn OUTSIDE the POWERUP_DROP_TYPES loop above (game.scoopLevel is not in powerFx/powerBudget and
   // never expires on a clock). Row index 0 (y = HUD_FX_BASE_Y), the stable floor of the bottom-left
-  // stack — the persistent upgrade anchors the bottom, the four timed rows (i = 0..3, above) float
-  // above it. ALWAYS drawn, even at level 0 (dim track, 0 lit segments) — matches the timed rows'
+  // stack — the persistent upgrade anchors the bottom, the five timed rows (i = 0..4, above; five since
+  // CS017 P6) float above it. ALWAYS drawn, even at level 0 (dim track, 0 lit segments) — matches the timed rows'
   // always-shown-muted-when-idle treatment; segment count derives from SCOOP_MAX_LEVEL, never hardcoded.
   // STROKE ONLY — the old pip row's fill dot is gone (GDD §3.2 no-fills exception list update).
   {
     const scoopY = HUD_FX_BASE_Y;
+    // CS015 P1 (FLAG-CS015-b): follow the same active/idle convention as the timed rows above
+    // (color = active ? POWERUP_COLOR[t] : COLOR.dim) — previously hardcoded violet regardless of
+    // level, so it read as the one bright row among dim ones at rest.
+    const scoopCol = game.scoopLevel > 0 ? POWERUP_COLOR.scoop : COLOR.dim;
     drawRingSegments(40, scoopY, HUD_FX_RING_R, SCOOP_MAX_LEVEL, game.scoopLevel,
-      POWERUP_COLOR.scoop, COLOR.dim);
-    drawText("SCOOP", 64, scoopY - 4, 13, POWERUP_COLOR.scoop, "left");
-    drawText(String(game.scoopLevel), 64, scoopY + 14, 16, POWERUP_COLOR.scoop, "left");
+      scoopCol, COLOR.dim);
+    drawText("SCOOP", 64, scoopY - 4, 13, scoopCol, "left");
+    drawText(String(game.scoopLevel), 64, scoopY + 14, 16, scoopCol, "left");
   }
   // when hauling, a chevron orbiting screen-center points toward the (maybe off-screen) dock
   if (game.chain.length && game.dock && !game.ship.dead) {
@@ -6042,6 +7017,13 @@ function loop(now) {
   pollGamepad();        // refresh the first-gamepad snapshot once per frame, before anything reads it
   handleGamepadMenu();  // edge-triggered controller menu/system actions (Start/A/B)
   update(dt);
+  // CS015 P4: expire the debug secret-code arming window on inactivity. Lives HERE (loop() runs every
+  // frame) and NOT update(), which early-returns while paused/at title — the very states the code is
+  // armed in. performance.now() matches the clock DebugCode.last is stamped with in the keydown listener.
+  if (DebugCode.armed && performance.now() - DebugCode.last > DEBUG_CODE_IDLE_MS) {
+    DebugCode.armed = false;
+    AudioSys.secretDisarm();
+  }
   updateToasts(dt);     // age out achievement-unlock toasts (independent of pause/state) (F9)
   updateMusic();        // v3.4 P6: drive the music state/duck off game.state + menu, then run the scheduler
   draw();
@@ -6060,7 +7042,10 @@ function loop(now) {
 // reads the settings module global). Switching in/out is then a normal setState() crossfade — no
 // new track-switch path. Every OTHER combination is byte-identical to the pre-P7 mapping.
 function musicStateFor(s) {
-  if (game.paused && game.menu.screen === "highscores") return "highscore";
+  // CS016 P1: reads menuActive(), not game.paused — P2 moves this screen onto the title menu, where
+  // game.paused is FALSE. Reading game.paused here would silently stop the highscore fanfare track
+  // the moment High Scores becomes reachable from the title without pausing.
+  if (menuActive() && game.menu.screen === "highscores") return "highscore";
   return s === "playing" ? settings.musicTrack : s === "title" ? "title" : "off";
 }
 function updateMusic() {
@@ -6068,7 +7053,11 @@ function updateMusic() {
   // CS010 P7: menu ducking (50%) exists to make room for gameplay audio under an overlaid menu. The
   // High Scores screen has its OWN full-level track and nothing beneath it, so exempt it — otherwise
   // a track that plays only while a menu is open would be permanently ducked. setDuck is idempotent.
-  MusicSys.setDuck(menuActive() && game.menu.screen !== "highscores");
+  // CS016 P1: reads game.paused, not menuActive() — ducking exists to make room for GAMEPLAY audio
+  // under an overlaid menu, and there is no gameplay under the title screen. Reading menuActive()
+  // here would permanently duck the title track to MUSIC_DUCK_GAIN once P2's title menu (input-
+  // owning but never paused) lands.
+  MusicSys.setDuck(game.paused && game.menu.screen !== "highscores");
   MusicSys.update();
 }
 
