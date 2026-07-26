@@ -1,0 +1,2031 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Posse Pursuit</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#160f09;overflow:hidden;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#160f09;}
+  /* Keep the flex centering + backdrop colour when #wrap is the fullscreen element,
+     so fitCanvas()'s letterbox math behaves identically in and out of fullscreen. */
+  #wrap:fullscreen{width:100%;height:100%;background:#160f09;}
+  #wrap:-webkit-full-screen{width:100%;height:100%;background:#160f09;}
+  #game{display:block;background:#c9a15f;touch-action:none;-webkit-user-select:none;user-select:none;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="720" height="1620"></canvas></div>
+<script>
+'use strict';
+/* ================================================================
+   POSSE PURSUIT  v1.3.0  —  Coinless Games
+   A conga-line arena brawler. An original homage to Nimble Quest.
+   ----------------------------------------------------------------
+   Single-file HTML5 / vanilla JS / Canvas 2D. No external assets:
+   all art is drawn and all audio is synthesized (WebAudio) in code.
+
+   v1.3.0 — responsive arena + 1.5x characters. The grid now follows the
+   screen shape instead of being a fixed portrait column: CONFIG.display
+   .tilesShort (8, was effectively 12) sets how many tiles span the screen's
+   SHORT edge — the one number that decides apparent character size — and
+   resolveGrid() derives the tile size, the long edge's tile count and the
+   HUD height from it plus the device aspect. A phone gets 8x16, a laptop
+   14x7, both with <4% letterbox waste. Every pixel-space CONFIG value
+   re-derives from the tile (applyPixelScale), and spawn concurrency/cadence
+   are normalised by arena area so a differently-shaped arena keeps the
+   tuned density. The grid is locked at run start, never mid-run.
+
+   v1.2.0 — added a fullscreen toggle (title-screen button, pause-menu entry,
+   and the F key) for Chrome on Android, which has no F11 equivalent.
+
+   v1.1.0 — retuned for tall phones: internal 720x1620 (~2.23:1), 60px
+   tiles / 12x25 grid, sprites +25%, and a devicePixelRatio backing store
+   so the canvas renders crisp at native density (no more CSS-upscale blur).
+
+   FILE MAP (search for the banner comments):
+     1. CONFIG        — every tunable value lives here. Edit here first.
+     2. UTIL / RNG    — mulberry32 seeded RNG, math helpers
+     3. AUDIO         — WebAudio synth + SFX table
+     4. GLOBAL STATE  — MODE state machine + per-run state S
+     5. ARENA         — grid helpers, obstacles, background layer
+     6. RUN / WAVES   — run setup, wave init, spawn director
+     7. POSSE         — leader stepping, follower chain, damage
+     8. ENEMIES       — AI, daze, recruit
+     9. PROJECTILES   — bullets, bombs, explosions
+    10. PICKUPS       — tonic / horseshoe / nugget
+    11. FEEL          — particles, floating text, screenshake
+    12. SIMULATE      — fixed-timestep update (pure sim, testable)
+    13. RENDER        — world, HUD, overlays
+    14. INPUT         — keyboard + touch (swipe / drag steering)
+    15. LOOP / BOOT   — rAF loop, resize, debug hooks (window.__PP)
+   ================================================================ */
+
+/* ---------------------------------------------------------------
+   1. CONFIG — the single source of truth for every tunable value.
+   Rebalance the game here; nothing gameplay-relevant is hardcoded
+   elsewhere. See the Development & Tuning Notes doc for safe ranges.
+   --------------------------------------------------------------- */
+const CONFIG = {
+  meta: { title: 'POSSE PURSUIT', version: '1.3.0' },
+
+  debug: {
+    seed: null,        // set to an integer for a deterministic run (tests use this)
+    godMode: false,    // leader can't die (tuning aid)
+  },
+
+  /* Responsive arena (v1.3). `tilesShort` is THE size dial: it sets how many
+     tiles span the screen's SHORT edge, which is what apparent character size
+     actually depends on. Everything else — tile px, the long edge's tile count,
+     the HUD height, the internal resolution — is derived from it and the device
+     aspect by resolveGrid(). The grid is resolved at boot and re-resolved only
+     at the menu or at the start of a run, NEVER mid-run (entities would end up
+     outside the arena); a mid-run resize just re-letterboxes. */
+  display: {
+    tilesShort: 8,             // tiles across the screen's SHORT edge (v1.2 was 12)
+    refShortPx: 720,           // internal px spanning that edge; tile = round(refShortPx/tilesShort)
+    refTilePx: 60,             // tile the pixel-space CONFIG values below are authored at
+    hudTilesPortrait: 2.0,     // HUD height in tiles, portrait
+    hudTilesLandscape: 1.5,    // ...and landscape (a full-height bar wastes a laptop)
+    minCols: 5, minRows: 5,    // clamps: never resolve an arena too small to play in,
+    maxCols: 40, maxRows: 40,  //   nor so long that spawns can't reach the posse
+    autoGrid: true,            // false pins the current grid (tests do this for determinism)
+    dprCap: 3,                 // backing store = CSS size * min(devicePixelRatio, dprCap)
+
+    // --- resolved by applyGrid(); listed here so the shape of D is visible and
+    //     so a pinned grid (autoGrid:false) has something to pin to ---
+    tile: 90, cols: 8, rows: 16, hudH: 180,
+    width: 720, height: 1620, landscape: false,
+  },
+
+  // Fullscreen: Chrome for Android has no F11, so the game offers its own button
+  // (title screen + pause menu) and the F key. Requesting fullscreen on the #wrap
+  // container rather than the canvas keeps the CSS letterbox/centering intact.
+  fullscreen: {
+    enabled: true,      // false hides both buttons entirely (keys still ignored)
+    targetId: 'wrap',   // element to expand; must be the flex-centering container
+    navigationUI: 'hide',   // ask Android Chrome for an immersive view (hint only)
+  },
+
+  audio: { enabled: true, master: 0.5 },
+
+  /* NOTE ON UNITS (v1.3): every px value from here down is authored at
+     display.refTilePx (60) and re-derived for the live tile by applyPixelScale(),
+     so a grid change is a pure resize — reach, radii and speeds keep the same
+     TILE-relative feel they were tuned with. The scaled fields are listed in
+     PIXEL_FIELDS below. Values in tiles/second or seconds need no scaling. */
+  player: {
+    tilesPerSec: 4.2,      // leader speed in tiles/second (posse speed)
+    queueMax: 2,           // buffered direction inputs
+    maxPosse: 8,           // total members including the Sheriff
+    invulnSec: 1.0,        // leader i-frames after taking a hit
+    memberIframe: 0.5,     // follower i-frames after a hit
+    wallDamage: 1,         // damage to leader on wall/rock bump
+    recruitRadius: 43,     // px: how close the leader must ride to a dazed outlaw (34*1.25)
+    startDir: {x: 0, y: -1},
+    startClearTiles: 5,    // tiles of open road the opening heading needs; a short
+                           // arena picks the roomiest axis instead (see startPose)
+  },
+
+  // Posse classes. Enemies convert into these when deputized (see enemies.types[].recruitAs)
+  classes: {
+    sheriff:      { name:'Sheriff',      hp:3, range:263, fireInterval:0.65, damage:1, projSpeed:650, projKind:'bullet', color:'#e8b23c' },
+    deputy:       { name:'Deputy',       hp:2, range:188, fireInterval:0.45, damage:1, projSpeed:700, projKind:'bullet', color:'#5aa9e6' },
+    sharpshooter: { name:'Sharpshooter', hp:1, range:413, fireInterval:1.50, damage:2, projSpeed:950, projKind:'slug',   color:'#a97fe8' },
+    blaster:      { name:'Blaster',      hp:2, range:313, fireInterval:1.90, damage:1, projSpeed:0,   projKind:'bomb',   color:'#e0653a',
+                    bombRadius:70, bombFlight:0.8 },
+  },
+
+  enemies: {
+    dazeDuration: 5.0,          // seconds a defeated outlaw stays recruitable
+    spawnTelegraph: 0.8,        // dust-swirl warning before an enemy appears
+    minSpawnDistFromLeader: 275,// px: never spawn closer than this to the leader (220*1.25)
+    contactCooldown: 0.9,       // per-enemy cooldown between contact hits
+    bodyRadius: 18,             // collision radius (px) for all enemy types (14*1.25)
+    // Per-type stats. firstWave gates when a type enters the pool.
+    // Speeds are px/s and scale 1.25x with the tile so the posse still outruns them (see tuning notes).
+    types: {
+      bandit:     { hp:2, speed:93, score:100, recruitAs:'deputy',       contactDamage:1, color:'#c04a3e', firstWave:1, weight:10 },
+      gunslinger: { hp:2, speed:80, score:150, recruitAs:'sharpshooter', contactDamage:1, color:'#3f7d4e', firstWave:2, weight:6,
+                    prefRange:238, fireInterval:2.2, projSpeed:375, projDamage:1, aimJitter:0.14 },
+      dynamiter:  { hp:3, speed:65, score:200, recruitAs:'blaster',      contactDamage:1, color:'#8a5a2e', firstWave:4, weight:4,
+                    prefRange:338, fireInterval:3.2, bombFlight:1.0, bombRadius:78, bombDamage:1 },
+    },
+    // Continuous per-wave ramp (no stair-steps): multiplies base stats.
+    ramp: { hpPerWave:0.12, speedPerWave:0.04, speedCap:1.6 },
+
+    /* Standoff breaker (v1.3). A ranged outlaw that has gone unhurt for a while
+       gets bold and closes in, then backs off again once it is being shot at.
+       This exists because a type whose preferred range exceeds the reach of every
+       SURVIVING posse member can otherwise hold a stalemate the wave never
+       resolves out of — a lone Sheriff (reach 4.4 tiles) versus a Dynamiter
+       (standoff 5.6 tiles) is a run that never ends. Rarely fires with a healthy
+       posse: a Sharpshooter outranges every outlaw. */
+    patience: {
+      graceSec: 6,     // unhurt seconds before an outlaw starts closing
+      closeSec: 8,     // ...and how long the full advance takes
+      closeTo: 0.45,   // fraction of prefRange it will close to at full boldness
+    },
+  },
+
+  waves: {
+    total: 10,                 // clear this many waves to win
+    baseQuota: 6,              // enemies in wave 1
+    quotaPerWave: 2,           // +enemies per wave (linear ramp)
+    baseSpawnInterval: 3.2,    // seconds between spawns, wave 1
+    spawnIntervalDecay: 0.18,  // seconds shaved off per wave
+    minSpawnInterval: 1.2,     // floor
+    baseMaxActive: 3,          // simultaneous enemies on field, wave 1
+    activePerTwoWaves: 1,      // +1 concurrent enemy every 2 waves
+    maxActiveCap: 7,
+    interWaveDelay: 2.5,       // breather between waves, seconds
+
+    /* Arena-area normalisation (v1.3). The resolved grid is not always the
+       reference arena these curves were tuned on, so concurrency and spawn
+       cadence scale with tile count: a smaller arena gets fewer simultaneous
+       outlaws and a slower drip, a bigger one the reverse. Exponent 1 = strict
+       per-tile density, 0 = ignore arena size entirely. */
+    refAreaTiles: 300,         // 12x25 — the v1.2 arena these curves were tuned on
+    activeAreaExp: 0.5,        // maxActive ∝ (tiles/ref)^exp
+    intervalAreaExp: 0.25,     // interval  ∝ (tiles/ref)^-exp
+    minMaxActive: 2,           // floor: never fewer than this many concurrent threats
+  },
+
+  obstacles: {
+    base: 3,                   // rocks in wave 1
+    perThreeWaves: 1,          // +1 rock every 3 waves
+    max: 7,
+    minDistFromPosse: 2,       // tiles: never regenerate a rock this close to the posse
+  },
+
+  pickups: {
+    lifetime: 10,              // seconds before a pickup blinks out
+    radius: 33,                // collection radius from leader center (26*1.25)
+    maxOnField: 3,
+    dropChances: { tonic:0.08, horseshoe:0.06, nugget:0.10 }, // rolled per dazed outlaw
+    tonicHeal: 1,              // HP restored to EVERY posse member
+    nuggetScore: 500,
+    horseshoeDuration: 8,      // seconds of boosted fire rate
+    horseshoeRateMult: 1.5,    // fire-rate multiplier while active
+  },
+
+  score: {
+    recruitBonus: 150,         // on top of the daze score
+    overflowBounty: 250,       // riding over a dazed outlaw with a full posse
+    escape: 25,                // consolation when a dazed outlaw slips away
+    waveClearBase: 250,        // wave-clear bonus = waveClearBase * wave number
+  },
+
+  feel: {
+    swipePx: 28,               // drag distance that registers a steering swipe
+    shakeHurt: 6, shakeHurtDur: 0.25,
+    hitFlash: 0.15,
+    particleMax: 320,
+    tapMaxPx: 12,              // pointer movement under this counts as a tap
+    stateTapDelay: 0.6,        // ignore taps this long after a game-over/victory
+  },
+};
+
+/* --- Pixel-space CONFIG values (v1.3) ---------------------------------------
+   These are the fields whose units are world pixels. They are authored at
+   display.refTilePx (60) and re-derived by applyPixelScale() whenever the
+   resolved tile changes, so raising the tile from 60 to 90 scales reach, radii
+   and enemy speeds by exactly the same 1.5x the sprites grew — the game plays
+   identically in TILE terms on every grid.
+
+   Deliberately absent: feel.swipePx and feel.tapMaxPx (physical-finger dials,
+   not world geometry — see T8), everything measured in tiles/sec or seconds,
+   and all score values. Add a field here if — and only if — it is a distance
+   or a speed in world px. */
+const PIXEL_FIELDS = [
+  'player.recruitRadius',
+  'enemies.minSpawnDistFromLeader',
+  'enemies.bodyRadius',
+  'classes.sheriff.range',      'classes.sheriff.projSpeed',
+  'classes.deputy.range',       'classes.deputy.projSpeed',
+  'classes.sharpshooter.range', 'classes.sharpshooter.projSpeed',
+  'classes.blaster.range',      'classes.blaster.projSpeed', 'classes.blaster.bombRadius',
+  'enemies.types.bandit.speed',
+  'enemies.types.gunslinger.speed', 'enemies.types.gunslinger.prefRange', 'enemies.types.gunslinger.projSpeed',
+  'enemies.types.dynamiter.speed',  'enemies.types.dynamiter.prefRange',  'enemies.types.dynamiter.bombRadius',
+  'pickups.radius',
+];
+const getPath = (o, p) => p.split('.').reduce((a,k)=> a[k], o);
+const setPath = (o, p, v) => { const k = p.split('.'); const last = k.pop(); k.reduce((a,x)=>a[x], o)[last] = v; };
+
+// Captured once at load, before any grid is applied: the authored literals above
+// ARE the reference values, so CONFIG stays the single source of truth.
+const PX_REF = {};
+for (const p of PIXEL_FIELDS) PX_REF[p] = getPath(CONFIG, p);
+
+let pxScaleTile = CONFIG.display.refTilePx;   // the tile the live CONFIG is scaled to
+function applyPixelScale(tile){
+  if (tile === pxScaleTile) return false;     // unchanged ⇒ leave live console edits alone
+  const k = tile / CONFIG.display.refTilePx;
+  for (const p of PIXEL_FIELDS) setPath(CONFIG, p, Math.round(PX_REF[p] * k));
+  pxScaleTile = tile;
+  return true;
+}
+
+/* ---------------------------------------------------------------
+   2. UTIL / RNG
+   --------------------------------------------------------------- */
+const TAU = Math.PI * 2;
+const clamp = (v,a,b)=> v<a?a : v>b?b : v;
+const lerp  = (a,b,t)=> a+(b-a)*t;
+const dist2 = (x1,y1,x2,y2)=>{ const dx=x2-x1, dy=y2-y1; return dx*dx+dy*dy; };
+
+// mulberry32: tiny seeded PRNG. All gameplay randomness flows through rng()
+// so a fixed CONFIG.debug.seed gives a fully deterministic run (used by tests).
+function mulberry32(a){
+  return function(){
+    a|=0; a=a+0x6D2B79F5|0;
+    let t=Math.imul(a^a>>>15,1|a);
+    t=t+Math.imul(t^t>>>7,61|t)^t;
+    return ((t^t>>>14)>>>0)/4294967296;
+  };
+}
+let rng = mulberry32(1);        // reseeded per run in startRun()
+let runSeed = 1;
+
+/* ---------------------------------------------------------------
+   3. AUDIO — WebAudio synthesis only. Every call is try/caught so
+   audio can never crash gameplay (and headless tests disable it).
+   --------------------------------------------------------------- */
+let AC = null, masterGain = null;
+
+function audioInit(){
+  if (AC || !CONFIG.audio.enabled) return;
+  try {
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return;
+    AC = new Ctor();
+    masterGain = AC.createGain();
+    masterGain.gain.value = CONFIG.audio.master;
+    masterGain.connect(AC.destination);
+  } catch(e){ AC = null; }
+}
+function audioResume(){ try { if (AC && AC.state === 'suspended') AC.resume(); } catch(e){} }
+
+// One oscillator sweep: f0 -> f1 over dur seconds.
+function tone(f0, f1, dur, type, vol, when){
+  if (!AC || !CONFIG.audio.enabled) return;
+  try {
+    const t0 = AC.currentTime + (when||0);
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t0);
+    o.frequency.exponentialRampToValueAtTime(Math.max(1,f1), t0+dur);
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0+dur);
+    o.connect(g); g.connect(masterGain);
+    o.start(t0); o.stop(t0+dur+0.02);
+  } catch(e){}
+}
+// Filtered white-noise burst (gunshots, explosions).
+function noiseBurst(dur, vol, cutoff, when){
+  if (!AC || !CONFIG.audio.enabled) return;
+  try {
+    const t0 = AC.currentTime + (when||0);
+    const len = Math.max(1, Math.floor(AC.sampleRate * dur));
+    const buf = AC.createBuffer(1, len, AC.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i=0;i<len;i++) d[i] = (Math.random()*2-1) * (1 - i/len);
+    const src = AC.createBufferSource(); src.buffer = buf;
+    const f = AC.createBiquadFilter(); f.type='lowpass'; f.frequency.value=cutoff;
+    const g = AC.createGain();
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0+dur);
+    src.connect(f); f.connect(g); g.connect(masterGain);
+    src.start(t0);
+  } catch(e){}
+}
+const SFX = {
+  shot()      { noiseBurst(0.07, 0.20, 2600); tone(300,120,0.06,'square',0.08); },
+  slug()      { noiseBurst(0.12, 0.28, 1800); tone(220, 80,0.10,'square',0.10); },
+  boom()      { noiseBurst(0.35, 0.45,  700); tone(120, 40,0.30,'sine',0.20); },
+  hurt()      { tone(200, 80, 0.18,'sawtooth',0.22); },
+  daze()      { tone(700,180, 0.30,'triangle',0.16); },
+  recruit()   { tone(392,392,0.09,'square',0.12); tone(523,523,0.09,'square',0.12,0.09); tone(659,659,0.14,'square',0.12,0.18); },
+  pickup()    { tone(880,1320,0.12,'sine',0.16); },
+  bounty()    { tone(660,990,0.10,'triangle',0.14); },
+  waveClear() { tone(523,523,0.10,'square',0.12); tone(659,659,0.10,'square',0.12,0.10); tone(784,784,0.20,'square',0.12,0.20); },
+  gameOver()  { tone(330,110,0.6,'sawtooth',0.20); tone(220,55,0.8,'sawtooth',0.16,0.15); },
+  victory()   { [523,659,784,1047].forEach((f,i)=> tone(f,f,0.18,'square',0.14, i*0.14)); },
+  uiTap()     { tone(600,600,0.05,'square',0.08); },
+};
+
+/* ---------------------------------------------------------------
+   4. GLOBAL STATE
+   MODE is the top-level state machine: menu | playing | paused |
+   gameover | victory. S holds one run's mutable state and is
+   rebuilt by startRun().
+   --------------------------------------------------------------- */
+let MODE = 'menu';
+let modeT = 0;                 // seconds since last MODE change
+let sessionBest = 0;           // session-only high score (see docs for localStorage recipe)
+
+let S = null;                  // current run state (null before first run)
+
+function setMode(m){ MODE = m; modeT = 0; }
+
+/* ---------------------------------------------------------------
+   5. ARENA — grid helpers, obstacles, pre-rendered background
+   --------------------------------------------------------------- */
+const D = CONFIG.display;
+
+/* Sprite & hit-circle sizing. All in-world art and hitboxes were authored against
+   a 48px tile; ART scales them with the tile so sprites grow with the grid and the
+   collision circles keep tracking the drawn shapes. (Cosmetic radii stay out of
+   CONFIG per the re-skin recipe; they derive from CONFIG.display.tile instead.)
+   Every one of these is recomputed by applyArtScale() when the grid changes. */
+let ART = 1.875;                  // 1.875 at the shipped 90px tile (was 1.25 at 60px)
+let R_HIT = 26;                   // posse/enemy body hit radius (≈ enemies.bodyRadius)
+let R_PROJ = 8;                   // projectile collision fudge added to a body radius
+let R_BULLET = 6.6, R_SLUG = 9.4, R_ESHOT = 8.4;   // projectile draw radii
+/* World-geometry constants used by the sim. They live here rather than in CONFIG
+   for the same reason R_HIT does: their job is to keep the physics matching the
+   drawn art, not to be balanced independently (see tuning notes D4). Same 48px
+   authoring base as everything else. */
+let SEP_R = 52, SEP_PUSH = 56, ROCK_R = 56, ROCK_PUSH = 169, KNOCKBACK = 49, DUST_Y = 15;
+
+function applyArtScale(){
+  ART = D.tile / 48;
+  R_HIT    = Math.round(14 * ART);
+  R_PROJ   = Math.round(4  * ART);
+  R_BULLET = 3.5 * ART; R_SLUG = 5 * ART; R_ESHOT = 4.5 * ART;
+  SEP_R     = 28 * ART;   // enemies start pushing apart inside this gap
+  SEP_PUSH  = 30 * ART;   // ...at this px/s
+  ROCK_R    = 30 * ART;   // enemies skirt rocks from this far out
+  ROCK_PUSH = 90 * ART;   // ...at this px/s
+  KNOCKBACK = 26 * ART;   // contact-hit shove, px
+  DUST_Y    =  8 * ART;   // hoof-dust offset below the leader
+}
+
+/* --- Responsive grid (v1.3) -------------------------------------------------
+   resolveGrid() is the whole responsive model, and it is deliberately pure: give
+   it a device viewport, get back a grid. tilesShort spans the SHORT edge; the
+   long edge then takes as many whole tiles as the aspect allows, and the internal
+   resolution follows from the grid (width = cols*tile, height = hudH + rows*tile)
+   so the letterbox is never more than one tile of waste on either axis.
+
+     portrait : cols = tilesShort;  rows = round((width/aspect - hudH)/tile)
+     landscape: rows = round((tilesShort*tile - hudH)/tile);  cols = round(height*aspect/tile)
+     hudH     = round(hudTiles{Portrait|Landscape} * tile)
+
+   Measured waste with tilesShort 8: 0.9% on a 1080x2408 phone (8x16, internal
+   720x1620) and 2.9% on a 1440x900 laptop (14x7, internal 1260x765). */
+function resolveGrid(devW, devH){
+  const d = CONFIG.display;
+  const landscape = devW > devH;
+  const tile = Math.max(1, Math.round(d.refShortPx / d.tilesShort));
+  const hudH = Math.round((landscape ? d.hudTilesLandscape : d.hudTilesPortrait) * tile);
+  const aspect = (devW > 0 && devH > 0) ? (devW / devH) : 0.4444;
+  let cols, rows;
+  if (!landscape){
+    cols = clamp(d.tilesShort, d.minCols, d.maxCols);
+    rows = clamp(Math.round((cols * tile / aspect - hudH) / tile), d.minRows, d.maxRows);
+  } else {
+    rows = clamp(Math.round((d.tilesShort * tile - hudH) / tile), d.minRows, d.maxRows);
+    cols = clamp(Math.round((hudH + rows * tile) * aspect / tile), d.minCols, d.maxCols);
+  }
+  return { tile, hudH, cols, rows, landscape, width: cols*tile, height: hudH + rows*tile };
+}
+
+// The grid D currently describes — used when autoGrid is off (tests pin a grid).
+function gridFromConfig(){
+  return { tile:D.tile, hudH:D.hudH, cols:D.cols, rows:D.rows, landscape:!!D.landscape,
+           width: D.cols*D.tile, height: D.hudH + D.rows*D.tile };
+}
+
+// Commit a grid: internal resolution, art/hit scales, pixel-space CONFIG, HUD rects.
+// Everything downstream reads D, so this is the only place a re-shape happens.
+function applyGrid(g){
+  D.tile = g.tile; D.hudH = g.hudH; D.cols = g.cols; D.rows = g.rows;
+  D.width = g.width; D.height = g.height; D.landscape = g.landscape;
+  applyArtScale();
+  applyPixelScale(D.tile);
+  layoutHUD();
+}
+
+// Re-shape to the current viewport. Returns true if the grid actually changed.
+// Callers gate this on MODE: menu and startRun() only, never mid-run.
+function reshapeToWindow(force){
+  const auto = D.autoGrid && typeof window !== 'undefined' && window.innerWidth;
+  const g = auto ? resolveGrid(window.innerWidth, window.innerHeight) : gridFromConfig();
+  const same = g.cols === D.cols && g.rows === D.rows && g.tile === D.tile &&
+               g.hudH === D.hudH && g.width === D.width && g.height === D.height;
+  if (same && !force) return false;
+  applyGrid(g);
+  return !same;
+}
+
+// Arena size relative to the tuned reference, for spawn-density normalisation.
+function arenaTiles(){ return D.cols * D.rows; }
+function densityScale(exp){
+  return Math.pow(arenaTiles() / CONFIG.waves.refAreaTiles, exp);
+}
+
+// View transform: maps the internal D.width x D.height space onto the device-pixel
+// backing store. Set by fitCanvas(); read by render() and drawBgLayer().
+let view = { sx: 1, sy: 1, cssW: D.width, cssH: D.height, dpr: 1 };
+
+function tileCX(c){ return c*D.tile + D.tile/2; }                 // tile -> pixel center x
+function tileCY(r){ return D.hudH + r*D.tile + D.tile/2; }        // tile -> pixel center y (play area starts under HUD)
+function inGrid(c,r){ return c>=0 && c<D.cols && r>=0 && r<D.rows; }
+function blocked(c,r){ return !inGrid(c,r) || (S && S.obstacleSet.has(c+','+r)); }
+
+// Regenerate obstacle rocks for a wave. Never places a rock within
+// obstacles.minDistFromPosse tiles of any current posse member (so a rock
+// can never appear on top of the line, and the emergency-reverse tile stays clear).
+function genObstacles(waveN){
+  const O = CONFIG.obstacles;
+  const n = Math.min(O.max, O.base + Math.floor((waveN-1)/3) * O.perThreeWaves);
+  S.obstacles = []; S.obstacleSet = new Set();
+  /* Also keep the road directly ahead of the leader clear. The "2 tiles from any
+     posse member" rule alone can still drop a rock three tiles in front of a
+     moving line — a cheap shot at any wave, and at run start it costs HP before
+     the steering hint has even been read. Small arenas make it likely rather
+     than rare, which is how v1.3 surfaced it. */
+  const corridor = new Set();
+  if (S.path && S.path.length && S.dir){
+    for (let k=1; k<=CONFIG.player.startClearTiles; k++){
+      corridor.add((S.path[0].c + S.dir.x*k) + ',' + (S.path[0].r + S.dir.y*k));
+    }
+  }
+  let guard = 0;
+  while (S.obstacles.length < n && guard++ < 400){
+    const c = 1 + Math.floor(rng()*(D.cols-2));
+    const r = 1 + Math.floor(rng()*(D.rows-2));
+    if (S.obstacleSet.has(c+','+r) || corridor.has(c+','+r)) continue;
+    let ok = true;
+    for (const p of S.path){
+      if (Math.abs(p.c-c) <= O.minDistFromPosse && Math.abs(p.r-r) <= O.minDistFromPosse){ ok=false; break; }
+    }
+    if (!ok) continue;
+    S.obstacles.push({c, r, seed: Math.floor(rng()*1e6)});
+    S.obstacleSet.add(c+','+r);
+  }
+}
+
+// Background is drawn once per wave into an offscreen layer (cheap per-frame blit).
+// Decor uses its own RNG stream so it never perturbs gameplay determinism.
+let bgLayer = null, bgCtx = null, bgWaveN = 0, bgObstacles = [], bgKey = null;
+function drawBgLayer(waveN, obstacles, key){
+  // Obstacles come from the live run, or the retained set for menu/resize re-renders.
+  obstacles = obstacles || (S ? S.obstacles : bgObstacles);
+  bgWaveN = waveN; bgObstacles = obstacles;
+  bgKey = (key !== undefined) ? key : bgKey;
+  if (!bgLayer){
+    bgLayer = document.createElement('canvas');
+    bgCtx = bgLayer.getContext('2d');
+  }
+  // Size the pre-rendered arena to the device-pixel backing store so it stays crisp too.
+  const bw = Math.max(1, Math.round(D.width  * view.sx));
+  const bh = Math.max(1, Math.round(D.height * view.sy));
+  if (bgLayer.width !== bw || bgLayer.height !== bh){ bgLayer.width = bw; bgLayer.height = bh; }
+  const g = bgCtx;
+  g.setTransform(view.sx, 0, 0, view.sy, 0, 0);   // paint in internal coords, land on device px
+  const dr = mulberry32((runSeed ^ (waveN*7919)) >>> 0);
+  // Decor scales with the tile (same 48px authoring base as the sprites) and its
+  // count with the arena's area, so a 14x7 laptop isn't sparser than an 8x16 phone.
+  const dec = ART / 1.25;
+  const area = (D.width * D.height) / (720 * 1620);
+  // sand base with a faint vertical tint shift
+  g.fillStyle = '#c9a15f'; g.fillRect(0,0,D.width,D.height);
+  g.fillStyle = 'rgba(120,80,40,0.08)'; g.fillRect(0, D.height*0.55, D.width, D.height*0.45);
+  // sand blotches
+  const blotches = Math.max(8, Math.round(26 * area));
+  for (let i=0;i<blotches;i++){
+    const x = dr()*D.width, y = D.hudH + dr()*(D.height-D.hudH);
+    const rw = (20+dr()*60)*dec, rh = rw*(0.3+dr()*0.3);
+    g.fillStyle = dr()<0.5 ? 'rgba(110,75,40,0.10)' : 'rgba(255,235,190,0.10)';
+    g.beginPath(); g.ellipse(x,y,rw,rh,0,0,TAU); g.fill();
+  }
+  // cacti
+  const cacti = Math.max(2, Math.round(5 * area));
+  for (let i=0;i<cacti;i++){
+    const x = 20+dr()*(D.width-40), y = D.hudH+40+dr()*(D.height-D.hudH-80);
+    g.save(); g.translate(x, y); g.scale(dec, dec);
+    g.fillStyle = 'rgba(70,110,60,0.55)';
+    g.fillRect(-4, -18, 8, 26);
+    g.fillRect(-14, -10, 8, 5); g.fillRect(-14, -14, 5, 9);
+    g.fillRect(6,  -6,  8, 5); g.fillRect(9,  -10, 5, 9);
+    g.restore();
+  }
+  // occasional cow skull
+  if (dr() < 0.7){
+    const x = 30+dr()*(D.width-60), y = D.hudH+40+dr()*(D.height-D.hudH-80);
+    g.save(); g.translate(x, y); g.scale(dec, dec);
+    g.fillStyle = 'rgba(240,235,220,0.7)';
+    g.beginPath(); g.ellipse(0,0,9,11,0,0,TAU); g.fill();
+    g.strokeStyle = 'rgba(240,235,220,0.7)'; g.lineWidth = 3;
+    g.beginPath(); g.arc(-10,-4,7,Math.PI*0.9,Math.PI*1.7); g.stroke();
+    g.beginPath(); g.arc(10,-4,7,Math.PI*1.3,Math.PI*2.1); g.stroke();
+    g.restore();
+  }
+  // grid whisper (helps players read the lattice without shouting)
+  g.strokeStyle = 'rgba(90,60,30,0.06)'; g.lineWidth = 1;
+  g.beginPath();
+  for (let c=1;c<D.cols;c++){ g.moveTo(c*D.tile, D.hudH); g.lineTo(c*D.tile, D.height); }
+  for (let r=1;r<D.rows;r++){ g.moveTo(0, D.hudH+r*D.tile); g.lineTo(D.width, D.hudH+r*D.tile); }
+  g.stroke();
+  // obstacles (static per wave, so they live on the bg layer)
+  for (const ob of obstacles){
+    const or_ = mulberry32(ob.seed);
+    g.save(); g.translate(tileCX(ob.c), tileCY(ob.r)); g.scale(dec, dec);
+    g.fillStyle = 'rgba(60,40,25,0.25)';
+    g.beginPath(); g.ellipse(0, 10, 20, 8, 0, 0, TAU); g.fill();
+    for (let k=0;k<3;k++){
+      const ox = (or_()-0.5)*18, oy = (or_()-0.5)*14 - k*3, rr = 9+or_()*7;
+      g.fillStyle = k===2 ? '#9a8f80' : '#7f7466';
+      g.beginPath(); g.arc(ox, oy, rr, 0, TAU); g.fill();
+      g.strokeStyle = '#55493c'; g.lineWidth = 2; g.stroke();
+    }
+    g.restore();
+  }
+}
+
+/* ---------------------------------------------------------------
+   6. RUN / WAVES
+   --------------------------------------------------------------- */
+function mkMember(cls){
+  const c = CONFIG.classes[cls];
+  return { cls, hp: c.hp, maxHp: c.hp, cd: rng()*c.fireInterval, iv: 0,
+           px: 0, py: 0, aim: -Math.PI/2, flash: 0 };
+}
+
+/* Opening position + heading. Centred, riding CONFIG.player.startDir if there is
+   road ahead — but a landscape grid can be only 7 rows deep, where "up" from the
+   middle would bump the wall in the first second, so a short arena falls back to
+   whichever axis has the most clearance. (v1.3; the fixed rows/2-2 start assumed
+   a 25-row column.) */
+function startPose(){
+  const c = Math.floor(D.cols/2), r = Math.floor(D.rows/2);
+  const room = d => d.x ? (d.x > 0 ? D.cols-1-c : c) : (d.y > 0 ? D.rows-1-r : r);
+  let dir = CONFIG.player.startDir;
+  if (room(dir) < CONFIG.player.startClearTiles){
+    for (const d of [{x:0,y:-1},{x:0,y:1},{x:-1,y:0},{x:1,y:0}]) if (room(d) > room(dir)) dir = d;
+  }
+  return { c, r, dir };
+}
+
+function newRun(){
+  const pose = startPose();
+  const startC = pose.c, startR = pose.r;
+  const sd = pose.dir;
+  const run = {
+    score: 0, elapsed: 0,
+    posse: [ mkMember('sheriff') ],
+    // path[0] = tile the leader is currently gliding INTO. Member i renders
+    // lerp(path[i+1] -> path[i], moveT). Invariant: path.length == posse.length + 2.
+    path: [ {c:startC, r:startR}, {c:startC - sd.x, r:startR - sd.y}, {c:startC - sd.x*2, r:startR - sd.y*2} ],
+    dir: {x: sd.x, y: sd.y},
+    dirQueue: [],
+    moveT: 0,
+    leaderInvuln: 0,
+    buffFire: 0,               // horseshoe timer
+    hurtFx: 0,                 // red vignette timer
+    enemies: [], spawnMarks: [],
+    shots: [], eshots: [], bombs: [], booms: [],
+    pickups: [], floats: [],
+    obstacles: [], obstacleSet: new Set(),
+    wave: null, interWave: 0,
+    banner: null,              // {text, sub, t}
+    hint: null,                // {text, t}
+    flags: { dazeHintShown: false },
+    shakeT: 0, shakeMag: 0,
+    stats: { recruits: 0, dazes: 0 },
+  };
+  return run;
+}
+
+function startRun(){
+  // THE grid lock (v1.3): the arena re-shapes here and nowhere else during play,
+  // so a run always finishes on the grid it started on. A window resize mid-run
+  // only re-letterboxes (see onResize); the new shape lands on the next run.
+  if (reshapeToWindow()) fitCanvas();
+  runSeed = (CONFIG.debug.seed != null) ? (CONFIG.debug.seed>>>0) : (Date.now()>>>0);
+  rng = mulberry32(runSeed);
+  S = newRun();
+  setMode('playing');
+  initWave(1);
+  updatePosseXY();      // valid px/py from frame zero
+  S.hint = { text: 'SWIPE (or ARROW KEYS) to steer', t: 4.5 };
+}
+
+// Per-wave derived numbers — all continuous ramps off CONFIG.waves / enemies.ramp.
+function waveQuota(w){ return CONFIG.waves.baseQuota + CONFIG.waves.quotaPerWave*(w-1); }
+// Spawn cadence and concurrency are normalised by arena area (v1.3) so that a
+// grid other than the tuned reference keeps the same felt density: a smaller
+// arena drips slower and holds fewer outlaws, a bigger one the reverse.
+function waveSpawnInterval(w){
+  const base = Math.max(CONFIG.waves.minSpawnInterval,
+                        CONFIG.waves.baseSpawnInterval - CONFIG.waves.spawnIntervalDecay*(w-1));
+  return base / densityScale(CONFIG.waves.intervalAreaExp);
+}
+function waveMaxActive(w){
+  const base = Math.min(CONFIG.waves.maxActiveCap,
+                        CONFIG.waves.baseMaxActive + Math.floor((w-1)/2)*CONFIG.waves.activePerTwoWaves);
+  return Math.max(CONFIG.waves.minMaxActive,
+                  Math.round(base * densityScale(CONFIG.waves.activeAreaExp)));
+}
+function enemyHpFor(type, w){
+  return Math.ceil(CONFIG.enemies.types[type].hp * (1 + CONFIG.enemies.ramp.hpPerWave*(w-1)));
+}
+function enemySpeedFor(type, w){
+  const m = Math.min(CONFIG.enemies.ramp.speedCap, 1 + CONFIG.enemies.ramp.speedPerWave*(w-1));
+  return CONFIG.enemies.types[type].speed * m;
+}
+
+function initWave(n){
+  S.wave = { n, toSpawn: waveQuota(n), spawnT: 0.6, cleared: false, introDone: false };
+  // If a type debuts this wave, guarantee it's the first spawn and announce it.
+  S.wave.introType = null;
+  for (const [k,t] of Object.entries(CONFIG.enemies.types)){
+    if (t.firstWave === n){ S.wave.introType = k; break; }
+  }
+  genObstacles(n);
+  // The arena repaint is a RENDER job, not a sim job: initWave only stamps what
+  // the background should be showing, and drawWorld() repaints when the stamp
+  // moves on. That keeps simulate() free of DOM calls (createElement) so the
+  // headless harness drives pure logic — see technical spec §1.
+  S.bgKey = runSeed + ':' + n;
+  const sub = S.wave.introType ? ('New outlaw: ' + S.wave.introType.toUpperCase() + '!') : null;
+  S.banner = { text: 'WAVE ' + n, sub, t: 2.0 };
+}
+
+function pickEnemyType(w){
+  const pool = [];
+  for (const [k,t] of Object.entries(CONFIG.enemies.types)){
+    if (t.firstWave <= w) pool.push([k, t.weight]);
+  }
+  let total = 0; for (const p of pool) total += p[1];
+  let roll = rng()*total;
+  for (const p of pool){ roll -= p[1]; if (roll <= 0) return p[0]; }
+  return pool[pool.length-1][0];
+}
+
+// Spawn director: telegraphed perimeter spawns, capped concurrency, min distance from leader.
+function spawnDirector(dt){
+  const w = S.wave;
+  if (!w || w.toSpawn <= 0) return;
+  w.spawnT -= dt;
+  const activeCount = S.enemies.length + S.spawnMarks.length;
+  if (w.spawnT > 0 || activeCount >= waveMaxActive(w.n)) return;
+  /* Find a perimeter tile far enough from the leader. A short arena (a 14x7
+     laptop grid is only 7 tiles deep) may have NO perimeter tile the full
+     minSpawnDistFromLeader away, so instead of retrying until the wave stalls we
+     remember the farthest legal candidate and use that — the fairest tile the
+     arena can offer. On a roomy grid the first loop almost always exits early
+     and this fallback never fires. (v1.3; v1.2 retried every 0.3s and could
+     starve a wave on a small grid.) */
+  const L = S.posse[0];
+  const minD2 = CONFIG.enemies.minSpawnDistFromLeader ** 2;
+  let bestC = -1, bestR = -1, bestD2 = -1;
+  for (let tries=0; tries<10; tries++){
+    let c, r;
+    const side = Math.floor(rng()*4);
+    if (side === 0){ c = Math.floor(rng()*D.cols); r = 0; }
+    else if (side === 1){ c = Math.floor(rng()*D.cols); r = D.rows-1; }
+    else if (side === 2){ c = 0; r = Math.floor(rng()*D.rows); }
+    else { c = D.cols-1; r = Math.floor(rng()*D.rows); }
+    if (S.obstacleSet.has(c+','+r)) continue;
+    const x = tileCX(c), y = tileCY(r);
+    const d2 = dist2(x,y,L.px,L.py);
+    if (d2 > bestD2){ bestD2 = d2; bestC = c; bestR = r; }
+    if (d2 < minD2) continue;
+    break;
+  }
+  if (bestC < 0){ w.spawnT = 0.3; return; }   // every try hit a rock; look again shortly
+  const type = (w.introType && !w.introDone) ? w.introType : pickEnemyType(w.n);
+  w.introDone = true;
+  S.spawnMarks.push({ x: tileCX(bestC), y: tileCY(bestR), type, t: CONFIG.enemies.spawnTelegraph });
+  w.toSpawn--;
+  w.spawnT = waveSpawnInterval(w.n) * (0.75 + rng()*0.5);
+}
+
+function remainingInWave(){
+  return S.wave ? (S.wave.toSpawn + S.spawnMarks.length + S.enemies.length) : 0;
+}
+
+function checkWaveClear(){
+  const w = S.wave;
+  if (!w || w.cleared) return;
+  if (w.toSpawn === 0 && S.spawnMarks.length === 0 && S.enemies.length === 0){
+    w.cleared = true;
+    const bonus = CONFIG.score.waveClearBase * w.n;
+    S.score += bonus;
+    SFX.waveClear();
+    if (w.n >= CONFIG.waves.total){
+      sessionBest = Math.max(sessionBest, S.score);
+      SFX.victory();
+      setMode('victory');
+    } else {
+      S.banner = { text: 'WAVE ' + w.n + ' CLEARED', sub: '+' + bonus + ' BONUS', t: 2.0 };
+      S.interWave = CONFIG.waves.interWaveDelay;
+    }
+  }
+}
+
+/* ---------------------------------------------------------------
+   7. POSSE — snake-style stepping + follower chain + damage
+   --------------------------------------------------------------- */
+function isReverse(a,b){ return a.x === -b.x && a.y === -b.y; }
+function sameDir(a,b){ return a.x === b.x && a.y === b.y; }
+
+// Buffer a steering input (from swipe or key). Rejects 180° reversals and duplicates.
+function queueDir(d){
+  if (MODE !== 'playing' || !S) return;
+  const ref = S.dirQueue.length ? S.dirQueue[S.dirQueue.length-1] : S.dir;
+  if (sameDir(d, ref) || isReverse(d, ref)) return;
+  if (S.dirQueue.length < CONFIG.player.queueMax) S.dirQueue.push(d);
+}
+
+// On a blocked step: damage the leader (i-frames permitting) and auto-turn along
+// the wall instead of instantly ending the run — kinder on touch, still costly.
+function chooseAltDir(head){
+  const d = S.dir;
+  const cands = [ {x:-d.y, y:d.x}, {x:d.y, y:-d.x} ];  // the two perpendiculars
+  const valid = cands.filter(c => !blocked(head.c + c.x, head.r + c.y));
+  if (valid.length === 2){
+    // prefer the turn that heads toward the arena center
+    const cx = (D.cols-1)/2, cy = (D.rows-1)/2;
+    valid.sort((a,b)=>{
+      const da = dist2(head.c+a.x, head.r+a.y, cx, cy);
+      const db = dist2(head.c+b.x, head.r+b.y, cx, cy);
+      return da - db;
+    });
+  }
+  if (valid.length) return valid[0];
+  return {x:-d.x, y:-d.y};   // emergency reverse (always open: we just came from there)
+}
+
+function leaderStep(){
+  // consume one buffered turn, if legal
+  if (S.dirQueue.length){
+    const d = S.dirQueue.shift();
+    if (!sameDir(d, S.dir) && !isReverse(d, S.dir)) S.dir = d;
+  }
+  const head = S.path[0];
+  let nc = head.c + S.dir.x, nr = head.r + S.dir.y;
+  if (blocked(nc, nr)){
+    hurtLeaderOnWall();
+    if (MODE !== 'playing') return;      // wall bump was fatal
+    S.dir = chooseAltDir(head);
+    nc = head.c + S.dir.x; nr = head.r + S.dir.y;
+    if (blocked(nc, nr)){ nc = head.c; nr = head.r; }   // fully boxed (shouldn't happen); stall a step
+  }
+  S.path.unshift({c:nc, r:nr});
+  while (S.path.length > S.posse.length + 2) S.path.pop();
+  addParts(tileCX(head.c), tileCY(head.r)+DUST_Y, 2, '#b08d55', 30, 0.4);  // dust
+}
+
+function hurtLeaderOnWall(){
+  shake(CONFIG.feel.shakeHurt*0.7, CONFIG.feel.shakeHurtDur);
+  if (S.leaderInvuln > 0) return;
+  damageMember(0, CONFIG.player.wallDamage, 'wall');
+}
+
+// Recompute every member's pixel position from the path + glide fraction.
+function updatePosseXY(){
+  for (let i=0;i<S.posse.length;i++){
+    const cur = S.path[i], prev = S.path[i+1];
+    const m = S.posse[i];
+    m.px = lerp(tileCX(prev.c), tileCX(cur.c), S.moveT);
+    m.py = lerp(tileCY(prev.r), tileCY(cur.r), S.moveT);
+  }
+}
+
+// All damage to posse members funnels through here.
+function damageMember(i, dmg, src){
+  const m = S.posse[i];
+  if (!m) return;
+  if (m.iv > 0) return;
+  if (i === 0){
+    if (S.leaderInvuln > 0 && src !== 'wall') return;
+    if (CONFIG.debug.godMode) return;
+  }
+  m.hp -= dmg;
+  m.flash = CONFIG.feel.hitFlash;
+  m.iv = CONFIG.player.memberIframe;
+  addParts(m.px, m.py, 8, '#ff5a4a', 90, 0.45);
+  if (i === 0){
+    S.leaderInvuln = CONFIG.player.invulnSec;
+    S.hurtFx = 0.45;
+    shake(CONFIG.feel.shakeHurt, CONFIG.feel.shakeHurtDur);
+  }
+  SFX.hurt();
+  if (m.hp <= 0){
+    if (i === 0) gameOver();
+    else removeFollower(i);
+  }
+}
+
+// Follower down: splice member AND its path slot so the chain closes up.
+function removeFollower(i){
+  const m = S.posse[i];
+  addParts(m.px, m.py, 16, '#e8d8b8', 130, 0.6);
+  addFloat(m.px, m.py, CONFIG.classes[m.cls].name + ' down!', '#ffb0a0');
+  S.posse.splice(i,1);
+  S.path.splice(i,1);
+}
+
+function gameOver(){
+  sessionBest = Math.max(sessionBest, S.score);
+  SFX.gameOver();
+  shake(10, 0.5);
+  setMode('gameover');
+}
+
+// Posse auto-combat: each member independently fires at the nearest active enemy in range.
+function posseCombat(dt){
+  const rateMult = S.buffFire > 0 ? CONFIG.pickups.horseshoeRateMult : 1;
+  for (const m of S.posse){
+    if (m.iv > 0) m.iv -= dt;
+    if (m.flash > 0) m.flash -= dt;
+    m.cd -= dt * rateMult;
+    // nearest active enemy in range
+    const cls = CONFIG.classes[m.cls];
+    let best = null, bestD = cls.range*cls.range;
+    for (const e of S.enemies){
+      if (e.state !== 'active') continue;
+      const d = dist2(m.px, m.py, e.x, e.y);
+      if (d < bestD){ bestD = d; best = e; }
+    }
+    if (best) m.aim = Math.atan2(best.y - m.py, best.x - m.px);
+    if (m.cd <= 0 && best){
+      m.cd = cls.fireInterval;
+      if (cls.projKind === 'bomb'){
+        S.bombs.push({ team:'p', sx:m.px, sy:m.py, tx:best.x, ty:best.y,
+                       x:m.px, y:m.py, t:0, T:cls.bombFlight,
+                       radius:cls.bombRadius, damage:cls.damage });
+        SFX.slug();
+      } else {
+        const sp = cls.projSpeed;
+        S.shots.push({ x:m.px, y:m.py, vx:Math.cos(m.aim)*sp, vy:Math.sin(m.aim)*sp,
+                       dmg:cls.damage, kind:cls.projKind });
+        if (cls.projKind === 'slug') SFX.slug(); else SFX.shot();
+        addParts(m.px + Math.cos(m.aim)*11*ART, m.py + Math.sin(m.aim)*11*ART, 2, '#ffe08a', 60, 0.15);
+      }
+    }
+  }
+}
+
+/* ---------------------------------------------------------------
+   8. ENEMIES — AI, daze, recruit
+   --------------------------------------------------------------- */
+function makeEnemy(type, x, y){
+  const t = CONFIG.enemies.types[type];
+  return { type, x, y, hp: enemyHpFor(type, S.wave.n), state: 'active',
+           dazeT: 0, contactCd: 0, fireCd: (t.fireInterval||2) * (0.5 + rng()*0.7),
+           phase: rng()*TAU, flash: 0, patience: 0 };
+}
+
+function nearestMember(x, y){
+  let best = null, bestD = Infinity;
+  for (const m of S.posse){
+    const d = dist2(x, y, m.px, m.py);
+    if (d < bestD){ bestD = d; best = m; }
+  }
+  return { m: best, d: Math.sqrt(bestD) };
+}
+
+function updateEnemies(dt){
+  // telegraphed spawns hatch
+  for (let i=S.spawnMarks.length-1; i>=0; i--){
+    const s = S.spawnMarks[i];
+    s.t -= dt;
+    if (s.t <= 0){
+      S.enemies.push(makeEnemy(s.type, s.x, s.y));
+      addParts(s.x, s.y, 10, '#b08d55', 80, 0.4);
+      S.spawnMarks.splice(i,1);
+    }
+  }
+  const E = CONFIG.enemies;
+  for (let i=S.enemies.length-1; i>=0; i--){
+    const e = S.enemies[i];
+    if (e.flash > 0) e.flash -= dt;
+
+    if (e.state === 'dazed'){
+      e.dazeT -= dt;
+      // leader rides over a dazed outlaw -> deputize (or claim a bounty if full)
+      const L = S.posse[0];
+      if (dist2(L.px, L.py, e.x, e.y) < CONFIG.player.recruitRadius**2){
+        recruitEnemy(e);
+        S.enemies.splice(i,1);
+        continue;
+      }
+      if (e.dazeT <= 0){        // slipped away
+        S.score += CONFIG.score.escape;
+        addFloat(e.x, e.y, 'escaped', '#d8c8a8');
+        addParts(e.x, e.y, 8, '#b08d55', 70, 0.4);
+        S.enemies.splice(i,1);
+      }
+      continue;
+    }
+
+    // --- active AI ---
+    const t = E.types[e.type];
+    const sp = enemySpeedFor(e.type, S.wave.n);
+    const near = nearestMember(e.x, e.y);
+    const dx = near.m.px - e.x, dy = near.m.py - e.y;
+    const dd = Math.max(1, near.d);
+    let mvx = 0, mvy = 0;
+    e.patience += dt;
+    if (t.prefRange){
+      // Ranged types hold a preferred distance and strafe — but the longer they go
+      // unhurt, the closer they are willing to come (see enemies.patience).
+      const P = CONFIG.enemies.patience;
+      const bold = clamp((e.patience - P.graceSec) / P.closeSec, 0, 1);
+      const pref = t.prefRange * lerp(1, P.closeTo, bold);
+      const err = dd - pref;
+      const radial = clamp(err/50, -1, 1);
+      mvx = (dx/dd)*radial*sp; mvy = (dy/dd)*radial*sp;
+      const st = Math.sin(S.elapsed*1.3 + e.phase) * sp * 0.5;
+      mvx += (-dy/dd)*st; mvy += (dx/dd)*st;
+    } else {
+      mvx = (dx/dd)*sp; mvy = (dy/dd)*sp;   // bandits just charge
+    }
+    e.x += mvx*dt; e.y += mvy*dt;
+
+    // gentle separation from other active enemies (radii track the sprite size)
+    for (const o of S.enemies){
+      if (o === e || o.state !== 'active') continue;
+      const d2 = dist2(e.x,e.y,o.x,o.y);
+      if (d2 > 1 && d2 < SEP_R*SEP_R){
+        const d = Math.sqrt(d2);
+        e.x += (e.x-o.x)/d * SEP_PUSH*dt; e.y += (e.y-o.y)/d * SEP_PUSH*dt;
+      }
+    }
+    // push out of rocks (rocks are posse hazards; enemies skirt them)
+    for (const ob of S.obstacles){
+      const ox = tileCX(ob.c), oy = tileCY(ob.r);
+      const d2 = dist2(e.x,e.y,ox,oy);
+      if (d2 > 1 && d2 < ROCK_R*ROCK_R){
+        const d = Math.sqrt(d2);
+        e.x += (e.x-ox)/d * ROCK_PUSH*dt; e.y += (e.y-oy)/d * ROCK_PUSH*dt;
+      }
+    }
+    // stay in the arena
+    e.x = clamp(e.x, R_HIT, D.width-R_HIT);
+    e.y = clamp(e.y, D.hudH+R_HIT, D.height-R_HIT);
+
+    // contact damage
+    e.contactCd -= dt;
+    if (e.contactCd <= 0){
+      for (let mi=0; mi<S.posse.length; mi++){
+        const m = S.posse[mi];
+        if (dist2(e.x,e.y,m.px,m.py) < (E.bodyRadius+R_HIT)**2){
+          damageMember(mi, t.contactDamage, 'contact');
+          e.contactCd = E.contactCooldown;
+          // knock the attacker back a touch
+          const kd = Math.max(1, Math.sqrt(dist2(e.x,e.y,m.px,m.py)));
+          e.x += (e.x-m.px)/kd * KNOCKBACK; e.y += (e.y-m.py)/kd * KNOCKBACK;
+          break;
+        }
+      }
+      if (MODE !== 'playing') return;   // contact may have ended the run
+    }
+
+    // ranged attacks
+    if (t.fireInterval){
+      e.fireCd -= dt;
+      if (e.fireCd <= 0 && dd < (t.prefRange||200) * 1.6){   // gate off the AUTHORED range: closing in never widens the firing window
+        e.fireCd = t.fireInterval * (0.85 + rng()*0.3);
+        if (e.type === 'dynamiter'){
+          const L = S.posse[0];
+          S.bombs.push({ team:'e', sx:e.x, sy:e.y, tx:L.px, ty:L.py,
+                         x:e.x, y:e.y, t:0, T:t.bombFlight,
+                         radius:t.bombRadius, damage:t.bombDamage });
+          SFX.slug();
+        } else {
+          const a = Math.atan2(dy,dx) + (rng()-0.5)*2*t.aimJitter;
+          S.eshots.push({ x:e.x, y:e.y, vx:Math.cos(a)*t.projSpeed, vy:Math.sin(a)*t.projSpeed,
+                          dmg:t.projDamage });
+          SFX.shot();
+        }
+      }
+    }
+  }
+}
+
+// HP reached zero: the outlaw is dazed, not dead — chase them down to deputize!
+function dazeEnemy(e){
+  if (e.state !== 'active') return;
+  e.state = 'dazed';
+  e.dazeT = CONFIG.enemies.dazeDuration;
+  const sc = CONFIG.enemies.types[e.type].score;
+  S.score += sc;
+  S.stats.dazes++;
+  addFloat(e.x, e.y - 14*ART, '+' + sc, '#ffe08a');
+  addParts(e.x, e.y, 10, '#ffe08a', 100, 0.5);
+  SFX.daze();
+  if (!S.flags.dazeHintShown){
+    S.flags.dazeHintShown = true;
+    S.hint = { text: 'Ride over dazed outlaws to deputize them!', t: 6 };
+  }
+  // pickup drop roll (independent chances, capped field count)
+  if (S.pickups.length < CONFIG.pickups.maxOnField){
+    const dc = CONFIG.pickups.dropChances;
+    const anyHurt = S.posse.some(m => m.hp < m.maxHp);
+    const roll = rng();
+    if (anyHurt && roll < dc.tonic) spawnPickup('tonic', e.x, e.y);
+    else if (roll < dc.tonic + dc.horseshoe) spawnPickup('horseshoe', e.x, e.y);
+    else if (roll < dc.tonic + dc.horseshoe + dc.nugget) spawnPickup('nugget', e.x, e.y);
+  }
+}
+
+function recruitEnemy(e){
+  const cls = CONFIG.enemies.types[e.type].recruitAs;
+  if (S.posse.length < CONFIG.player.maxPosse){
+    S.posse.push(mkMember(cls));
+    while (S.path.length < S.posse.length + 2){
+      const last = S.path[S.path.length-1];
+      S.path.push({c:last.c, r:last.r});
+    }
+    S.score += CONFIG.score.recruitBonus;
+    S.stats.recruits++;
+    addFloat(e.x, e.y - 14*ART, CONFIG.classes[cls].name + ' joins!', '#a8ffb0');
+    addParts(e.x, e.y, 14, '#a8ffb0', 110, 0.55);
+    SFX.recruit();
+  } else {
+    S.score += CONFIG.score.overflowBounty;
+    addFloat(e.x, e.y - 14*ART, '+' + CONFIG.score.overflowBounty + ' BOUNTY', '#ffe08a');
+    addParts(e.x, e.y, 10, '#ffe08a', 90, 0.45);
+    SFX.bounty();
+  }
+}
+
+/* ---------------------------------------------------------------
+   9. PROJECTILES — bullets, lobbed bombs, explosions
+   --------------------------------------------------------------- */
+function updateProjectiles(dt){
+  const R = CONFIG.enemies.bodyRadius;
+  // friendly bullets vs active enemies
+  for (let i=S.shots.length-1; i>=0; i--){
+    const p = S.shots[i];
+    p.x += p.vx*dt; p.y += p.vy*dt;
+    if (p.x < -20 || p.x > D.width+20 || p.y < D.hudH-20 || p.y > D.height+20){ S.shots.splice(i,1); continue; }
+    for (const e of S.enemies){
+      if (e.state !== 'active') continue;
+      if (dist2(p.x,p.y,e.x,e.y) < (R+R_PROJ)**2){
+        e.hp -= p.dmg; e.flash = CONFIG.feel.hitFlash; e.patience = 0;
+        addParts(p.x, p.y, 4, '#ffe08a', 70, 0.25);
+        S.shots.splice(i,1);
+        if (e.hp <= 0) dazeEnemy(e);
+        break;
+      }
+    }
+  }
+  // enemy bullets vs posse members
+  for (let i=S.eshots.length-1; i>=0; i--){
+    const p = S.eshots[i];
+    p.x += p.vx*dt; p.y += p.vy*dt;
+    if (p.x < -20 || p.x > D.width+20 || p.y < D.hudH-20 || p.y > D.height+20){ S.eshots.splice(i,1); continue; }
+    let hit = false;
+    for (let mi=0; mi<S.posse.length; mi++){
+      const m = S.posse[mi];
+      if (dist2(p.x,p.y,m.px,m.py) < (R_HIT+R_PROJ)**2){
+        damageMember(mi, p.dmg, 'shot');
+        hit = true;
+        break;
+      }
+    }
+    if (hit){ S.eshots.splice(i,1); if (MODE !== 'playing') return; }
+  }
+  // lobbed bombs (both teams) — telegraphed landing, then an explosion
+  for (let i=S.bombs.length-1; i>=0; i--){
+    const b = S.bombs[i];
+    b.t += dt;
+    const f = clamp(b.t/b.T, 0, 1);
+    b.x = lerp(b.sx, b.tx, f); b.y = lerp(b.sy, b.ty, f);
+    if (b.t >= b.T){
+      S.booms.push({ x:b.tx, y:b.ty, r:b.radius, team:b.team, t:0.35 });
+      // damage applies once, on detonation
+      if (b.team === 'e'){
+        for (let mi=0; mi<S.posse.length; mi++){
+          const m = S.posse[mi];
+          if (dist2(b.tx,b.ty,m.px,m.py) < b.radius**2) damageMember(mi, b.damage, 'bomb');
+        }
+      } else {
+        for (const e of S.enemies){
+          if (e.state !== 'active') continue;
+          if (dist2(b.tx,b.ty,e.x,e.y) < b.radius**2){
+            e.hp -= b.damage; e.flash = CONFIG.feel.hitFlash; e.patience = 0;
+            if (e.hp <= 0) dazeEnemy(e);
+          }
+        }
+      }
+      addParts(b.tx, b.ty, 16, b.team==='e' ? '#ff8a4a' : '#ffd24a', 160, 0.5);
+      SFX.boom();
+      shake(3, 0.15);
+      S.bombs.splice(i,1);
+      if (MODE !== 'playing') return;
+    }
+  }
+  for (let i=S.booms.length-1; i>=0; i--){
+    S.booms[i].t -= dt;
+    if (S.booms[i].t <= 0) S.booms.splice(i,1);
+  }
+}
+
+/* ---------------------------------------------------------------
+   10. PICKUPS
+   --------------------------------------------------------------- */
+function spawnPickup(kind, x, y){
+  S.pickups.push({ kind, x, y, t: CONFIG.pickups.lifetime });
+}
+function updatePickups(dt){
+  const L = S.posse[0];
+  for (let i=S.pickups.length-1; i>=0; i--){
+    const p = S.pickups[i];
+    p.t -= dt;
+    if (p.t <= 0){ S.pickups.splice(i,1); continue; }
+    if (dist2(L.px, L.py, p.x, p.y) < CONFIG.pickups.radius**2){
+      if (p.kind === 'tonic'){
+        for (const m of S.posse) m.hp = Math.min(m.maxHp, m.hp + CONFIG.pickups.tonicHeal);
+        addFloat(p.x, p.y-14*ART, 'TONIC! posse healed', '#a8ffb0');
+      } else if (p.kind === 'horseshoe'){
+        S.buffFire = CONFIG.pickups.horseshoeDuration;
+        addFloat(p.x, p.y-14*ART, 'LUCKY HORSESHOE! rapid fire', '#8ad4ff');
+      } else { // nugget
+        S.score += CONFIG.pickups.nuggetScore;
+        addFloat(p.x, p.y-14*ART, '+' + CONFIG.pickups.nuggetScore, '#ffe08a');
+      }
+      addParts(p.x, p.y, 10, '#ffffff', 90, 0.4);
+      SFX.pickup();
+      S.pickups.splice(i,1);
+    }
+  }
+}
+
+/* ---------------------------------------------------------------
+   11. FEEL — particles (pooled), floating text, screenshake
+   --------------------------------------------------------------- */
+const parts = [];
+for (let i=0;i<CONFIG.feel.particleMax;i++) parts.push({alive:false,x:0,y:0,vx:0,vy:0,t:0,T:1,color:'#fff',size:2});
+let partCursor = 0;
+
+// Burst speeds are authored at the 48px tile like the sprites, so bursts keep
+// their size relative to the characters they come off.
+function addParts(x, y, n, color, speed, life){
+  for (let i=0;i<n;i++){
+    const p = parts[partCursor]; partCursor = (partCursor+1) % parts.length;
+    const a = rng()*TAU, s = speed*ART*(0.4+rng()*0.8);
+    p.alive = true; p.x = x; p.y = y;
+    p.vx = Math.cos(a)*s; p.vy = Math.sin(a)*s;
+    p.t = 0; p.T = life*(0.6+rng()*0.8); p.color = color; p.size = 2+rng()*3;
+  }
+}
+function updateParts(dt){
+  for (const p of parts){
+    if (!p.alive) continue;
+    p.t += dt;
+    if (p.t >= p.T){ p.alive = false; continue; }
+    p.x += p.vx*dt; p.y += p.vy*dt;
+    p.vx *= (1 - 2.5*dt); p.vy *= (1 - 2.5*dt);
+  }
+}
+function addFloat(x, y, txt, color){
+  S.floats.push({x, y, txt, color, t: 1.2});
+  if (S.floats.length > 12) S.floats.shift();
+}
+function updateFloats(dt){
+  for (let i=S.floats.length-1; i>=0; i--){
+    const f = S.floats[i];
+    f.t -= dt; f.y -= 21*ART*dt;
+    if (f.t <= 0) S.floats.splice(i,1);
+  }
+}
+function shake(mag, dur){ S.shakeMag = Math.max(S.shakeMag, mag); S.shakeT = Math.max(S.shakeT, dur); }
+
+/* ---------------------------------------------------------------
+   12. SIMULATE — one fixed-timestep tick of pure game logic.
+   No rendering, no DOM: this is what the headless harness drives.
+   --------------------------------------------------------------- */
+function simulate(dt){
+  modeT += dt;
+  if (MODE !== 'playing' || !S) return;
+
+  S.elapsed += dt;
+  if (S.leaderInvuln > 0) S.leaderInvuln -= dt;
+  if (S.buffFire > 0) S.buffFire -= dt;
+  if (S.hurtFx > 0) S.hurtFx -= dt;
+  if (S.banner){ S.banner.t -= dt; if (S.banner.t <= 0) S.banner = null; }
+  if (S.hint){ S.hint.t -= dt; if (S.hint.t <= 0) S.hint = null; }
+  if (S.shakeT > 0) S.shakeT -= dt;
+
+  // inter-wave breather: posse still rides, no spawns
+  if (S.interWave > 0){
+    S.interWave -= dt;
+    if (S.interWave <= 0) initWave(S.wave.n + 1);
+  }
+
+  // leader glide + tile steps
+  const stepDur = 1 / CONFIG.player.tilesPerSec;
+  S.moveT += dt / stepDur;
+  let guard = 0;
+  while (S.moveT >= 1 && guard++ < 4){
+    S.moveT -= 1;
+    leaderStep();
+    if (MODE !== 'playing') return;
+  }
+  updatePosseXY();
+
+  posseCombat(dt);
+  if (S.interWave <= 0 && !S.wave.cleared) spawnDirector(dt);
+  updateEnemies(dt);      if (MODE !== 'playing') return;
+  updateProjectiles(dt);  if (MODE !== 'playing') return;
+  updatePickups(dt);
+  updateParts(dt);
+  updateFloats(dt);
+  checkWaveClear();
+}
+
+/* ---------------------------------------------------------------
+   13. RENDER
+   --------------------------------------------------------------- */
+let canvas = null, ctx = null, wrapEl = null;
+
+function fmtTime(sec){
+  const m = Math.floor(sec/60), s = Math.floor(sec%60);
+  return m + ':' + (s<10?'0':'') + s;
+}
+
+function drawHat(g, x, y, color){
+  g.fillStyle = color;
+  g.beginPath(); g.ellipse(x, y-6, 13, 4.5, 0, 0, TAU); g.fill();   // brim
+  g.fillRect(x-7, y-16, 14, 10);                                    // crown
+}
+
+function drawMember(g, m, isLeader){
+  const cls = CONFIG.classes[m.cls];
+  // Whole sprite is authored at the 48px-tile scale, then grown with the tile via ART.
+  g.save();
+  g.translate(m.px, m.py);
+  g.scale(ART, ART);
+  // shadow
+  g.fillStyle = 'rgba(60,40,20,0.25)';
+  g.beginPath(); g.ellipse(0, 11, 12, 5, 0, 0, TAU); g.fill();
+  // invulnerable leader blinks (S can be null on the menu's decorative posse)
+  if (isLeader && S && S.leaderInvuln > 0 && Math.floor(S.elapsed*12)%2===0) g.globalAlpha = 0.45;
+  // gun toward aim
+  g.strokeStyle = '#3a2a18'; g.lineWidth = 4;
+  g.beginPath(); g.moveTo(0, 0);
+  g.lineTo(Math.cos(m.aim)*17, Math.sin(m.aim)*17); g.stroke();
+  // body
+  g.fillStyle = m.flash > 0 ? '#ffffff' : cls.color;
+  g.beginPath(); g.arc(0, 0, 13, 0, TAU); g.fill();
+  g.strokeStyle = 'rgba(40,25,10,0.6)'; g.lineWidth = 2; g.stroke();
+  drawHat(g, 0, 0, isLeader ? '#5a3a1a' : '#463222');
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+function drawEnemy(g, e){
+  const t = CONFIG.enemies.types[e.type];
+  g.save();
+  g.translate(e.x, e.y);
+  g.scale(ART, ART);
+  g.fillStyle = 'rgba(60,40,20,0.25)';
+  g.beginPath(); g.ellipse(0, 11, 12, 5, 0, 0, TAU); g.fill();
+  if (e.state === 'dazed'){
+    // recruitable: gray body, pulsing green ring showing time left, orbiting stars
+    const frac = e.dazeT / CONFIG.enemies.dazeDuration;
+    g.fillStyle = '#8f8478';
+    g.beginPath(); g.arc(0, 0, 13, 0, TAU); g.fill();
+    g.strokeStyle = 'rgba(40,25,10,0.6)'; g.lineWidth = 2; g.stroke();
+    const pulse = 1 + Math.sin(S.elapsed*6)*0.08;
+    g.strokeStyle = 'rgba(120,240,130,0.9)'; g.lineWidth = 3;
+    g.beginPath(); g.arc(0, 0, 20*pulse, -Math.PI/2, -Math.PI/2 + TAU*frac); g.stroke();
+    g.fillStyle = '#ffe36a';
+    for (let k=0;k<3;k++){
+      const a = S.elapsed*3 + k*TAU/3;
+      g.beginPath(); g.arc(Math.cos(a)*16, -16 + Math.sin(a)*5, 2.5, 0, TAU); g.fill();
+    }
+  } else {
+    g.fillStyle = e.flash > 0 ? '#ffffff' : t.color;
+    g.beginPath(); g.arc(0, 0, 13, 0, TAU); g.fill();
+    g.strokeStyle = 'rgba(40,25,10,0.7)'; g.lineWidth = 2; g.stroke();
+    // black hat + eye band = outlaw silhouette
+    g.fillStyle = '#221a12';
+    g.beginPath(); g.ellipse(0, -7, 12, 4, 0, 0, TAU); g.fill();
+    g.fillRect(-6, -15, 12, 8);
+    g.fillStyle = 'rgba(20,12,8,0.55)'; g.fillRect(-9, -4, 18, 5);
+    g.fillStyle = '#fff';
+    g.fillRect(-6, -3, 3, 3); g.fillRect(3, -3, 3, 3);
+    // type tells: dynamiter cradles a bomb, gunslinger shows a barrel
+    if (e.type === 'dynamiter'){
+      g.fillStyle = '#111'; g.beginPath(); g.arc(11, 6, 5, 0, TAU); g.fill();
+      g.strokeStyle = '#ffb04a'; g.lineWidth = 2;
+      g.beginPath(); g.moveTo(11, 1); g.lineTo(14, -3); g.stroke();
+    } else if (e.type === 'gunslinger'){
+      const near = nearestMember(e.x, e.y);
+      const a = Math.atan2(near.m.py-e.y, near.m.px-e.x);
+      g.strokeStyle = '#1a1208'; g.lineWidth = 4;
+      g.beginPath(); g.moveTo(0, 0); g.lineTo(Math.cos(a)*17, Math.sin(a)*17); g.stroke();
+    }
+  }
+  g.restore();
+}
+
+function drawWorld(g){
+  // The sim only stamps which arena should be showing (initWave); painting it is
+  // a render job, so the repaint happens here — including after a restart, where
+  // the wave number repeats but the seed in the stamp does not.
+  if (S.bgKey !== bgKey) drawBgLayer(S.wave.n, S.obstacles, S.bgKey);
+  g.save();
+  if (S.shakeT > 0){
+    // Math.random on purpose: cosmetic jitter must never touch the seeded gameplay RNG
+    g.translate((Math.random()-0.5)*2*S.shakeMag, (Math.random()-0.5)*2*S.shakeMag);
+  }
+  g.drawImage(bgLayer, 0, 0, D.width, D.height);
+
+  // spawn telegraphs: swirling dust ring
+  for (const s of S.spawnMarks){
+    const f = 1 - s.t / CONFIG.enemies.spawnTelegraph;
+    g.strokeStyle = 'rgba(120,80,40,' + (0.3+0.5*f) + ')';
+    g.lineWidth = 3;
+    for (let k=0;k<3;k++){
+      const a = S.elapsed*5 + k*TAU/3;
+      g.beginPath(); g.arc(s.x, s.y, (14 - 6*f)*ART, a, a+1.6); g.stroke();
+    }
+  }
+
+  // pickups
+  for (const p of S.pickups){
+    if (p.t < 3 && Math.floor(p.t*6)%2===0) continue;   // blink when expiring
+    const bob = Math.sin(S.elapsed*4 + p.x)*3;
+    g.save(); g.translate(p.x, p.y); g.scale(ART, ART);
+    g.fillStyle = 'rgba(60,40,20,0.2)';
+    g.beginPath(); g.ellipse(0, 10, 9, 4, 0, 0, TAU); g.fill();
+    if (p.kind === 'tonic'){
+      g.fillStyle = '#5ad46a'; g.fillRect(-6, -8+bob, 12, 16);
+      g.fillStyle = '#2e8038'; g.fillRect(-4, -12+bob, 8, 5);
+      g.fillStyle = '#fff'; g.fillRect(-2, -4+bob, 4, 8); g.fillRect(-4, -2+bob, 8, 4);
+    } else if (p.kind === 'horseshoe'){
+      g.strokeStyle = '#8ad4ff'; g.lineWidth = 5;
+      g.beginPath(); g.arc(0, bob, 9, Math.PI*0.15, Math.PI*0.85, true); g.stroke();
+    } else {
+      g.fillStyle = '#ffd24a';
+      g.beginPath(); g.moveTo(0, -9+bob); g.lineTo(8, 5+bob);
+      g.lineTo(-8, 5+bob); g.closePath(); g.fill();
+      g.strokeStyle = '#a8842a'; g.lineWidth = 2; g.stroke();
+    }
+    g.restore();
+  }
+
+  // enemies (dazed under active so live threats read on top)
+  for (const e of S.enemies) if (e.state === 'dazed') drawEnemy(g, e);
+  for (const e of S.enemies) if (e.state === 'active') drawEnemy(g, e);
+
+  // posse (tail first so the Sheriff draws on top)
+  for (let i=S.posse.length-1; i>=0; i--) drawMember(g, S.posse[i], i===0);
+  // Sheriff's badge
+  const L = S.posse[0];
+  g.fillStyle = '#ffe08a'; g.font = 'bold ' + Math.round(12*ART) + 'px Georgia'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText('\u2605', L.px, L.py+2*ART);
+
+  // bombs: ground telegraph + arcing bomb
+  for (const b of S.bombs){
+    const f = clamp(b.t/b.T, 0, 1);
+    g.strokeStyle = b.team==='e' ? 'rgba(255,90,60,'+(0.25+0.55*f)+')' : 'rgba(255,220,110,'+(0.2+0.4*f)+')';
+    g.lineWidth = 2; g.setLineDash([6,6]);
+    g.beginPath(); g.arc(b.tx, b.ty, b.radius, 0, TAU); g.stroke();
+    g.setLineDash([]);
+    const arc = Math.sin(f*Math.PI) * 46 * ART;
+    g.fillStyle = 'rgba(60,40,20,0.25)';
+    g.beginPath(); g.ellipse(b.x, b.y+6*ART, 6*ART, 3*ART, 0, 0, TAU); g.fill();
+    g.fillStyle = '#181410';
+    g.beginPath(); g.arc(b.x, b.y-arc, 6*ART, 0, TAU); g.fill();
+    g.fillStyle = '#ffb04a';
+    g.beginPath(); g.arc(b.x+4*ART, b.y-arc-6*ART, 2*ART, 0, TAU); g.fill();
+  }
+  // explosions
+  for (const bm of S.booms){
+    const f = 1 - bm.t/0.35;
+    g.strokeStyle = bm.team==='e' ? 'rgba(255,120,60,'+(1-f)+')' : 'rgba(255,220,110,'+(1-f)+')';
+    g.lineWidth = 6*(1-f)+2;
+    g.beginPath(); g.arc(bm.x, bm.y, bm.r*f, 0, TAU); g.stroke();
+  }
+
+  // bullets
+  for (const p of S.shots){
+    g.fillStyle = p.kind === 'slug' ? '#c9a2ff' : '#ffe08a';
+    g.beginPath(); g.arc(p.x, p.y, p.kind==='slug'?R_SLUG:R_BULLET, 0, TAU); g.fill();
+  }
+  for (const p of S.eshots){
+    g.fillStyle = '#ff7a5a';
+    g.beginPath(); g.arc(p.x, p.y, R_ESHOT, 0, TAU); g.fill();
+    g.strokeStyle = 'rgba(255,122,90,0.4)'; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(p.x, p.y); g.lineTo(p.x - p.vx*0.03, p.y - p.vy*0.03); g.stroke();
+  }
+
+  // particles
+  for (const p of parts){
+    if (!p.alive) continue;
+    g.globalAlpha = 1 - p.t/p.T;
+    g.fillStyle = p.color;
+    const ps = p.size * ART;
+    g.fillRect(p.x - ps/2, p.y - ps/2, ps, ps);
+  }
+  g.globalAlpha = 1;
+
+  // floating text
+  g.font = 'bold ' + Math.round(18*ART) + 'px Trebuchet MS';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (const f of S.floats){
+    g.globalAlpha = clamp(f.t/0.4, 0, 1);
+    g.fillStyle = '#241608'; g.fillText(f.txt, f.x+1, f.y+1);
+    g.fillStyle = f.color;   g.fillText(f.txt, f.x, f.y);
+  }
+  g.globalAlpha = 1;
+  g.restore();
+
+  // hurt vignette
+  if (S.hurtFx > 0){
+    g.strokeStyle = 'rgba(200,30,20,' + (S.hurtFx*0.9) + ')';
+    g.lineWidth = 28 * HUD.ts;
+    g.strokeRect(0, 0, D.width, D.height);
+  }
+}
+
+/* Pause / fullscreen hit rects. Same corner and size so the top-right always
+   means "system control", never "steer". Mutated in place by layoutHUD() so the
+   __PP getters (and anything else holding a reference) always see live values. */
+const PAUSE_BTN = { x: 0, y: 0, w: 70, h: 70 };
+const FS_BTN    = { x: 0, y: 0, w: 70, h: 70 };
+let pauseMenuBtns = [];   // rebuilt each render of the pause overlay
+
+/* HUD layout (v1.3). Nothing here may be hardcoded against a 720px width any
+   more: vertical positions are fractions of hudH, horizontal ones are insets
+   scaled by ts — the internal short edge over the reference 720. That keeps the
+   bar reading identically on an 8x16 phone (720x1620, hudH 180) and a 14x7
+   laptop (1260x765, hudH 135), and keeps text at the same PHYSICAL size on both,
+   since the internal short edge always maps to the device's short edge. */
+const HUD = { ts:1, pad:22, heartStep:35, hRow:38, pRow:84, cRow1:41, cRow2:76,
+              rRow1:34, rRow2:66, rRow3:94, rightX:600, rule:5 };
+function layoutHUD(){
+  const ts = Math.min(D.width, D.height) / CONFIG.display.refShortPx;
+  HUD.ts = ts;
+  HUD.pad       = Math.round(22 * ts);
+  HUD.heartStep = Math.round(35 * ts);
+  HUD.rule      = Math.max(2, Math.round(5 * ts));
+  HUD.hRow  = D.hudH * 0.32;   // hearts
+  HUD.pRow  = D.hudH * 0.70;   // posse count / rapid-fire timer
+  HUD.cRow1 = D.hudH * 0.34;   // score
+  HUD.cRow2 = D.hudH * 0.63;   // session best
+  HUD.rRow1 = D.hudH * 0.28;   // wave
+  HUD.rRow2 = D.hudH * 0.55;   // outlaws left
+  HUD.rRow3 = D.hudH * 0.78;   // elapsed
+  // Button grows with the bar but is capped so a tall portrait HUD doesn't hand
+  // it half the screen; floor keeps it a comfortable touch target on any grid.
+  const btn = Math.round(clamp(D.hudH * 0.58, 56 * ts, 100 * ts));
+  PAUSE_BTN.w = FS_BTN.w = PAUSE_BTN.h = FS_BTN.h = btn;
+  PAUSE_BTN.x = FS_BTN.x = D.width - btn - HUD.pad;
+  PAUSE_BTN.y = FS_BTN.y = Math.round((D.hudH - btn) / 2);
+  HUD.rightX = PAUSE_BTN.x - Math.round(14 * ts);   // right-aligned text stops here
+}
+
+function drawHUD(g){
+  const ts = HUD.ts;
+  g.fillStyle = '#3a2415';
+  g.fillRect(0, 0, D.width, D.hudH);
+  g.fillStyle = '#241608';
+  g.fillRect(0, D.hudH-HUD.rule, D.width, HUD.rule);
+
+  const L = S.posse[0];
+  // hearts (leader HP)
+  g.font = Math.round(33*ts) + 'px Georgia'; g.textAlign = 'left'; g.textBaseline = 'middle';
+  let hx = HUD.pad;
+  for (let i=0;i<L.maxHp;i++){
+    g.fillStyle = i < L.hp ? '#ff5a4a' : 'rgba(255,255,255,0.18)';
+    g.fillText('\u2665', hx, HUD.hRow);
+    hx += HUD.heartStep;
+  }
+  // posse size
+  g.font = 'bold ' + Math.round(23*ts) + 'px Trebuchet MS';
+  g.fillStyle = '#ffe08a';
+  g.fillText('\u2605\u00d7' + S.posse.length, HUD.pad, HUD.pRow);
+  if (S.buffFire > 0){
+    g.fillStyle = '#8ad4ff';
+    g.fillText('RAPID ' + Math.ceil(S.buffFire) + 's', HUD.pad + Math.round(100*ts), HUD.pRow);
+  }
+  // score (center)
+  g.textAlign = 'center';
+  g.font = 'bold ' + Math.round(38*ts) + 'px Trebuchet MS'; g.fillStyle = '#fff2d8';
+  g.fillText(String(S.score), D.width/2, HUD.cRow1);
+  g.font = Math.round(18*ts) + 'px Trebuchet MS'; g.fillStyle = 'rgba(255,242,216,0.55)';
+  g.fillText('BEST ' + Math.max(sessionBest, S.score), D.width/2, HUD.cRow2);
+  // wave / remaining / timer (right, stopping short of the pause button)
+  g.textAlign = 'right';
+  g.font = 'bold ' + Math.round(23*ts) + 'px Trebuchet MS'; g.fillStyle = '#fff2d8';
+  g.fillText('WAVE ' + S.wave.n + '/' + CONFIG.waves.total, HUD.rightX, HUD.rRow1);
+  g.font = Math.round(19*ts) + 'px Trebuchet MS'; g.fillStyle = 'rgba(255,242,216,0.7)';
+  g.fillText('outlaws left: ' + remainingInWave(), HUD.rightX, HUD.rRow2);
+  g.fillText(fmtTime(S.elapsed), HUD.rightX, HUD.rRow3);
+  // pause button (glyph proportional to the button, so it scales with the bar)
+  const b = PAUSE_BTN;
+  g.fillStyle = 'rgba(255,242,216,0.12)';
+  g.fillRect(b.x, b.y, b.w, b.h);
+  g.fillStyle = '#fff2d8';
+  g.fillRect(b.x + b.w*0.30, b.y + b.h*0.26, b.w*0.14, b.h*0.50);
+  g.fillRect(b.x + b.w*0.56, b.y + b.h*0.26, b.w*0.14, b.h*0.50);
+}
+
+function drawBanner(g){
+  if (!S || !S.banner) return;
+  const ts = HUD.ts, b = S.banner;
+  const a = clamp(b.t / 0.4, 0, 1);
+  g.globalAlpha = a;
+  g.fillStyle = 'rgba(30,18,8,0.65)';
+  g.fillRect(0, D.height*0.34, D.width, 110*ts);
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = 'bold ' + Math.round(46*ts) + 'px Georgia'; g.fillStyle = '#ffe08a';
+  g.fillText(b.text, D.width/2, D.height*0.34 + 42*ts);
+  if (b.sub){
+    g.font = 'bold ' + Math.round(22*ts) + 'px Trebuchet MS'; g.fillStyle = '#fff2d8';
+    g.fillText(b.sub, D.width/2, D.height*0.34 + 84*ts);
+  }
+  g.globalAlpha = 1;
+}
+
+function drawHint(g){
+  if (!S || !S.hint) return;
+  const ts = HUD.ts;
+  const a = clamp(S.hint.t / 0.5, 0, 1) * 0.95;
+  g.globalAlpha = a;
+  g.fillStyle = 'rgba(30,18,8,0.6)';
+  g.fillRect(0, D.height-64*ts, D.width, 44*ts);
+  g.font = 'bold ' + Math.round(20*ts) + 'px Trebuchet MS'; g.fillStyle = '#a8ffb0';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(S.hint.text, D.width/2, D.height-42*ts);
+  g.globalAlpha = 1;
+}
+
+function drawTitleCard(g, title, lines, prompt){
+  const ts = HUD.ts;
+  g.fillStyle = 'rgba(22,13,6,0.78)';
+  g.fillRect(0, 0, D.width, D.height);
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = 'bold ' + Math.round(64*ts) + 'px Georgia'; g.fillStyle = '#ffe08a';
+  g.fillText(title, D.width/2, D.height*0.26);
+  g.font = Math.round(20*ts) + 'px Trebuchet MS'; g.fillStyle = '#fff2d8';
+  let y = D.height*0.36;
+  for (const ln of lines){ g.fillText(ln, D.width/2, y); y += 32*ts; }
+  if (prompt && Math.floor(modeT*2)%2===0){
+    g.font = 'bold ' + Math.round(24*ts) + 'px Trebuchet MS'; g.fillStyle = '#a8ffb0';
+    g.fillText(prompt, D.width/2, D.height*0.82);
+  }
+}
+
+/* Corner-bracket fullscreen glyph, drawn in code like the rest of the art.
+   Windowed: brackets sit on the outer corners with arms turning inward (expand).
+   Fullscreen: brackets pull in to a smaller box with arms turning outward
+   (contract) — so the icon always shows what the tap will do next. */
+function drawFsIcon(g, r, active){
+  const u = r.w / 70;                       // glyph was authored for a 70px button
+  const cx = r.x + r.w/2, cy = r.y + r.h/2;
+  const h = (active ? 7 : 16) * u, len = 9 * u, dir = active ? 1 : -1;
+  g.strokeStyle = '#fff2d8'; g.lineWidth = 4 * u; g.lineCap = 'round';
+  for (const [sx, sy] of [[-1,-1],[1,-1],[-1,1],[1,1]]){
+    const x = cx + sx*h, y = cy + sy*h;
+    g.beginPath();
+    g.moveTo(x + dir*sx*len, y);
+    g.lineTo(x, y);
+    g.lineTo(x, y + dir*sy*len);
+    g.stroke();
+  }
+  g.lineCap = 'butt';
+}
+
+// Title-screen fullscreen button (only drawn when the platform supports it).
+function drawFsButton(g){
+  if (!fullscreenSupported()) return;
+  g.fillStyle = 'rgba(255,242,216,0.12)';
+  g.fillRect(FS_BTN.x, FS_BTN.y, FS_BTN.w, FS_BTN.h);
+  drawFsIcon(g, FS_BTN, isFullscreen());
+}
+
+function drawMenu(g){
+  const ts = HUD.ts;
+  // decorative marching posse under the title
+  g.drawImage(bgLayer, 0, 0, D.width, D.height);
+  g.fillStyle = 'rgba(22,13,6,0.55)';
+  g.fillRect(0, 0, D.width, D.height);
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = 'bold ' + Math.round(72*ts) + 'px Georgia'; g.fillStyle = '#ffe08a';
+  g.fillText('POSSE', D.width/2, D.height*0.20);
+  g.fillText('PURSUIT', D.width/2, D.height*0.29);
+  g.font = 'italic ' + Math.round(20*ts) + 'px Georgia'; g.fillStyle = '#fff2d8';
+  g.fillText('Every outlaw is a deputy waiting to happen.', D.width/2, D.height*0.37);
+
+  // posse illustration: sheriff + two deputies in a line, spaced by the tile so
+  // they never overlap at a bigger character size
+  const py = D.height*0.50, gap = D.tile;
+  const demo = [
+    {x: D.width/2+gap, cls:'sheriff', lead:true},
+    {x: D.width/2,     cls:'deputy'},
+    {x: D.width/2-gap, cls:'sharpshooter'},
+  ];
+  for (let i=demo.length-1;i>=0;i--){
+    const d0 = demo[i];
+    const m = { px:d0.x, py:py + Math.sin(modeT*3+i)*4, aim:0, flash:0, cls:d0.cls };
+    drawMember(g, m, !!d0.lead);
+  }
+  g.font = Math.round(18*ts) + 'px Trebuchet MS'; g.fillStyle = 'rgba(255,242,216,0.85)';
+  const lines = [
+    'Lead the line. Guns fire on their own \u2014 you steer.',
+    'Beat outlaws senseless, then RIDE OVER them to recruit.',
+    'If the Sheriff falls, the ride is over.',
+    '',
+    'TOUCH: swipe to turn \u00b7 KEYS: arrows / WASD \u00b7 P pauses \u00b7 M mutes \u00b7 F fullscreen',
+  ];
+  let y = D.height*0.60;
+  for (const ln of lines){ g.fillText(ln, D.width/2, y); y += 30*ts; }
+  if (Math.floor(modeT*2)%2===0){
+    g.font = 'bold ' + Math.round(26*ts) + 'px Trebuchet MS'; g.fillStyle = '#a8ffb0';
+    g.fillText('TAP or press ENTER to ride', D.width/2, D.height*0.86);
+  }
+  g.font = Math.round(13*ts) + 'px Trebuchet MS'; g.fillStyle = 'rgba(255,242,216,0.4)';
+  g.fillText(CONFIG.meta.title + ' v' + CONFIG.meta.version + ' \u00b7 coinlessgames.com', D.width/2, D.height-20*ts);
+  drawFsButton(g);   // top-right; hit-tested before the tap-to-start catch-all
+}
+
+function drawPause(g){
+  const ts = HUD.ts;
+  g.fillStyle = 'rgba(22,13,6,0.72)';
+  g.fillRect(0, 0, D.width, D.height);
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = 'bold ' + Math.round(52*ts) + 'px Georgia'; g.fillStyle = '#ffe08a';
+  g.fillText('CAMP', D.width/2, D.height*0.24);
+  pauseMenuBtns = [
+    { id:'resume',  label:'Resume ride' },
+    { id:'sound',   label:'Sound: ' + (CONFIG.audio.enabled ? 'ON' : 'OFF') },
+    { id:'restart', label:'Restart run' },
+  ];
+  // Display toggle only appears where the browser can honour it (no dead buttons).
+  if (fullscreenSupported()){
+    pauseMenuBtns.splice(2, 0, { id:'fullscreen', label: isFullscreen() ? 'Exit fullscreen' : 'Fullscreen' });
+  }
+  // Rows are spaced to fit the arena height: a 765px-tall laptop frame packs the
+  // same four entries a 1620px phone frame does, without running off the bottom.
+  const bh = Math.round(64*ts), bw = Math.round(300*ts);
+  const top = D.height*0.38;
+  const step = Math.min(92*ts, (D.height*0.94 - top) / Math.max(1, pauseMenuBtns.length));
+  let y = top;
+  for (const b of pauseMenuBtns){
+    b.x = Math.round(D.width/2 - bw/2); b.y = Math.round(y - bh/2); b.w = bw; b.h = bh;
+    g.fillStyle = 'rgba(255,242,216,0.12)';
+    g.fillRect(b.x, b.y, b.w, b.h);
+    g.strokeStyle = 'rgba(255,224,138,0.5)'; g.lineWidth = 2*ts;
+    g.strokeRect(b.x, b.y, b.w, b.h);
+    g.font = 'bold ' + Math.round(24*ts) + 'px Trebuchet MS'; g.fillStyle = '#fff2d8';
+    g.fillText(b.label, D.width/2, y);
+    y += step;
+  }
+}
+
+function render(){
+  const g = ctx;
+  // Base transform maps internal D.width x D.height onto the device-pixel backing store,
+  // so every draw call below stays in clean internal coordinates.
+  g.setTransform(view.sx, 0, 0, view.sy, 0, 0);
+  g.clearRect(0, 0, D.width, D.height);
+
+  if (MODE === 'menu'){
+    drawMenu(g);
+    return;
+  }
+  // world + HUD behind every in-run overlay
+  drawWorld(g);
+  drawHUD(g);
+  drawBanner(g);
+  drawHint(g);
+
+  if (MODE === 'paused'){
+    drawPause(g);
+  } else if (MODE === 'gameover'){
+    drawTitleCard(g, 'BUSHWHACKED!', [
+      'The Sheriff has fallen.',
+      '',
+      'Score: ' + S.score,
+      'Session best: ' + sessionBest,
+      'Reached wave ' + S.wave.n + ' \u00b7 ' + fmtTime(S.elapsed) + ' in the saddle',
+      'Deputized ' + S.stats.recruits + ' outlaws',
+    ], 'TAP or press ENTER to ride again');
+  } else if (MODE === 'victory'){
+    drawTitleCard(g, 'TERRITORY TAMED!', [
+      'All ' + CONFIG.waves.total + ' waves cleared. The county sleeps easy.',
+      '',
+      'Final score: ' + S.score,
+      'Session best: ' + sessionBest,
+      'Time: ' + fmtTime(S.elapsed) + ' \u00b7 Posse size: ' + S.posse.length,
+      'Deputized ' + S.stats.recruits + ' outlaws',
+    ], 'TAP or press ENTER to ride again');
+  }
+}
+
+/* ---------------------------------------------------------------
+   14. INPUT — keyboard + swipe/drag touch steering
+   --------------------------------------------------------------- */
+const KEY_DIRS = {
+  ArrowUp:{x:0,y:-1}, ArrowDown:{x:0,y:1}, ArrowLeft:{x:-1,y:0}, ArrowRight:{x:1,y:0},
+  w:{x:0,y:-1}, s:{x:0,y:1}, a:{x:-1,y:0}, d:{x:1,y:0},
+  W:{x:0,y:-1}, S:{x:0,y:1}, A:{x:-1,y:0}, D:{x:1,y:0},
+};
+
+function confirmAction(){
+  // Enter/Space/tap in a non-playing state
+  if (MODE === 'menu'){ startRun(); SFX.uiTap(); }
+  else if (MODE === 'gameover' || MODE === 'victory'){
+    if (modeT >= CONFIG.feel.stateTapDelay){ startRun(); SFX.uiTap(); }
+  }
+}
+function togglePause(){
+  if (MODE === 'playing'){ setMode('paused'); SFX.uiTap(); }
+  else if (MODE === 'paused'){ setMode('playing'); SFX.uiTap(); }
+}
+function toggleSound(){
+  CONFIG.audio.enabled = !CONFIG.audio.enabled;
+  if (CONFIG.audio.enabled){ audioInit(); audioResume(); SFX.uiTap(); }
+}
+
+function onKeyDown(e){
+  audioInit(); audioResume();
+  const d = KEY_DIRS[e.key];
+  if (d){ queueDir(d); e.preventDefault && e.preventDefault(); return; }
+  if (e.key === 'Enter' || e.key === ' '){ confirmAction(); e.preventDefault && e.preventDefault(); }
+  else if (e.key === 'p' || e.key === 'P' || e.key === 'Escape'){ togglePause(); }
+  else if (e.key === 'm' || e.key === 'M'){ toggleSound(); }
+  else if (e.key === 'f' || e.key === 'F'){ toggleFullscreen(); }   // keydown is a user gesture
+}
+
+// Map client coordinates to internal canvas space.
+function toGame(e){
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (D.width / r.width),
+           y: (e.clientY - r.top) * (D.height / r.height) };
+}
+const ptr = { down:false, id:null, x0:0, y0:0, ax:0, ay:0, moved:0 };
+
+function onPointerDown(e){
+  audioInit(); audioResume();
+  const p = toGame(e);
+  ptr.down = true; ptr.id = e.pointerId;
+  ptr.x0 = p.x; ptr.y0 = p.y; ptr.ax = p.x; ptr.ay = p.y; ptr.moved = 0;
+  e.preventDefault && e.preventDefault();
+}
+function onPointerMove(e){
+  if (!ptr.down || e.pointerId !== ptr.id) return;
+  const p = toGame(e);
+  ptr.moved = Math.max(ptr.moved, Math.hypot(p.x-ptr.x0, p.y-ptr.y0));
+  // drag steering: every swipePx of travel from the last anchor queues a turn
+  const dx = p.x - ptr.ax, dy = p.y - ptr.ay;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) >= CONFIG.feel.swipePx){
+    if (Math.abs(dx) > Math.abs(dy)) queueDir({x: dx>0?1:-1, y:0});
+    else queueDir({x:0, y: dy>0?1:-1});
+    ptr.ax = p.x; ptr.ay = p.y;
+  }
+  e.preventDefault && e.preventDefault();
+}
+function onPointerUp(e){
+  if (!ptr.down || e.pointerId !== ptr.id) return;
+  ptr.down = false;
+  const p = toGame(e);
+  if (ptr.moved <= CONFIG.feel.tapMaxPx){
+    handleTap(p.x, p.y);
+  }
+  e.preventDefault && e.preventDefault();
+}
+function inRect(x, y, r){ return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+
+function handleTap(x, y){
+  if (MODE === 'menu'){
+    // Checked before the tap-anywhere-to-start fallback, so tapping the button
+    // toggles fullscreen instead of launching a run.
+    if (fullscreenSupported() && inRect(x, y, FS_BTN)){ toggleFullscreen(); SFX.uiTap(); return; }
+    confirmAction(); return;
+  }
+  if (MODE === 'playing'){
+    if (inRect(x, y, PAUSE_BTN)) togglePause();
+    return;
+  }
+  if (MODE === 'paused'){
+    for (const b of pauseMenuBtns){
+      if (inRect(x, y, b)){
+        if (b.id === 'resume') togglePause();
+        else if (b.id === 'sound') toggleSound();
+        else if (b.id === 'fullscreen'){ toggleFullscreen(); SFX.uiTap(); }   // stays paused
+        else if (b.id === 'restart'){ startRun(); SFX.uiTap(); }
+        return;
+      }
+    }
+    return;
+  }
+  confirmAction();   // gameover / victory
+}
+
+/* ---------------------------------------------------------------
+   15. LOOP / BOOT
+   --------------------------------------------------------------- */
+const STEP = 1/60;          // fixed simulation timestep
+let acc = 0, lastT = 0;
+
+function frame(now){
+  const dt = Math.min(0.1, (now - lastT) / 1000);
+  lastT = now;
+  acc += dt;
+  let steps = 0;
+  while (acc >= STEP && steps++ < 6){ simulate(STEP); acc -= STEP; }
+  if (steps >= 6) acc = 0;   // spiral-of-death guard: drop backlog
+  render();
+  requestAnimationFrame(frame);
+}
+
+/* ---- Fullscreen ----------------------------------------------------------
+   Chrome for Android has no F11, so the game exposes its own toggle. Two rules
+   drive this code:
+     1. requestFullscreen() only works when called synchronously from a user
+        gesture, so toggleFullscreen() is ONLY ever reached from the tap or
+        keydown handlers — never from the render loop or a timer.
+     2. We expand #wrap (the flex-centering container), not the canvas. If the
+        canvas itself went fullscreen the browser would stretch it edge to edge
+        and fight fitCanvas(); expanding the container instead just gives
+        fitCanvas() a bigger window to letterbox into, so the aspect ratio and
+        all input mapping stay exactly as they are windowed.
+   Everything is feature-detected and wrapped: on a platform that refuses (or
+   an iPhone, where element fullscreen doesn't exist) the buttons simply never
+   appear and the game plays as before. */
+function fsTarget(){
+  return wrapEl || canvas || null;
+}
+function fullscreenSupported(){
+  if (!CONFIG.fullscreen.enabled) return false;
+  const el = fsTarget();
+  return !!(el && (el.requestFullscreen || el.webkitRequestFullscreen));
+}
+function isFullscreen(){
+  if (typeof document === 'undefined') return false;
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+function toggleFullscreen(){
+  if (!fullscreenSupported()) return;
+  const el = fsTarget();
+  try {
+    if (isFullscreen()){
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      if (exit){ const p = exit.call(document); if (p && p.catch) p.catch(()=>{}); }
+    } else {
+      const req = el.requestFullscreen || el.webkitRequestFullscreen;
+      // navigationUI is a hint; browsers that don't know it ignore the argument.
+      const p = req.call(el, { navigationUI: CONFIG.fullscreen.navigationUI });
+      if (p && p.catch) p.catch(()=>{});   // refusal must never throw into the loop
+    }
+  } catch (_){ /* unsupported or blocked: stay windowed, no harm done */ }
+}
+
+
+// is crisp at native density. Input still maps through CSS px (see toGame), so no
+// coordinate assumptions change — the whole scene just draws at higher resolution.
+function fitCanvas(){
+  const winW = (typeof window !== 'undefined' && window.innerWidth)  || D.width;
+  const winH = (typeof window !== 'undefined' && window.innerHeight) || D.height;
+  const rawDpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+  const dpr = Math.max(1, Math.min(rawDpr, D.dprCap));
+  const scale = Math.min(winW / D.width, winH / D.height);
+  const cssW = Math.max(1, Math.floor(D.width  * scale));
+  const cssH = Math.max(1, Math.floor(D.height * scale));
+  canvas.style.width  = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  const bw = Math.max(1, Math.round(cssW * dpr));
+  const bh = Math.max(1, Math.round(cssH * dpr));
+  if (canvas.width !== bw || canvas.height !== bh){ canvas.width = bw; canvas.height = bh; }
+  view.sx = canvas.width  / D.width;
+  view.sy = canvas.height / D.height;
+  view.cssW = cssW; view.cssH = cssH; view.dpr = dpr;
+}
+
+/* On resize / rotate / DPR change / fullscreen transition:
+
+   - On the MENU we re-shape the grid to the new window (a phone rotated to
+     landscape should start its next run on a landscape arena), then refit.
+   - During a run — playing, paused, or frozen on a tally card — we only refit.
+     Re-shaping mid-run would leave entities outside the arena and would change
+     the geometry a seeded run was reproducing, so a mid-run resize is purely a
+     re-letterbox; the new shape is picked up by the next startRun(). */
+function onResize(){
+  if (MODE === 'menu') reshapeToWindow();
+  fitCanvas();
+  drawBgLayer(bgWaveN, bgObstacles);
+}
+
+function boot(){
+  canvas = document.getElementById('game');
+  wrapEl = document.getElementById(CONFIG.fullscreen.targetId) || canvas;
+  ctx = canvas.getContext('2d');
+  reshapeToWindow(true);      // resolve the grid for this device BEFORE anything reads D
+  fitCanvas();                // then the view + device-pixel backing store
+  // menu needs a background before the first run exists
+  S = newRun();               // throwaway state so drawBgLayer/obstacles have context
+  runSeed = 12345;
+  rng = mulberry32(runSeed);
+  genObstacles(1);
+  drawBgLayer(0, S.obstacles, 'menu');
+  S = null;
+
+  window.addEventListener('resize', onResize);
+  // Entering/leaving fullscreen changes the viewport: refit and repaint the arena.
+  // Most browsers also fire 'resize' here, but not all do it reliably on Android.
+  document.addEventListener('fullscreenchange', onResize);
+  document.addEventListener('webkitfullscreenchange', onResize);
+  window.addEventListener('keydown', onKeyDown);
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', onPointerUp);
+  document.addEventListener('visibilitychange', ()=>{ if (document.hidden && MODE === 'playing') setMode('paused'); });
+  window.addEventListener('blur', ()=>{ if (MODE === 'playing') setMode('paused'); });
+
+  lastT = (typeof performance !== 'undefined' ? performance.now() : 0);
+  requestAnimationFrame(frame);
+}
+
+/* Debug / test hooks. The headless harness (and curious tinkerers) drive the
+   game through window.__PP without touching the DOM or rAF. Harmless to ship. */
+window.__PP = {
+  CONFIG, D,
+  get mode(){ return MODE; },
+  get S(){ return S; },
+  get view(){ return view; },
+  get pauseBtn(){ return PAUSE_BTN; },
+  get pauseBtns(){ return pauseMenuBtns; },
+  get fsBtn(){ return FS_BTN; },
+  get hud(){ return HUD; },
+  get grid(){ return gridFromConfig(); },
+  startRun,
+  simulate,
+  render,
+  queueDir,
+  setSeed(n){ CONFIG.debug.seed = n; },
+  /* Grid control for tests and console tinkering. setGridFor(devW, devH) applies
+     the grid a device of that shape would resolve to, regardless of autoGrid —
+     and pinning it (autoGrid:false) is what makes a seeded run reproducible, since
+     determinism only holds at a fixed geometry. */
+  resolveGrid, applyGrid, reshapeToWindow, densityScale, arenaTiles,
+  setGridFor(devW, devH){ applyGrid(resolveGrid(devW, devH)); return gridFromConfig(); },
+  pinGrid(on){ CONFIG.display.autoGrid = !on; },
+  key(k){ onKeyDown({ key: k, preventDefault(){} }); },   // drive the keyboard path
+  tap(x, y){ handleTap(x, y); },                            // drive the pointer-tap path
+  confirmAction, togglePause, toggleSound, fitCanvas,
+  toggleFullscreen, isFullscreen, fullscreenSupported,
+  spawnEnemyAt(type, x, y){ S.enemies.push(makeEnemy(type, x, y)); },
+  dazeAll(){ for (const e of S.enemies) if (e.state === 'active') dazeEnemy(e); },
+  damageMember, dazeEnemy, spawnPickup,
+  helpers: { waveQuota, waveSpawnInterval, waveMaxActive, enemyHpFor, enemySpeedFor, tileCX, tileCY, blocked, inRect },
+};
+
+boot();
+</script>
+</body>
+</html>
