@@ -1,9 +1,9 @@
 ---
-title: "Change Set 13: Polish Pass"
-date: 2026-07-16T16:15:00.000-05:00
-summary: Playtesting turned up a handful of nagging rough edges — dead-end
-  navigation, low-contrast text, and an auto-shield that made the ship nearly
-  unkillable. All fixed in one focused pass.
+title: "Change Set 14: Tutorial Exploration (Reverted)"
+date: 2026-07-16T16:16:00.000-05:00
+summary: An attempt to make Orbital Overhaul approachable for players without a
+  classic-arcade background. The direction didn't land, so the whole changeset
+  was scrapped.
 draft: false
 ---
-Some rough edges showed up during playtesting that were bugging me. You'd finish a run and get stuck unable to get back to the Title screen without restarting a whole new game first — that's just bad UX, so I fixed the navigation. I also noticed a lot of my dialog text was hard to read against the backgrounds — Options menus, control legends, the Achievements screen — so I bumped up contrast and size across the board. And the auto-shield option? Turns out it made the ship nearly unkillable since it regenerated instantly after activating. Added a short cooldown so it still helps without trivializing the danger.
+I wanted to make Orbital Overhaul approachable for players who didn't grow up on classic arcade games — not everyone intuitively knows what a "shoot the rocks" game is trying to teach them. I went down the path of researching onboarding methods for arcade-style games and started drafting a full tutorial spec. In the end, the direction didn't come together the way I wanted, so I scrapped the whole changeset. Sometimes the right call is starting over rather than shipping something half-baked.
