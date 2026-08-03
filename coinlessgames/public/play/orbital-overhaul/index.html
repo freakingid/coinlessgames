@@ -99,9 +99,39 @@
 
 // ---------- Constants ----------
 // The world is a large wrapping torus; the viewport is a camera window onto it.
-const WORLD_W = 2560, WORLD_H = 1440;   // simulation space (the wrap boundary)
 const VIEW_W = 1280, VIEW_H = 720;      // visible viewport = canvas size
+// CS022 P1 (spec §4.1, FORK-CS022-B/C): THE TORUS PERIOD IS NO LONGER FIXED. A world "size" counts
+// VIEWPORT-SIZED SCREENS OF AREA — size 4 is 2x2 viewports (2560x1440, every build through CS021),
+// size 16 is 4x4 (5120x2880, what four rings at CS022's 276 px spacing need). The size is chosen by
+// the LEVEL'S ARCHETYPE (worldSizeFor), not by a level-table column and not by a ramp, so game.wave
+// stays the ONE difficulty clock. FORK-CS022-B: this is a general seam with two values wired — a
+// finer per-level scheme later is a data change, not a re-plumb.
+//
+// CONSEQUENCE, and the whole reason this block carries a warning: WORLD_W/WORLD_H are `let` now.
+// ANY VALUE DERIVED FROM THEM AND CACHED AT MODULE LOAD IS A BUG. STAR_COUNT/`stars` was the only
+// one and §4.3 handles it (generated once for WORLD_SIZE_MAX, filtered per world into starsActive).
+// Everything else reads them live, inside a function, which is what makes the resize safe.
+const WORLD_SIZE_FIELD = 4;             // field levels: 2560x1440 — deliberately UNCHANGED from the
+                                        // v3.1 P1 shrink (spec C4: the bigger world was tried and
+                                        // rejected, and the spawn/dock rings are flat constants that
+                                        // would just leave more dead space in it)
+const WORLD_SIZE_ORBIT = 16;            // orbit levels: 5120x2880
+const WORLD_SIZE_MAX = Math.max(WORLD_SIZE_FIELD, WORLD_SIZE_ORBIT); // largest size in the table; the
+                                        // starfield is generated once for THIS (§4.3/FLAG-CS022-d)
+let WORLD_W = 2560, WORLD_H = 1440;     // simulation space (the wrap boundary). WAS `const` through
+                                        // CS021. Boots at the FIELD size and must always equal
+                                        // worldDims(WORLD_SIZE_FIELD) — asserted headlessly.
 const TAU = Math.PI * 2;
+
+// CS022 P1 (§4.1): a size in viewport-areas -> [width, height]. sqrt because `size` counts AREA, so
+// size 4 is a 2x screen linear scale and size 16 a 4x one; both land on exact integers.
+function worldDims(size) { const k = Math.sqrt(size); return [VIEW_W * k, VIEW_H * k]; }
+
+// CS022 P1 (FORK-CS022-C): the level's ARCHETYPE picks the size. A pure function of the level number,
+// evaluated fresh at every wave boundary — never a stored schedule.
+function worldSizeFor(level) {
+  return levelDef(level).archetype === "orbit" ? WORLD_SIZE_ORBIT : WORLD_SIZE_FIELD;
+}
 
 const SHIP_TURN = 4.2;          // rad/sec — the design-default turn rate (before the player scale)
 // Player rotation-speed preference (CS010 §10b): a multiplier over SHIP_TURN, adjustable on the
@@ -128,12 +158,36 @@ const SHIELD_DRAIN = 0.55;      // energy/sec while on
 const SHIELD_RECHARGE = 0.12;   // energy/sec while off
 const SHIELD_HIT_COST = 0.22;   // energy per deflection
 const SHIELD_RADIUS = 26;
+// CS021 P1b — THE SHIP BOUNCES OFF A HAZARD IT CANNOT PUSH. shieldDeflect() below shoves the HAZARD
+// and never touches the ship, which works for every free-moving body but not for a CS021 orbiting
+// satellite: that one's position is re-derived from its orbit angle every frame, so the shove is
+// undone before it can separate and the same contact re-presents every frame. Measured on the P1
+// build: five deflects in five consecutive frames, the whole shield meter gone in 0.10 s against
+// 1.38 s of ordinary SHIELD_DRAIN, and no way to push clear. A body on a rail is effectively
+// infinite mass, so the whole exchange goes to the SHIP instead — see shieldBounce().
+// ELASTIC, and computed in the SATELLITE'S FRAME so a fast ring genuinely flings you: the approaching
+// component of the RELATIVE velocity is reflected, then the satellite's own tangential velocity is
+// added back. Restitution 1.0 is literally "reflect incoming speed" — you get back exactly what you
+// brought. PLAYTEST KNOB: lower it if a ring reads like a trampoline.
+const SHIELD_BOUNCE_RESTITUTION = 1.0;
+// PLAYTEST KNOB, px/s. THE SEPARATION FLOOR: the minimum outward speed a bounce always leaves behind.
+// A reflection alone does nothing for a ship whose RELATIVE velocity has no approaching component —
+// one at rest, one riding alongside, one already moving away — and the overlap push only buys 2 px of
+// clearance, so anything that closes those 2 px re-presents the same contact on the next frame.
+// MEASURED, not assumed (deflect events over 5 s, meter held full, floor 120 vs floor 0):
+//     parked radially, ring 1 ................ 1 vs 1   (the push alone happens to suffice)
+//     parked in the satellite's PATH, ring 1 .. 1 vs 2   (it sweeps back into you)
+//     parked radially, THRUST HELD into it .... 2 vs 5   (you push yourself back in)
+//     parked radially, 12-node tow ............ 1 vs 2   (CARGO_TUG drags you back in)
+// So it earns its place in exactly the cases a player creates on purpose. Well under KNOCKBACK_SPEED
+// (250): a graze should nudge, not launch — the elastic term is what makes a hard hit hurt.
+const SHIELD_BOUNCE_MIN = 120;
 const AUTO_SHIELD_SCORE_PENALTY = 500; // PLAYTEST KNOB — score lost per auto-save. Flat (FLAG-4d).
 const AUTO_SHIELD_REGEN_PAUSE = 1.0; // sec — passive regen freezes this long after an auto-save. PLAYTEST KNOB (>= HIT_STUN_DURATION guarantees no recharge between i-frame end and next hit).
 
-const DEBRIS_SPEEDS = { 3: 70, 2: 110, 1: 160 };  // base drift speed by size. The per-wave multiplier and
-                                 // its cap are CS017 P3 cycle knobs — see DEBRIS_SPEED_PER_WAVE /
-                                 // DEBRIS_SPEED_CAP in the difficulty-ramp block below.
+const DEBRIS_SPEEDS = { 3: 70, 2: 110, 1: 160 };  // base drift speed by size; 70 is also the JUNK
+                                 // section's "normal" DEBUG_VARS default (junkSpeedMul() divides by
+                                 // it). Its cap is DEBRIS_SPEED_CAP in the difficulty-ramp block below.
 const DEBRIS_RADII  = { 3: 46, 2: 26, 1: 13 };
 const DEBRIS_SCORE  = { 3: 20, 2: 50, 1: 100 };
 const DEBRIS_GARBAGE = 4;       // canisters emitted at EVERY tier's destruction (F3). PLAYTEST KNOB:
@@ -143,21 +197,26 @@ const SAUCER_SCORE = { big: 200, small: 1000 };
 
 // Hunter Satellites (F4) — the reshaped killer-satellite/wedge system: a diamond core that
 // drifts passively toward the ship, then splits 3-ways into actively-homing children,
-// emitting garbage at every tier. All speeds/turn rates are CEILINGS the difficulty ramp
-// (§2.13) climbs toward; at wave 1 the whole family moves at HUNTER_FLOOR_FRAC of them, so
-// early waves are gentle and full pressure arrives ~wave 20.
+// emitting garbage at every tier.
+// CS018 P4 (FLAG-a): every Hunter's speed and turn rate is now FROZEN at _CEIL × HUNTER_FLOOR_FRAC
+// for the WHOLE GAME — no difficulty ramp, no cycle, no clock of any kind. The two _CEIL tables are
+// therefore the FROZEN VALUE'S DERIVATION, not a target anything climbs toward; nothing interpolates
+// between the floor fraction and the ceiling any more. Rising Hunter pressure is expressed purely as
+// COUNT now, through the level table's maxLargeHunters cap (see HUNTER_CAP_STEPS / levelDef).
 const HUNTER_RADII      = { 3: 24, 2: 15, 1: 10 };    // collision radius by tier
 const HUNTER_SCORE      = { 3: 200, 2: 150, 1: 250 }; // large core / medium / small (small worth most — hardest to hit)
 const HUNTER_DAMAGE     = { 3: 60, 2: 45, 1: 30 };    // contact damage — harder than the equivalent Debris tier (F2/F4)
-const HUNTER_SPEED_CEIL = { 3: 70, 2: 120, 1: 175 };  // full-difficulty px/s: large drifts, medium/small home (anchored on the old wedge 120/175)
-const HUNTER_TURN_CEIL  = { 3: 0, 2: 1.6, 1: 2.6 };   // full-difficulty homing turn rate (rad/s); large never turns (passive drift)
-const HUNTER_FLOOR_FRAC = 0.58;   // wave-1 speeds & turn rates = this × ceiling (THE knob for early-game Hunter calm)
+const HUNTER_SPEED_CEIL = { 3: 70, 2: 120, 1: 175 };  // frozen-speed DERIVATION base (px/s): large drifts, medium/small home (anchored on the old wedge 120/175)
+const HUNTER_TURN_CEIL  = { 3: 0, 2: 1.6, 1: 2.6 };   // frozen turn-rate DERIVATION base (rad/s); large's is 0, so it never turns (passive drift)
+const HUNTER_FLOOR_FRAC = 0.58;   // THE Hunter speed/turn knob: EVERY Hunter, at EVERY level, moves at this × its _CEIL
+                                  // (40.6 / 69.6 / 101.5 px/s and 0 / 0.928 / 1.508 rad/s by tier 3/2/1)
 const HUNTER_SCATTER    = 0.6;    // sec a freshly-split homer scatters outward before homing engages
 // v3.6 P2b: "last stand" — once no Debris remain (game.debris.length === 0), a large core slowly steers
 // toward the ship instead of drifting forever. Both PLAYTEST KNOBS, deliberately under-specified.
-const HUNTER_LAST_STAND_SPEED = 50;    // px/s — slower than a medium homer at ANY wave (medium ranges
-                                       // HUNTER_SPEED_CEIL[2]*HUNTER_FLOOR_FRAC≈70 at wave 1 up to 120 at
-                                       // ceiling); a search-ender, not a second homing tier.
+const HUNTER_LAST_STAND_SPEED = 50;    // px/s — slower than a medium homer, which since CS018 P4 is the
+                                       // FROZEN HUNTER_SPEED_CEIL[2]*HUNTER_FLOOR_FRAC = 69.6 px/s at
+                                       // EVERY level (it used to range 69.6 -> 120 and beyond); a
+                                       // search-ender, not a second homing tier.
 const HUNTER_LAST_STAND_TURN  = 0.5;   // rad/s — well below HUNTER_TURN_CEIL[2] (1.6); a slow, inevitable turn.
 // PLAYTEST KNOB (v3.4 P1): canisters per Hunter KILL, by tier — was a flat HUNTER_GARBAGE=3 for
 // both large/medium plus a separate HUNTER_SMALL_GARBAGE=6 for the small tier; now one per-tier
@@ -242,7 +301,7 @@ const SCORES_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 // Minor = tweaks to existing systems. Patch = bug fixes, where "bug" includes the game not doing what
 // the design intends. Changeset = the CS### number, monotonically increasing, never resets — the 4th
 // segment IS the changeset number (this build shipped in CS010).
-const GAME_VERSION = "1.0.0.17";
+const GAME_VERSION = "1.0.0.22";
 const VERSION_STAMP_INSET_X = 16; // px in from the right edge of the viewport (title screen only)
 const VERSION_STAMP_INSET_Y = 16; // px in from the bottom edge of the viewport (title screen only)
 
@@ -269,6 +328,12 @@ const HUD_RING_SEG_GAP = 0.12;  // CS012 P2: radians of empty gap between adjace
                                  // drawRingSegments (the Scoop segmented-ring primitive). PLAYTEST KNOB.
 const HUD_FX_GLYPH_R = 9;       // radius of the glyph drawn inside a powerup row's ring
 const HUD_FX_LOW = 3;           // sec remaining at/under which a timed powerup row shows the low warning
+// CS021 P4: delivery-combo readout (closes FLAG-CS020-i). Left column, under Score/Level — those two
+// use bare literals (30,46)/(30,62) predating the CS009 HUD naming convention, but this is a new
+// mechanic, so it gets named knobs per CLAUDE.md rather than joining them as a third bare literal.
+const HUD_COMBO_X = 30;         // same left margin as Score/Level
+const HUD_COMBO_Y = 84;         // baseline y, beneath "LEVEL n" (62); PLAYTEST KNOB, first-pass spacing
+const HUD_COMBO_SIZE = 18;      // smaller than LEVEL (22) so a 3rd line doesn't compete with it
 const HUD_PULSE_HZ = 1.2;       // CS010 P3: the FLAT pulse rate for NON-HP alarms ONLY — the cargo-gold
                                  // ring and the powerup low-timer row. Anything keyed on LOW_HP_THRESHOLD
                                  // (the critical-hull ring, the corner glow, the audio siren) instead
@@ -339,8 +404,8 @@ const GARBAGE_SHATTER_KICK = [40, 90]; // v3.2 P2: px/s outward kick range for s
 // rather than escalating — see DIFFICULTY-LEVERS.md and bonusSpawnChance() below.
 const BONUS_CANISTER_PIECES = 6;      // PLAYTEST KNOB: chain slots one bonus clump fills on a full scoop
 const BONUS_CANISTER_SCORE  = 250;    // PLAYTEST KNOB: points paid ONCE per clump, at the scoop
-const BONUS_SPAWN_CHANCE_EARLY = 0.5; // PLAYTEST KNOB: per-wave spawn probability at cycleWave 1
-const BONUS_SPAWN_CHANCE_LATE  = 0.1; // PLAYTEST KNOB: ... at the LAST wave of a cycle (cycleWave === CYCLE_LENGTH)
+const BONUS_SPAWN_CHANCE_EARLY = 0.5; // PLAYTEST KNOB: per-wave spawn probability right after a junk-cycle reset
+const BONUS_SPAWN_CHANCE_LATE  = 0.1; // PLAYTEST KNOB: ... at the LAST level of a junk cycle (CS018 P3: re-homed off cycleWave)
 const BONUS_RING_PAD = 5;             // px: gap between the clump's collision radius and its halo-ring tell (look-call)
 
 const CHAIN_LINK = 20;          // px between chain nodes
@@ -351,12 +416,14 @@ const CHAIN_ITER = 4;           // verlet constraint relaxation passes/frame (B-
 const GUARD_ABSORB_SPARKS = 7;  // PLAYTEST KNOB: guard-hued particles spat out where a break was absorbed
 const GUARD_CHAIN_WIDTH = 1.8;  // link stroke width while guarded (vs the normal 1.2) — the "armoured" read
 const GUARD_CHAIN_BLUR = 14;    // link glow blur while guarded (vs the normal 6)
-// Tow capacity (B-8): the cap is a runtime value (game.cargoMax) that GROWS during a run from
-// CARGO_BASE toward CARGO_CAP_MAX — capacity is earned by engaging the salvage loop (Pillar 5),
-// not handed out. The old fixed `CHAIN_MAX` (12) is now CARGO_BASE.
-const CARGO_BASE = 12;          // starting tow cap (was CHAIN_MAX)
-const CARGO_CAP_MAX = 24;       // ceiling (v3.4 P1: 20->24); the physics retune below targets "full chain here" ≈ old 12-node feel
-const CARGO_GROW_PER = 30;      // +1 cap per this many canisters recycled (delivered) in the current run
+// Tow capacity (B-8, superseded CS018 P5 / FORK-CS018-B): the cap is a runtime value
+// (game.cargoMax) set from levelDef(game.wave).payloadSlots in nextWave() — GRANTED by level, no
+// longer earned by delivering canisters. CARGO_BASE and CARGO_CAP_MAX survive only as the
+// documented bounds the table's payloadSlots curve targets (8 at level 1, 24 by level 12); neither
+// drives growth anymore. The old fixed `CHAIN_MAX` (12) was the ancestor of CARGO_BASE.
+const CARGO_BASE = 12;          // HISTORICAL (CS018 P5): pre-table level-1 value; the table's level-1 value is 8, not this
+const CARGO_CAP_MAX = 24;       // ceiling — still current: levelDef's payloadSlots tops out here at level 12, and the Maxed Out latch still keys off it
+const CARGO_GROW_PER = 30;      // RETIRED (CS018 P5): the old per-delivery growth rate. Superseded by the levelDef payloadSlots field. No readers remain.
 const CHAIN_TUG = 26;           // ship pull-back accel per px of chain stretch
 // Towed-mass penalty coefficients — ALL FOUR ARE PLAYTEST KNOBS (CS010 §3). The complaint they
 // address: a typical mid-sized haul (~6-12 towed mass) didn't "feel heavy." Background: v3.0 P6 grew
@@ -388,6 +455,25 @@ const DOCK_RADIUS = 44;
 const LEVER_DOCK_SIZE = { enabled: false, start: 2.0, floor: 1.0 };
 const DOCK_BASE_SCORE = 50;     // 1st canister of a visit
 const DOCK_BONUS_STEP = 25;     // each additional canister: +25 over the last
+// CS020: px PAST dock.radius — the dock's "neighborhood". Two readers, and they must be the same
+// number: the towed/incidental tag at capture (a piece hooked INSIDE the neighborhood was never
+// towed in, so it earns no combo) and the CS020 P1b grace window's arm/decay gate (inside the
+// neighborhood a delivery run is safe indefinitely; outside it the run is on a countdown).
+// Deliberately NOT the dock's +10 offload radius, which is a different, smaller number and stays as
+// it is: at +10 a parked player's own magnet grabs would tag `towed` and therefore reset their own
+// combo continuously (the P1b hook reset below). +40 keeps a parked ship's pickups neutral.
+// See GDD 2.10.
+const DOCK_NEIGHBORHOOD_PAD = 40;
+// CS020 P1b (FORK-CS020-E): sec a delivery run survives OUTSIDE the dock's neighborhood before
+// game.deliveryCount zeroes. A delivery run is ONE EFFORT — one chain, delivered in one go — and a
+// skirt-and-return is still one effort, so leaving the dock mid-offload must not destroy the run.
+// 4.0 s, not the 2.0 first proposed: a 180-degree turn at SHIP_TURN costs 0.75 s before thrust can
+// even begin, and a normal pilot exiting at 200-300 px/s with a real load is outside for 2.8-3.8 s
+// (spec 2.4's integrator table), so a 2 s window would fail almost every real skirt — the exact case
+// this exists for. THE TIMER IS NOT THE SAFETY MECHANISM: what bounds the counter is the towed-hook
+// reset at the pickup gate, which is why a generous window costs nothing here. Live value is
+// DEBUG.dockComboGrace (DEBUG_VARS, DELIVERY section); this const is the shipped default it derives.
+const DOCK_COMBO_GRACE = 4.0;
 const DOCK_OFFLOAD_INTERVAL = 0.05; // PLAYTEST KNOB (v3.4 P1; was a bare literal 0.13). sec between
                                      // canisters peeling off at the dock.
 const DOCK_POWERUP_SPEED = 120;     // PLAYTEST KNOB (v3.6 P3): launch speed of the hub's per-visit
@@ -396,7 +482,12 @@ const DOCK_POWERUP_SPEED = 120;     // PLAYTEST KNOB (v3.6 P3): launch speed of 
 // Larger world & scrolling camera (v1.2)
 const CULL_MARGIN = 100;        // px beyond the viewport edge still worth drawing
 const SPAWN_MIN_DIST = 220;     // new debris satellites: nearest allowed to the ship
-const SPAWN_MAX_DIST = 640;     // new debris satellites: farthest from the ship (stay reachable; clamped to min(WORLD_W,WORLD_H)/2-60 = 660 for the 2560x1440 world)
+const SPAWN_MAX_DIST = 640;     // new debris satellites: farthest from the ship (stay reachable; clamped
+                                // to the reachable radius min(WORLD_W,WORLD_H)/2-60, which is 660 at
+                                // WORLD_SIZE_FIELD and 1380 at WORLD_SIZE_ORBIT — CS022 P1 (spec C5)
+                                // corrects the old comment's claim that 660 is "the" limit. Both this
+                                // and DOCK_MAX_DIST are FLAT constants that do NOT scale with world
+                                // size, and they clear either figure; only this comment moved.
 const DOCK_MIN_DIST = 260;      // recycling dock: nearest allowed to the ship
 const DOCK_MAX_DIST = 620;      // recycling dock: farthest from the ship (stay reachable; kept below SPAWN_MAX_DIST)
 const STAR_DENSITY = 80;        // background stars per viewport-sized area of world
@@ -407,32 +498,253 @@ const STAR_NEAR_DENSITY = 22;   // near parallax layer: sparse, per viewport-siz
 const STAR_NEAR_BRIGHT_MIN = 0.55; // near layer reads brighter (closer) than the far layer
 const STAR_NEAR_BRIGHT_MAX = 1.0;
 
-// Difficulty ramp & early-game pacing (F10) — one shared curve scales every wave-driven
-// threat parameter from an easy wave-1 floor up to a full-intensity ceiling (see §2.6/§2.13).
+// ---------- CS021 P1: ORBIT LEVELS — the orbit-level archetype (PLANNED-FEATURES-CS021 §1/§4) --------
+// Every ORBIT_LEVEL_EVERY-th level replaces nextWave()'s scatter with concentric rings of size-3
+// DebrisSatellites ORBITING THE DOCK. The schedule constant itself lives with the level table below,
+// beside JUNK_CYCLE — see the note there for why it can't live up here.
+//
+// It is a spawn ARRANGEMENT plus a motion MODE, never a wall: the satellites are ordinary debris —
+// shootable, breakable, harvestable — so shooting a lane open is a legitimate strategy and the whole
+// arrangement erodes into a normal field as it is harvested (FORK-CS021-C2).
+//
+// THE RADII ARE DERIVED FROM SATELLITE SIZE AND FITTED TO THE *ORBIT-LEVEL* WORLD (CS022 P3, gate Q1 +
+// FORK-CS022-A). CS021 shipped 180/150 — four radii fitted to the FIELD world's ~700 px wrap-clean
+// circle — and its playtest gate came back saying the rings sat too close to the dock and were all too
+// tight. The spacing Q1 asked for is: ring 1 five large-satellite diameters out from the dock, every
+// further ring three more, measured CENTRE-TO-CENTRE (FORK-CS022-A; the edge-to-edge readings need a
+// size-25 world). At DEBRIS_RADII[3] * 2 = 92 px that is 5 x 92 = 460 and 3 x 92 = 276, putting the four
+// rings at 460 / 736 / 1012 / 1288 and the OUTERMOST SATELLITE EDGE at 1288 + 46 = 1,334 px.
+//
+// That is why CS022 P1 exists: 1,334 px does not fit the field world (budget 700 px), so an ORBIT level
+// runs at WORLD_SIZE_ORBIT (5120x2880), whose wrap-clean budget is 2880/2 - 20 = 1,420 px. 1,334 against
+// 1,420 — four rings fit, and they fit from the FIRST occurrence. THE WORLD SIZE DOES NOT RAMP EVEN
+// THOUGH THE RINGS DO (activeRingsFor(), spec §1.2). Ring 1 clears the permanent 88 px dock (radius
+// DOCK_RADIUS x 2 at every level — LEVER_DOCK_SIZE ships disabled, Correction C2) by 460 - 46 - 88 =
+// 326 px, against CS021's 46 px. Anything re-deriving these must budget against worldDims(
+// WORLD_SIZE_ORBIT), never the live WORLD_H — see orbitEffectiveCount() for the same rule.
+const ORBIT_INNER_RADIUS  = 460;  // ring 1 radius, px from the dock — 5 large-satellite diameters (5 x 92)
+const ORBIT_RADIUS_STEP   = 276;  // px per further ring (3 x 92); rings 1-4 land at 460 / 736 / 1012 / 1288
+// ORBIT_RING_COUNT IS NOT DECLARED HERE ANY MORE. CS022 P3 moved it down into the LEVEL PROGRESSION
+// TABLE block, beside ORBIT_LEVEL_EVERY, because levelDef()'s new `orbitRings` column reads it and
+// levelDef must stay evaluable ALONE in a bare context — the identical reason ORBIT_LEVEL_EVERY lives
+// there. Its value (4) and its meaning are unchanged; see the note at its new home.
+// CS021 P3 (FLAG-CS021-a). RETIRED IN CS022 P2 (spec Correction C3, §6/§9): orbitEffectiveCount() now
+// clamps against the wrap-clean BUDGET (worldDims(WORLD_SIZE_ORBIT)) rather than this step-pad floor —
+// once orbitRadiusStepFor() holds ORBIT_RADIUS_STEP fixed, the step can no longer narrow as count rises,
+// so this floor can never bind again. Left defined, unread, as a documented historical value (the
+// DEBRIS_COUNT_MAX precedent, CS018 P3). No readers remain.
+const ORBIT_RADIUS_STEP_PAD = 40;
+// Per-ring density, 0 (one satellite) -> 1 (the tightest fair fit). Non-uniform on purpose so the level
+// has rhythm: tight -> breather -> widest -> wide.
+//
+// CS022 P3 (FORK-CS022-G, Correction C7): that rhythm line USED to read "tight -> breather -> wide/fast
+// -> tightest", which was true at CS021's 180/150 geometry — ring 4's lane was 96.5 px there and it was
+// the level's climax. Ring 4's density is now HALVED (0.85 -> 0.42), taken on FRAME BUDGET rather than on
+// fairness: at the new radii the shipped curve put 44 satellites on ring 4 alone and a level-21 peak of
+// 108, and the standing-garbage load a full harvest produces scales with that. The halving is exact at
+// both ends of the occurrence curve — 44 -> 22 at level 3, 49 -> 25 at the 1.8 floor — and takes the peak
+// level total to 84. The consequence is that ring 4's lane goes 92 -> 276 px, making it the second-WIDEST
+// ring rather than the tightest; ring 1's 101 px is now the only tight ring left (FLAG-CS022-c).
+//
+// At the shipped geometry, with every ring active (occurrence 4+), this yields counts 15 / 14 / 15 / 23
+// at level 12 rising to 15 / 15 / 16 / 25 at the floor. All four are live debug sliders (CS021 P3) and
+// are the first lever if the frame budget or the feel says so.
+const ORBIT_DENSITY       = [0.75, 0.45, 0.35, 0.42];
+// THE FAIRNESS FLOOR, as a multiple of the ship's diameter:
+//     minRequiredGap = max(shipDiameter + ORBIT_SAFETY_MARGIN, shipDiameter * ORBIT_GAP_MULT)
+// At 2.5x a 26 px ship that is 65 px of clear lane between adjacent satellites (the multiplicative half
+// beats the additive 26 + 8 = 34 at every shipped value). CS022 (spec C1): this floor's job is "never a
+// solid wall," not "always a passable lane for a skilled pilot" — the satellites exist to be destroyed,
+// not threaded past, so the number below is a fairness minimum, not a difficulty-vs-skill dial. CS021 P2
+// (spec §5): ORBIT_GAP_MULT is the OCCURRENCE-1 value (level 3) — the multiplier actually fed to the
+// orbit spawn is orbitGapMult(level) below, which decays by ORBIT_GAP_MULT_STEP per further occurrence
+// of the archetype and is clamped at the hard ORBIT_GAP_MULT_FLOOR, the point past which the gap would
+// stop being a fair minimum at all. The floor lands at occurrence 8 (level 24) and holds through level 63.
+const ORBIT_GAP_MULT       = 2.5;
+const ORBIT_GAP_MULT_FLOOR = 1.8;  // hard absolute floor under difficulty scaling (FLAG-CS021-d)
+const ORBIT_GAP_MULT_STEP  = 0.1;  // multiplier lost per occurrence past the first
+const ORBIT_SAFETY_MARGIN  = 8;    // px in the ADDITIVE half of minRequiredGap
+// MOTION (FORK-CS021-C1 -> (b)), rad/s. FIRST-PASS VALUES BY DESIGN: CS021 P3 turns both into debug
+// knobs whose `def` DERIVES from these constants (shown in degrees/second, via toNative), and the
+// playtest gate is where they get settled — the fork resolution is explicit that Paul tunes them live
+// rather than accepting a specced guess. ORBIT_ANG_VEL is deliberately slow: a full revolution in 60 s,
+// which at CS022 P3's ring-4 radius (1288) is ~135 px/s of tangential travel — the px/s figures scale
+// with the radii, so this whole paragraph's numbers moved when the geometry did, the °/s did not.
+const ORBIT_ANG_VEL       = 6 * Math.PI / 180;  // 6 deg/s
+const ORBIT_FAST_MULT     = 3.0;  // the fast ring's multiplier — ~18 deg/s, ~318 px/s at ring 3's radius
+const ORBIT_FAST_RING     = 3;    // 1-BASED ring number that spins at ORBIT_ANG_VEL * ORBIT_FAST_MULT.
+                                  // Ring 3 is the deliberately SPARSE ring: it trades spatial tightness
+                                  // for timing pressure, which is the whole point of the density curve's dip.
+// FORK-CS021-A -> (c): the rings centre on the dock and THE SHIP IS NEVER REPOSITIONED. Instead, any
+// ring whose band contains the ship rerolls its startAngle until the nearest satellite clears the ship;
+// this bounds the rerolls so a wave start can never hang. See spawnSafeOrbitLayout().
+const ORBIT_SPAWN_TRIES   = 60;
+
+// Difficulty ramp & early-game pacing (F10) — originally the one shared curve that scaled every
+// wave-driven threat parameter from an easy wave-1 floor up to a full-intensity ceiling.
+// CS018 P4 (FLAG-l): RETAINED DELIBERATELY, but its job is now exactly ONE thing — it is the
+// MUSIC-INTENSITY CURVE. difficultyFactor()'s only direct caller is MusicSys.setIntensity() in
+// nextWave(); every per-level difficulty quantity comes from levelDef() below instead. Do NOT
+// re-derive music intensity from the level table, and do not put a new difficulty lever back on this
+// curve. ramp() (which composes difficultyFactor) still interpolates the remaining direct-ramp
+// levers: the small-saucer chance (permanent) and the two disabled leverScale levers (powerup/dock
+// size). CS018 P7 moved the last of the saucer group (fire rate, aim) off ramp() onto levelDef
+// tiers — the whole spawn/fire/aim group is now tier-driven, ending with P6's spawn-gap move.
 const RAMP_WAVES = 8;           // THE knob: larger = slower ramp. Feeds difficultyFactor(wave);
                                 // ~0 at wave 1, ~0.9 by wave 20, plateauing near 1 by ~wave 25.
-// CS017 P1: the difficulty CYCLE clock. CS017 P3 wired it into the SAWTOOTH levers below (debris
-// count/speed, Hunter speed/turn). The FROZEN levers — everything else, saucers included — keep
-// sampling the absolute game.wave; that asymmetry is deliberate (GDD §2.13).
-const CYCLE_LENGTH = 9;         // PLAYTEST KNOB: waves per difficulty cycle; the sawtooth reset period
-const CYCLE_GAIN   = 0.12;      // PLAYTEST KNOB: per-cycle escalation multiplier (FORK-CS017-A -> spiral)
-// CS017 P3 — the sawtooth debris knobs. Count and speed ramp on game.cycleWave (so they RESET at every
-// cycle boundary) and are then multiplied by cycleValue(x, game.cycle), so cycle N+1 opens above cycle N.
-const DEBRIS_COUNT_MAX      = 12;   // PLAYTEST KNOB: in-cycle ceiling on 3 + cycleWave (was the inline
-                                    // literal 9). At CYCLE_LENGTH 9 the in-cycle top is exactly 3+9=12,
-                                    // so this ceiling only binds if CYCLE_LENGTH grows past 9.
-const DEBRIS_COUNT_HARD_MAX = 24;   // PLAYTEST KNOB: absolute ceiling AFTER the spiral gain — a deep run
-                                    // can never spawn an unbounded field. First binds at cycle 9 (~wave 90).
-const DEBRIS_SPEED_PER_WAVE = 0.08; // PLAYTEST KNOB: speed multiplier gained per cycle-wave (hoisted from
-                                    // the inline 0.08 that used to sit at BOTH debris-speed sites).
+// CS017's difficulty CYCLE clock — CYCLE_LENGTH, CYCLE_GAIN, cycleValue(), game.cycle,
+// game.cycleWave — is GONE as of CS018 P4 (FORK-CS018-A). The level table below replaced it and is
+// now the game's ONE difficulty clock; there is no second clock and no sawtooth/spiral any more.
+
+// ---------- CS018 P1: the LEVEL PROGRESSION TABLE (PLANNED-FEATURES-CS018 §3) ----------
+// One PURE function, levelDef(n), is the single source of truth for every per-level difficulty
+// quantity. It reads NO game state — not game.wave, not DEBUG, nothing — so it is callable before
+// startGame() and is this changeset's primary headless-test surface.
+// As of CS018 P4 this is the game's ONLY difficulty clock — the CS017 cycle clock it landed beside
+// in P1 has been retired outright. Consumers repointed so far: junk count + speed and the
+// bonus-canister chance (P3), the large-hunter cap (P4). Payload slots (P5) and the saucer group
+// (P6/P7) still read their old constants. Domain: n >= 1 (game.wave is 1-based).
+const PHASE_LEN  = 21;              // levels per phase; three phases cover levels 1..LEVEL_MAX
+const LEVEL_MAX  = 63;              // levels 64+ reuse level 63's definition unchanged (endgame plateau)
+const JUNK_CYCLE = [3, 5, 9, 13];   // junk count by position in the 4-level cycle, indexed (rel-1) % 4
+// CS021 P1 (FORK-CS021-E): the orbit-level schedule — every ORBIT_LEVEL_EVERY-th level is an ORBIT
+// level (3, 6, 9 … 63, i.e. 21 of the 63) rather than the usual scatter. IT LIVES HERE, apart from the
+// rest of the ORBIT_* geometry block above, for one concrete reason: levelDef() must stay evaluable
+// ALONE in a bare context, and test-cs018-p1.js (B) proves that by slicing the source from this
+// section's banner to levelDef's closing brace and running nothing else. Anything levelDef reads has to
+// be inside that slice. Changing the schedule is a design decision, not a retune (spec §3, FORK-E).
+const ORBIT_LEVEL_EVERY = 3;
+// CS022 P3 (FLAG-CS022-e): rings per orbit level (FORK-CS021-B -> 4 rings of size-3 debris). MOVED HERE
+// from the ORBIT_* geometry block above, for exactly the reason stated for ORBIT_LEVEL_EVERY: levelDef()'s
+// new `orbitRings` column clamps against it, and anything levelDef reads has to be inside that slice.
+// The value and the meaning are unchanged — this is a relocation, not a retune.
+const ORBIT_RING_COUNT = 4;
+
+// Shared step-table reader: the value of the LAST breakpoint at or below n. Every table below is
+// ascending by level and starts at level 1, so a level under the table's start returns its first value.
+// ONE helper, ONE behaviour — used by the hunter cap AND all seven graded tier tables. Do not add a
+// per-lever lookup beside it; two implementations of "which step am I on" is how they drift apart.
+function stepAt(table, n) {
+  let v = table[0][1];
+  for (const [lvl, val] of table) { if (lvl <= n) v = val; else break; }
+  return v;
+}
+
+// Max LARGE hunters alive at once (size 3 ONLY — middle/small are never counted and never capped).
+// Cap 0 across levels 1–4 means no large hunter from EITHER producer, coalescence or ambient spawn
+// (§4.1); 12 is the changeset's hard ceiling and this table must never exceed it. Consumed in P4.
+const HUNTER_CAP_STEPS = [[1,0],[5,1],[9,2],[13,3],[17,5],[21,7],
+                          [22,8],[26,9],[34,10],[43,11],[59,12]];
+
+// The seven GRADED levers. levelDef returns a TIER NAME ("low"/"normal"/"high") per lever, never a
+// number: each tier's actual value is a trio of DEBUG_VARS playtest knobs wired in P3/P6/P7, so this
+// table stays a pure schedule and the values stay tunable without touching it.
+//
+// FOUR OF THE SEVEN ARE INVERTED (§3.1; source notes §1.1). Wherever the quantity is a delay or an
+// error, the number goes DOWN as difficulty rises:
+//     ufoAppearFreq     25 ->  18 ->  13   sec between saucers
+//     ufoDirChangeFreq  2.0 -> 1.3 -> 0.8   sec between zig-zags
+//     ufoFireFreq       1.8 -> 1.0 -> 0.7   × multiplier on the shipped reload ranges
+//     ufoAccuracy        30 ->  20 ->  10   degrees of aim error
+// while junkSpeed (58/70/90 px/s), ufoFlightSpeed (120/150/190 px/s) and ufoShotSpeed (300/380/470
+// px/s) climb. CONSEQUENCE, and it binds every later phase: NOTHING may validate, clamp, reorder or
+// assert low <= normal <= high — not here, not in the debug panel, not at a call site. Tier order is
+// by DIFFICULTY, never by magnitude, so there is deliberately no sanity check below.
+const TIER_STEPS = {
+  junkSpeed:        [[1,"low"],[22,"normal"],[43,"high"]],
+  ufoAppearFreq:    [[1,"low"],[26,"normal"],[47,"high"]],
+  ufoFlightSpeed:   [[1,"low"],[17,"normal"],[38,"high"]],
+  ufoDirChangeFreq: [[1,"low"],[30,"normal"],[55,"high"]],
+  ufoFireFreq:      [[1,"low"],[21,"normal"],[42,"high"]],
+  ufoAccuracy:      [[1,"low"],[13,"normal"],[34,"high"]],
+  ufoShotSpeed:     [[1,"low"],[51,"normal"],[63,"high"]],
+};
+
+// PURE: a level number in, a plain object out. `level` is the UNCLAMPED argument (display/telemetry
+// only); every derived field reads the clamped L, so levelDef(64) … levelDef(Infinity) are
+// field-identical to levelDef(63) except for `level`.
+// AMENDED CS021 P1: `archetype` is an exception to that clamp — it reads the unclamped n on
+// purpose, so the every-3rd orbit rhythm survives the endgame plateau instead of latching "orbit"
+// permanently from level 63. AMENDED AGAIN CS022 P3: `orbitRings` reads the unclamped n for the same
+// reason and is the third such field. `fieldCount` does NOT need to be listed: past level 63 the
+// internal L clamp pins it at levelDef(63).junkCount === 13 at every level, orbit or field, so it is
+// plateau-identical even though it is written in terms of n. levelDef(64+) is therefore field-identical
+// to levelDef(63) except for `level`, `archetype` and `orbitRings`. See each field's own comment.
+function levelDef(n) {
+  const L     = Math.min(n, LEVEL_MAX);
+  const phase = Math.floor((L - 1) / PHASE_LEN) + 1;   // 1..3
+  const rel   = L - PHASE_LEN * (phase - 1);           // 1..21, the level's position within its phase
+  // CS021 P1 (FORK-CS021-E): "field" (the shipped scatter) or "orbit" (concentric rings around the
+  // dock). THE SECOND FIELD DERIVED FROM THE UNCLAMPED n, alongside `level` — every other field reads
+  // the clamped L, but the every-3rd rhythm has to keep going past the level-63 endgame plateau, and
+  // reading L here would make level 63 AND EVERY LEVEL AFTER IT an orbit level forever. game.wave
+  // stays the ONE difficulty clock: this is a pure function of it, not a second clock and not cycle
+  // state. levelDef(Infinity) yields NaN % 3 !== 0, i.e. "field" — no throw at the extreme.
+  // CS022 P3: HOISTED out of the object literal below into a local, because THREE columns now read it
+  // (itself, orbitRings, fieldCount) and an object literal cannot see its own properties. The
+  // expression is byte-unchanged; only where it is written moved.
+  const archetype = n % ORBIT_LEVEL_EVERY === 0 ? "orbit" : "field";
+  // A phase's LAST level holds 13 rather than restarting the cycle at 3 (spec: rel === 21).
+  // CS022 P3: hoisted for the same reason — fieldCount reads it on a field level.
+  const junkCount = rel === PHASE_LEN ? 13 : JUNK_CYCLE[(rel - 1) % 4];
+  const def = {
+    level: n,
+    phase: phase,
+    rel: rel,
+    archetype: archetype,
+    junkCount: junkCount,
+    // CS022 P3 (spec §1.2/§4.5, FORK-CS022-E): HOW MANY of the ORBIT_RING_COUNT rings this orbit level
+    // lays down — one more per OCCURRENCE of the archetype, so ring 4 alone at level 3, rings 4+3 at 6,
+    // 4+3+2 at 9, all four from level 12 onward. Derived from the UNCLAMPED n exactly like `archetype`,
+    // and for the same reason: the rhythm has to survive the level-63 plateau. 0 on a field level.
+    // THE RAMP SELECTS RINGS, IT DOES NOT RE-SPACE THEM — ring 4 sits at 1288 px whether or not rings
+    // 1-3 exist. This column is what the TABLE says; the live spawn goes through activeRingsFor(),
+    // which additionally composes with the orbitCount debug knob (FLAG-CS022-h) and therefore cannot
+    // live in a pure function that reads no state.
+    orbitRings: archetype === "orbit" ? Math.min(n / ORBIT_LEVEL_EVERY, ORBIT_RING_COUNT) : 0,
+    // CS022 P3 (spec §1.4, FORK-CS022-F): the number of ORDINARY scatter satellites the level spawns.
+    // On a field level that is simply its own junkCount. On an ORBIT level it is THE PREVIOUS LEVEL'S
+    // junkCount — an orbit level now carries a field component ON TOP OF its rings, which RETIRES
+    // CS021's "junkCount is not consumed on an orbit level" rule (Correction C6). The orbit level's own
+    // junkCount column is now unread by the spawn path, though logDifficultySnapshot still reports it
+    // (FLAG-CS022-g: that column means "what the table says").
+    //
+    // THE ONE RECURSIVE CALL IN THIS FUNCTION, AND IT TERMINATES BY CONSTRUCTION: orbit levels are
+    // every ORBIT_LEVEL_EVERY-th, so n - 1 is never itself an orbit level when n is, and the branch
+    // cannot be taken twice. levelDef(Infinity) resolves to "field" (NaN % 3 !== 0) so the extreme
+    // never enters it at all. Past level 63 the internal L clamp pins this at levelDef(63).junkCount
+    // === 13, consistent with the plateau. It is a SELF-call, not a table consumer — everything it
+    // needs is already inside this block, so the bare-context slice still evaluates.
+    fieldCount: archetype === "orbit" ? levelDef(n - 1).junkCount : junkCount,
+    // 8 tow slots through level 4, then +2 per level to 24 (= CARGO_CAP_MAX) at level 12, then flat.
+    // Replaces the delivery-earned growCap curve (FORK-CS018-B); consumed in P5.
+    payloadSlots: L <= 4 ? 8 : L >= 12 ? 24 : 8 + (L - 4) * 2,
+    maxLargeHunters: stepAt(HUNTER_CAP_STEPS, L),
+  };
+  for (const k in TIER_STEPS) def[k] = stepAt(TIER_STEPS[k], L);
+  return def;
+}
+
+// CS017 P3 — the sawtooth debris knobs. RETIRED IN CS018 P3: nextWave() now reads
+// levelDef(game.wave).junkCount, already bounded by the table, so neither clamp below is applied
+// anywhere. Left defined, unread, as documented historical values until P10's retirement sweep.
+const DEBRIS_COUNT_MAX      = 12;   // RETIRED (CS018 P3): in-cycle ceiling on 3 + cycleWave (was the
+                                    // inline literal 9). No readers remain.
+const DEBRIS_COUNT_HARD_MAX = 24;   // RETIRED (CS018 P3): absolute ceiling AFTER the spiral gain. No
+                                    // readers remain.
+const DEBRIS_SPEED_PER_WAVE = 0.08; // RETIRED (CS018 P3): speed multiplier gained per cycle-wave —
+                                    // superseded by junkSpeedMul() (Helpers section) at both
+                                    // derivation sites. No readers remain.
 const DEBRIS_SPEED_CAP = 2 * SHIP_MAX_SPEED; // 1040 px/s. FLAG-CS017-a GUARD RAIL, applied to the RESULTING
                                     // per-entity speed in the DebrisSatellite ctor (never to the multiplier —
                                     // the three sizes have different bases). Insurance, not a live constraint:
-                                    // at the shipped curve the fastest small debris reaches ~341 px/s
-                                    // (160 base x 1.64 top-of-cycle speedMul x 1.3 roll) against a 1040 cap;
-                                    // the cap only starts to bind around cycle 18 (~wave 171).
+                                    // at CS018 P3's tier system the fastest small debris reaches ~267 px/s
+                                    // (160 base x 1.286 "high"-tier junkSpeedMul x 1.3 roll) against a 1040
+                                    // cap — it does not bind at the shipped tiers; insurance against a retune.
 // Saucer spawn gap (sec between saucers): wide early, tightening with difficulty.
 // Re-expresses the old `rand(12,22) - min(6,wave)` as an interpolated rand(min,max) range.
+// RETIRED (CS018 P6): superseded by the UFO MOVEMENT appearance-frequency tier + jitteredInterval() —
+// see ufoAppearInterval(). No readers remain (grep-confirmed).
 const SAUCER_GAP_FLOOR_MIN = 20;  // wave-1 shortest gap between saucers
 const SAUCER_GAP_FLOOR_MAX = 30;  // wave-1 longest gap
 const SAUCER_GAP_CEIL_MIN  = 12;  // full-difficulty shortest gap (≈ shipped v1.1 cadence)
@@ -441,9 +753,13 @@ const SAUCER_GAP_CEIL_MAX  = 16;  // full-difficulty longest gap
 const SAUCER_FIRE_INIT  = [0.6, 1.4]; // delay before a saucer's first shot after entering
 const SAUCER_FIRE_BIG   = [0.9, 1.6]; // big saucer reload (fires randomly)
 const SAUCER_FIRE_SMALL = [0.7, 1.1]; // small saucer reload (fires aimed)
+// RETIRED (CS018 P7): superseded by the UFO WEAPONS fire-frequency tier + ufoFireMult() — see
+// rollFireTimer(). No readers remain (grep-confirmed).
 const SAUCER_FIRE_MULT_FLOOR = 1.8;   // wave-1: fire ~1.8× slower (longer between shots)
 const SAUCER_FIRE_MULT_CEIL  = 1.0;   // full difficulty: shipped cadence
 // Small-saucer aim error (rad): wide barely-aimed spray early, tightening to precise late.
+// RETIRED (CS018 P7): superseded by the UFO WEAPONS accuracy tier + ufoAccuracyRad() — see
+// Saucer.update(). No readers remain (grep-confirmed).
 const SAUCER_AIM_ERR_FLOOR = 0.35;    // wave-1 aim error
 const SAUCER_AIM_ERR_CEIL  = 0.09;    // full-difficulty aim error (shipped precision)
 const SAUCER_ACCURACY_RAMP_SCALE = 0.5;  // <1: saucer aim sharpens slower than the global difficulty
@@ -480,6 +796,11 @@ const POWERUP_DROP_TYPES = ["rapid", "triple", "magnet", "engine", "guard"]; // 
 // Below that threshold the roll renormalises over the other five and is byte-identical to pre-P6.
 // Weight 1 puts it in the existing rare tier alongside magnet/engine — a PLAYTEST KNOB, like the rest.
 const POWERUP_DROP_WEIGHTS = { rapid: 3, triple: 3, scoop: 2, magnet: 1, engine: 1, guard: 1 };
+// CS018 P9: hard ceiling on powerups spawned by ONE Super Mega Delivery — the guaranteed six PLUS
+// every per-piece sweep payout (source doc §7.3: "No more than 48 powerups may spawn simultaneously
+// from a sweep"). A FIXED bound, deliberately NOT a DEBUG_VARS knob — the source doc pins it
+// ("Fixed value, not configurable"). See superMegaDelivery() for the reservation bookkeeping.
+const SWEEP_POWERUP_CAP = 48;
 const POWERUP_HEALTH_GAP = [18, 26]; // sec between ambient Health spawns (saucer-like cadence)
 const POWERUP_HEALTH_AMOUNT = 25;    // +HP on Health pickup, capped at max (matches the F2 milestone repair)
 const POWERUP_HEALTH_MIN_DIST = 220; // ambient Health spawns in a ring this..MAX from the ship (reachable, visible)
@@ -1667,6 +1988,10 @@ const VOICE_LINES = {
     { text: "I'm not sure I can count that high.",
       phon: "AY1 M / N AA1 T / SH UH1 R / AY1 / K AE N / K AW1 N T / DH AE1 T / HH AY1 ." },
   ],
+  dock_24: [
+    { text: "Super Mega Delivery at your service.",
+      phon: "S UW1 P ER / M EH1 G AH / D IH L IH1 V ER IY / AE T / Y ER / S ER1 V IH S ." },
+  ],
   cargo_full: [
     { text: "Truck is full, let's go.",
       phon: "T R AH1 K / IH Z / F UH1 L , L EH1 T S / G OW1 ." },
@@ -2191,10 +2516,40 @@ window.addEventListener("keydown", e => {
         DebugCode.buf = (DebugCode.buf + e.key).slice(-DEBUG_CODE.length);
         if (DebugCode.buf.endsWith(DEBUG_CODE)) {
           DebugCode.armed = false; DebugCode.buf = "";
-          if (game.state === "title") openDebug(); else gotoScreen("debug");
+          enterDebug();   // CS018 P2: was `game.state === "title" ? openDebug() : gotoScreen("debug")` inline
         }
       }
     }
+  }
+
+  // CS018 P2: raw capture for the debug panel's direct numeric entry. menuDebug() only ever sees ABSTRACT
+  // actions, so digits (plus "." / "-" / Backspace) have to be taken here. Gated hard: only on the debug
+  // screen, only with a VALUE row selected, and only while the secret-code window is NOT armed — the code
+  // itself contains a digit ("EvilG3niu$"), so a live capture window keeps first claim on keystrokes and this
+  // hook stands down until it lapses (the block above self-expires on idle in loop()). It sits AFTER that
+  // block for the same reason. ENTER/ESC are deliberately NOT handled here: they stay on the abstract layer
+  // as confirm/back, so gamepad A/B commit and cancel identically. Consumed (preventDefault + return) so
+  // Backspace can't navigate the browser back and a digit can't reach branch (2)/(3).
+  if (game.menu.screen === "debug" && !DebugCode.armed && !game.menu.rebinding && !game.entry && !e.repeat &&
+      debugSelectedVar() && (DEBUG_ENTRY_CHARS.test(e.key) || e.key === "Backspace")) {
+    e.preventDefault();
+    debugEntryKey(e.key);
+    return;
+  }
+
+  // CS021 P3 (FLAG-CS021-c): the start-angle reroll keybind — raw capture, like the numeric-entry block
+  // just above, since it has no button idiom to hang off DEBUG_ROWS (a canvas-drawn, registry-derived
+  // list — "no new row kind, no button machinery" per the spec). Gated the same way debug-panel-only
+  // actions are gated here: debug screen only, no secret-code capture in flight, no rebind/entry pending
+  // — PLUS no numeric entry pending (a stray "r" mid-typed-number must stay inert, not fire a reroll) and
+  // only while an orbit level's layout is actually live (game.orbitLayout — null on a field level or
+  // before any game has started). Documented on the panel footer, drawDebug().
+  if (game.menu.screen === "debug" && !DebugCode.armed && !game.menu.rebinding && !game.entry &&
+      !debugEntryActive() && game.orbitLayout && k === "r") {
+    e.preventDefault();
+    rerollOrbitStartAngles();
+    AudioSys.ui(false);
+    return;
   }
 
   // (1) Rebind capture — exclusive; the key never reaches gameplay or nav.
@@ -2407,6 +2762,21 @@ const TITLE_MENU_HINT   = "↑↓ move    ENTER / A select    ESC / B options";
 const MENU_HINT_SIZE = 16;  // CS013 P2: control-hint footer text size (drawMenuHint) — playtest knob
 const ACH_SCALE = 1.5;      // CS013 P3: Achievements-viewer text-size multiplier (readability pass) — playtest knob
 const ACH_SCROLL_STEP = 60; // CS013 P3: px per up/down scroll press in the Achievements viewer, ~one row — playtest knob
+// CS018 P2: the hidden Debug Options panel's layout + scroll geometry. Before this phase the panel sized
+// itself to the whole registry (`h = 220 + (N + 1) * 46`), which was ALREADY broken at N = 12: 818 px
+// against VIEW_H 720 put both panel edges off-screen and rendered the control hint at y + h - 30 = 739,
+// i.e. below the canvas. CS018 grows the registry to 32 entries (that formula would give 1738 px), so the
+// panel is now a FIXED, viewport-safe height with a scrolling window of rows — the registry can grow again
+// without any layout edit. DEBUG_ROWS_VISIBLE is the one knob: the panel height is DERIVED from it, so the
+// footer can never be pushed off the panel by changing it.
+const DEBUG_PANEL_W      = 660;   // wider than the pre-P2 560 — CS018's tier labels need the label column
+const DEBUG_ROW_STEP     = 32;    // px between row baselines (was 46) — tighter, so more rows fit the window
+const DEBUG_ROWS_VISIBLE = 14;    // rows drawn at once; everything else scrolls
+const DEBUG_ROWS_Y       = 100;   // first row baseline band, offset from the panel top (below the title)
+const DEBUG_FOOTER_H     = 92;    // room below the row band for the position indicator + the control hint
+const DEBUG_PANEL_H      = DEBUG_ROWS_Y + DEBUG_ROWS_VISIBLE * DEBUG_ROW_STEP + DEBUG_FOOTER_H; // 640 <= VIEW_H
+const DEBUG_VALUE_X      = 420;   // value column, offset from the panel's left edge
+const DEBUG_ENTRY_MAXLEN = 8;     // characters a typed numeric entry may accrete (guards a held/pasted key)
 // CS016 P5: the viewer's two tabs replace the old three columns. The default tab id lives up here
 // (not beside ACH_TABS down in the viewer section) because game.menu's object literals — evaluated
 // long before the viewer's consts — need it, and a `const` referenced ahead of its definition is a
@@ -2485,7 +2855,17 @@ const settings = {
 // shows/persists) into the native unit the consumer reads (identity when absent). P4 shipped exactly
 // one entry (item 5); P5 (items 7, 11, 12) adds four more entries only — no panel/persistence code
 // changes; P6 does the same.
+//
+// CS018 P2 (FLAG-j): the registry is also the panel's ROW ORDER, and an entry may now be a non-selectable
+// SECTION HEADER — `{ header: "JUNK" }` — instead of a value. A header has no `id`/`def`, so every loop
+// over VALUES goes through DEBUG_ENTRIES (below), never DEBUG_VARS directly; up/down skip headers so one can
+// never become the selection. Headers are pure grouping: they carry no state and nothing persists for them.
+// CS018 P3/P6/P7: the old "SAUCER PRESSURE" header and its three pressure knobs (saucerGapPressure,
+// saucerPressureSecs, saucerAimPressure) are fully retired now — replaced by the JUNK / UFO MOVEMENT /
+// UFO WEAPONS / GLOBAL headers those phases added. A header left with no entries under it renders as a
+// stray label, which is why it was deleted along with its last two knobs rather than left empty.
 const DEBUG_VARS = [
+  { header: "SHIP" },
   { id: "autoShieldRegenPause", label: "Auto Shield Regen Pause", unit: "ms",
     def: AUTO_SHIELD_REGEN_PAUSE * 1000, min: 0, max: 5000, step: 100, toNative: v => v / 1000 },
   // CS015 P5 (items 7, 11, 12): four more knobs, same registry/toNative idiom — defaults derive from
@@ -2493,6 +2873,7 @@ const DEBUG_VARS = [
   // stay in place as the documented shipped values. No panel/persistence code changes.
   { id: "scoopHitsPerLevel", label: "Hits before losing scoop", unit: "",
     def: SCOOP_HITS_PER_LEVEL, min: 1, max: 20, step: 1 },
+  { header: "GARBAGE" },
   { id: "garbageAttractDelay", label: "Garbage attraction delay", unit: "ms",
     def: GARBAGE_COALESCE_DELAY * 1000, min: 0, max: 10000, step: 250, toNative: v => v / 1000 },
   { id: "garbageAttractRadius", label: "Garbage attraction radius", unit: "px",
@@ -2504,36 +2885,184 @@ const DEBUG_VARS = [
   // stays in place as the documented pre-P6 shipped value; this knob is the live source of truth now.
   { id: "garbageLifetime", label: "Garbage lifetime", unit: "s",
     def: 10, min: 1, max: 60, step: 1 },
-  // CS017 P4: the time-in-level saucer pressure axis (FORK-CS017-B -> (b) COMPOSE). saucerPressureSecs
-  // is how long a level takes to reach full pressure; the two *Pressure knobs scale how much of the
-  // FLOOR..CEIL gap that pressure closes (0 disables the axis entirely, reproducing pre-P4 behaviour).
-  { id: "saucerPressureSecs", label: "Saucer pressure ramp time", unit: "s",
-    def: 90, min: 10, max: 300, step: 5 },
-  { id: "saucerAimPressure", label: "Saucer aim pressure scale", unit: "",
-    def: 0.5, min: 0, max: 1, step: 0.05 },
-  { id: "saucerGapPressure", label: "Saucer gap pressure scale", unit: "",
-    def: 0.5, min: 0, max: 1, step: 0.05 },
-  // CS017 P6: the chain-guard powerup's three knobs. chainGuardTime is powerDuration("guard") in TIME
-  // mode; chainGuardIntercepts is the seeded powerBudget in COUNT mode (see powerBudgetAmount); both are
-  // live values, NOT frozen consts, so the registry entry IS the source of truth for each default.
-  // chainGuardMinTow is the drop gate — "guard" only enters the dropPowerup roll while the player is
-  // towing at least this many nodes. 0 makes it always-eligible (the un-gated roll), which is the useful
-  // dev setting for exercising the powerup without first building a load.
+  // CS017 P6 (+ CS019 P1): the chain-guard powerup's four knobs. chainGuardTime is powerDuration("guard")
+  // in TIME mode; chainGuardIntercepts is the seeded powerBudget in COUNT mode (see powerBudgetAmount);
+  // both are live values, NOT frozen consts, so the registry entry IS the source of truth for each
+  // default. chainGuardMinTow is the drop gate — "guard" only enters the dropPowerup roll while the
+  // player is towing at least this many nodes. 0 makes it always-eligible (the un-gated roll), which is
+  // the useful dev setting for exercising the powerup without first building a load.
+  //   CS019 P1: chainGuardCooldown is the ABSORB cooldown — how long an absorbed break stamps the SOURCE
+  // hazard's guardT, during which the hazards-vs-chain scan skips it (while the guard is up, and only
+  // while it is up). Before this knob existed a body that stayed overlapping a guarded node re-presented
+  // the same contact every frame, so a default 3-intercept budget burned in 3 frames. 0.75 s covers a
+  // medium-debris pass-through (~0.5 s) as ONE event while still billing a genuinely new approach
+  // seconds later. Its 0.05 step is finer than any sibling's but needs no special handling: the panel's
+  // +/- arithmetic is plain float addition clamped to [min,max], and typed entry is parseFloat.
+  { header: "CHAIN GUARD" },
   { id: "chainGuardTime", label: "Chain guard duration", unit: "s",
     def: 30, min: 5, max: 120, step: 5 },
   { id: "chainGuardIntercepts", label: "Chain guard intercepts", unit: "",
     def: 3, min: 1, max: 10, step: 1 },
   { id: "chainGuardMinTow", label: "Chain guard min tow", unit: "",
     def: 5, min: 0, max: 24, step: 1 },
+  { id: "chainGuardCooldown", label: "Chain guard cooldown", unit: "s",
+    def: 0.75, min: 0.1, max: 3, step: 0.05 },
+  // CS020 P1b: the delivery combo's one-effort grace window — how long a delivery run survives while
+  // the ship is outside the dock's neighborhood. Same `unit: "ms"` + `toNative: v => v / 1000` idiom
+  // as autoShieldRegenPause / garbageAttractDelay: the panel shows and persists milliseconds, the
+  // consumer (the dock block's grace gate) reads seconds. DOCK_COMBO_GRACE stays in place as the
+  // documented shipped value and this `def` derives from it, so the two can never disagree.
+  // Its own section header, chain-adjacent, with room for future delivery knobs.
+  { header: "DELIVERY" },
+  { id: "dockComboGrace", label: "Delivery one-effort window", unit: "ms",
+    def: DOCK_COMBO_GRACE * 1000, min: 0, max: 10000, step: 100, toNative: v => v / 1000 },
+  // CS018 P3: junk (debris) satellite speed, by TIER (§3.1) — levelDef's junkSpeed tier name selects
+  // one of these three, and junkSpeedMul() (Helpers section) turns the pick into the DEBRIS_SPEEDS[3]
+  // multiplier the two speed-derivation sites (nextWave, destroyDebris) share. normal (70) IS
+  // DEBRIS_SPEEDS[3] — the single source of truth for that default.
+  { header: "JUNK" },
+  { id: "junkSpeedLow", label: "Junk speed (low)", unit: "px/s",
+    def: 58, min: 20, max: 400, step: 2 },
+  { id: "junkSpeedNormal", label: "Junk speed (normal)", unit: "px/s",
+    def: 70, min: 20, max: 400, step: 2 },
+  { id: "junkSpeedHigh", label: "Junk speed (high)", unit: "px/s",
+    def: 90, min: 20, max: 400, step: 2 },
+  // CS018 P6: UFO movement, by TIER (§3.1) — levelDef's three movement tier names each select one of
+  // these knobs; ufoFlightSpeedPx()/ufoAppearInterval()/ufoZigInterval() (Helpers section) turn the
+  // pick into the value the Saucer ctor/update() and the spawn block consume. Appearance and
+  // direction-change frequency are two of the four INVERTED levers (§3.1) — high holds the SMALLER
+  // number; do not add a low<=normal<=high validator. normal anchors (150 / 18 / 1.3) are the shipped
+  // pre-CS018 values — the single source of truth for those defaults.
+  { header: "UFO MOVEMENT" },
+  { id: "ufoFlightSpeedLow", label: "UFO flight speed (low)", unit: "px/s",
+    def: 120, min: 20, max: 600, step: 2 },
+  { id: "ufoFlightSpeedNormal", label: "UFO flight speed (normal)", unit: "px/s",
+    def: 150, min: 20, max: 600, step: 2 },
+  { id: "ufoFlightSpeedHigh", label: "UFO flight speed (high)", unit: "px/s",
+    def: 190, min: 20, max: 600, step: 2 },
+  { id: "ufoAppearFreqLow", label: "UFO appearance frequency (low)", unit: "s",
+    def: 25, min: 1, max: 60, step: 1 },
+  { id: "ufoAppearFreqNormal", label: "UFO appearance frequency (normal)", unit: "s",
+    def: 18, min: 1, max: 60, step: 1 },
+  { id: "ufoAppearFreqHigh", label: "UFO appearance frequency (high)", unit: "s",
+    def: 13, min: 1, max: 60, step: 1 },
+  { id: "ufoDirChangeFreqLow", label: "UFO direction change frequency (low)", unit: "s",
+    def: 2.0, min: 0.1, max: 10, step: 0.1 },
+  { id: "ufoDirChangeFreqNormal", label: "UFO direction change frequency (normal)", unit: "s",
+    def: 1.3, min: 0.1, max: 10, step: 0.1 },
+  { id: "ufoDirChangeFreqHigh", label: "UFO direction change frequency (high)", unit: "s",
+    def: 0.8, min: 0.1, max: 10, step: 0.1 },
+  // CS018 P7: UFO weapons, by TIER (§3.1) — the last three of the four INVERTED levers (§3.1, alongside
+  // UFO MOVEMENT's appearance/direction-change pair): all three DESCEND as difficulty rises, so high
+  // holds the SMALLEST number for every field here. ufoFireMult()/ufoAccuracyRad()/ufoShotSpeedPx()
+  // (Helpers section) turn a tier name into the value rollFireTimer()/Saucer.update() consume. Fire
+  // frequency is a MULTIPLIER on the shipped SAUCER_FIRE_BIG/SAUCER_FIRE_SMALL ranges (FLAG-d) — the
+  // build has two per-size ranges a single seconds-centre can't represent — not a jittered interval, so
+  // it deliberately does NOT go through jitteredInterval(). Accuracy is entered in DEGREES (0 = perfectly
+  // accurate) and converted to radians at the call site. normal anchors (1.0x / 20° / 380 px/s) are the
+  // shipped pre-CS018 values — the single source of truth for those defaults.
+  { header: "UFO WEAPONS" },
+  { id: "ufoFireFreqLow", label: "UFO firing frequency (low)", unit: "x",
+    def: 1.8, min: 0.1, max: 4, step: 0.1 },
+  { id: "ufoFireFreqNormal", label: "UFO firing frequency (normal)", unit: "x",
+    def: 1.0, min: 0.1, max: 4, step: 0.1 },
+  { id: "ufoFireFreqHigh", label: "UFO firing frequency (high)", unit: "x",
+    def: 0.7, min: 0.1, max: 4, step: 0.1 },
+  { id: "ufoAccuracyLow", label: "UFO shot accuracy (low)", unit: "deg",
+    def: 30, min: 0, max: 60, step: 5 },
+  { id: "ufoAccuracyNormal", label: "UFO shot accuracy (normal)", unit: "deg",
+    def: 20, min: 0, max: 60, step: 5 },
+  { id: "ufoAccuracyHigh", label: "UFO shot accuracy (high)", unit: "deg",
+    def: 10, min: 0, max: 60, step: 5 },
+  { id: "ufoShotSpeedLow", label: "UFO shot speed (low)", unit: "px/s",
+    def: 300, min: 50, max: 1200, step: 2 },
+  { id: "ufoShotSpeedNormal", label: "UFO shot speed (normal)", unit: "px/s",
+    def: 380, min: 50, max: 1200, step: 2 },
+  { id: "ufoShotSpeedHigh", label: "UFO shot speed (high)", unit: "px/s",
+    def: 470, min: 50, max: 1200, step: 2 },
+  // CS018 P6: GLOBAL fields — not per-lever tiers. freqJitter scales every frequency-shaped lever
+  // (appearance + direction-change here). UFO firing frequency does NOT join it (FLAG-d, above) — it's a
+  // multiplier on fixed per-size ranges, not a jittered interval, so it stays outside this knob's reach.
+  // sweepCoalescePause is consumed by the Super Mega Delivery (CS018 P9): superMegaDelivery() copies it
+  // into game.sweepPause, and the coalesceGarbage(dt) call site in update() ticks + honours the pause.
+  { header: "GLOBAL" },
+  { id: "freqJitter", label: "Frequency jitter", unit: "%",
+    def: 25, min: 0, max: 90, step: 5 },
+  { id: "sweepCoalescePause", label: "Coalescence pause after sweep", unit: "s",
+    def: 10, min: 0, max: 60, step: 1 },
+  // CS021 P3 (spec §6): the orbit-level archetype's ten live knobs. Every def derives from the ORBIT_*
+  // consts (P1/P2) — never a duplicated literal — so the panel and the shipped geometry can't disagree.
+  // orbitGapMult OVERRIDES the occurrence-scaled curve (orbitGapMult(level), CS021 P2) only while it has
+  // been moved off its own default — see orbitEffectiveGapMult() below; left untouched, every orbit level
+  // still gets its own occurrence-scaled value, not a level-3-forever freeze. orbitCount carries a
+  // `clampShown` hook (the one addition to the generic registry idiom this phase makes, applyDebug()
+  // below) so a requested 5 — ungeometry-fittable at size-3, FLAG-CS021-a — collapses to the achievable
+  // 4 EVERYWHERE at once: what's stored, what's persisted, and what the panel shows, never a silent
+  // mismatch between the slider and the level that actually spawns. orbitDensity1-5 are consumed
+  // first-orbitCount (FLAG-CS021-b); orbitDensity5 has no shipped 5th-ring value to derive from (the
+  // geometry never reaches 5 rings at size-3), so it mirrors ring 4's climax density rather than
+  // inventing a new number. orbitAngVel is the one DEGREES/SECOND knob, following the unit:"ms" +
+  // toNative precedent (autoShieldRegenPause et al.) rather than exposing raw radians.
+  { header: "ORBIT" },
+  { id: "orbitGapMult", label: "Orbit gap multiplier", unit: "",
+    def: ORBIT_GAP_MULT, min: 1.5, max: 4.0, step: 0.05 },
+  { id: "orbitSafetyMargin", label: "Orbit safety margin", unit: "px",
+    def: ORBIT_SAFETY_MARGIN, min: 0, max: 32, step: 2 },
+  { id: "orbitCount", label: "Orbit ring count", unit: "",
+    def: ORBIT_RING_COUNT, min: 3, max: 5, step: 1, clampShown: v => orbitEffectiveCount(v) },
+  { id: "orbitDensity1", label: "Ring 1 density", unit: "",
+    def: ORBIT_DENSITY[0], min: 0, max: 1, step: 0.05 },
+  { id: "orbitDensity2", label: "Ring 2 density", unit: "",
+    def: ORBIT_DENSITY[1], min: 0, max: 1, step: 0.05 },
+  { id: "orbitDensity3", label: "Ring 3 density", unit: "",
+    def: ORBIT_DENSITY[2], min: 0, max: 1, step: 0.05 },
+  { id: "orbitDensity4", label: "Ring 4 density", unit: "",
+    def: ORBIT_DENSITY[3], min: 0, max: 1, step: 0.05 },
+  { id: "orbitDensity5", label: "Ring 5 density", unit: "",
+    def: ORBIT_DENSITY[3], min: 0, max: 1, step: 0.05 },
+  { id: "orbitAngVel", label: "Orbit angular velocity", unit: "°/s",
+    def: ORBIT_ANG_VEL * 180 / Math.PI, min: 0, max: 60, step: 0.5, toNative: v => v * Math.PI / 180 },
+  { id: "orbitFastMult", label: "Fast-ring multiplier", unit: "x",
+    def: ORBIT_FAST_MULT, min: 1.0, max: 6.0, step: 0.1 },
 ];
+// CS018 P2: the registry's VALUE entries, with the section headers filtered out. Every loop that wants
+// "each knob" (the startup seed below, loadSettings' per-entry validation) goes through this — a header has
+// no `id`/`def`/`min`/`max`, so iterating DEBUG_VARS directly would seed `debugShown[undefined]`.
+const DEBUG_ENTRIES = DEBUG_VARS.filter(v => !v.header);
+// CS018 P2: the panel's ROW MODEL, derived from the registry — never a hardcoded count or offset. Each
+// registry entry becomes one row (a header row or a value row carrying its entry), and the two trailing rows
+// (the CS017 P2 "Dump difficulty log" action and Back) are APPENDED HERE rather than special-cased in the
+// handler and the renderer. That's what keeps them reachable at any registry size: they scroll with
+// everything else, and both menuDebug and drawDebug read row `kind` instead of comparing against
+// DEBUG_VARS.length. `game.menu.index` indexes THIS array, not DEBUG_VARS.
+const DEBUG_ROWS = [
+  ...DEBUG_VARS.map(v => v.header ? { kind: "header", label: v.header } : { kind: "var", label: v.label, e: v }),
+  { kind: "action", label: "Dump difficulty log" },
+  { kind: "back",   label: "Back" },
+];
+// CS018 P2: the panel's transient VIEW state — the scroll window's top row and the pending numeric-entry
+// buffer (`null` = not typing; a string = the digits typed so far, not yet committed). Module-level beside
+// DebugCode rather than fields on game.menu ON PURPOSE: game.menu is written from two literals (its own and
+// startGame's reset), and a field added to only one of them reads `undefined` for a whole run — see the
+// standing note at startGame's reset. This state belongs to one hidden screen with exactly one entry point
+// (enterDebug), which is the single place it resets.
+const DebugPanel = { scroll: 0, entry: null };
 const DEBUG = {};        // native-unit live values — what consumers read (e.g. seconds for the regen lock)
 const debugShown = {};   // display-unit values — what the panel shows and what persists in afd_settings_v1.debug
+// CS021 P3: `clampShown` is the one new registry hook this phase adds, alongside `toNative` — an entry
+// may collapse the requested display value to an achievable one BEFORE it is stored, so `debugShown`
+// (what's shown AND what's persisted) can never disagree with what actually gets used. Every entry
+// without one (all 34 pre-CS021 knobs, and 9 of these 10) is unaffected: `e.clampShown` is undefined,
+// so `shown` passes through unchanged, byte-identical to the pre-P3 function. Only `orbitCount` supplies
+// one (FLAG-CS021-a): a requested 5 collapses to the geometry-fittable 4 right here, so the slider, the
+// save file, and the level that actually spawns can never show three different numbers.
 function applyDebug(id, shown) {
-  const e = DEBUG_VARS.find(v => v.id === id);
-  debugShown[id] = shown;
-  DEBUG[id] = e.toNative ? e.toNative(shown) : shown;
+  const e = DEBUG_ENTRIES.find(v => v.id === id);
+  const clamped = e.clampShown ? e.clampShown(shown) : shown;
+  debugShown[id] = clamped;
+  DEBUG[id] = e.toNative ? e.toNative(clamped) : clamped;
 }
-for (const v of DEBUG_VARS) applyDebug(v.id, v.def);   // seed both maps from the registry defaults
+for (const v of DEBUG_ENTRIES) applyDebug(v.id, v.def);   // seed both maps from the registry defaults
 
 // Secret-code entry state for the debug panel (module-level; driven by the keydown listener + loop()).
 // The backtick ARMS a capture window; subsequent single-char keys accrete into `buf` until its tail
@@ -2548,45 +3077,63 @@ const DebugCode = { armed: false, buf: "", last: 0 };
 // ---------- Dev-only difficulty logging (CS017 P2) — nothing player-visible, nothing persisted ----------
 // One snapshot row per nextWave() call, kept only in memory (never touches localStorage) and exported by
 // hand from the DEBUG_CODE-gated debug panel below. DIFFLOG_FIELDS is the single source of truth for both
-// the row shape (logDifficultySnapshot) and the CSV column order (difficultyLogCSV) — the field list is
-// frozen by IMPLEMENTATION-PHASES-CS017.md P2 and must not change; only the expressions feeding each field
-// may be repointed as later phases (P3/P4) wire the levers for real.
+// the row shape (logDifficultySnapshot) and the CSV column order (difficultyLogCSV).
+// CS018 P4 CHANGED THE FIELD LIST — deliberately, and it supersedes CS017 P2's "the field list is frozen"
+// rule, which was written when the cycle clock was the thing being observed. Four columns described
+// machinery that no longer exists (`cycle`, `cycleWave`, `hunterSpeedFrac`, `hunterTurnFrac`: the clock is
+// retired and Hunter speed/turn are now frozen constants, so those two would log a fixed 0.58 forever).
+// They are replaced by what the level table actually decides. Later phases may repoint the expressions
+// feeding a column; changing the LIST itself needs a reason as concrete as this one.
 const DIFFLOG_MAX = 2000; // cap so a long dev session can't grow the buffer without bound; drops oldest
 const DiffLog = { rows: [] };
 const DIFFLOG_FIELDS = [
-  "t", "wave", "cycle", "cycleWave", "score",
-  "debrisCount", "debrisSpeedMul", "hunterSpeedFrac", "hunterTurnFrac",
+  "t", "level", "phase", "rel", "score", "prevLevelSecs",
+  "junkCount", "junkSpeedMul", "maxLargeHunters", "hunterCount",
+  "junkSpeed", "ufoAppearFreq", "ufoFlightSpeed", "ufoDirChangeFreq",
+  "ufoFireFreq", "ufoAccuracy", "ufoShotSpeed",
   "saucerAimErr", "saucerGapMin", "saucerGapMax",
-  "hunterCount", "chainLen", "cargoMax", "scoopLevel",
+  "chainLen", "cargoMax", "scoopLevel",
 ];
 // Snapshots read every lever from the SAME expressions the live sites use — never a re-derived formula.
-// debrisCount/debrisSpeedMul are passed in verbatim from nextWave()'s own `count`/`speedMul` locals (the
-// exact values that wave's DebrisSatellite spawns just used). hunterSpeedFrac/hunterTurnFrac are today
-// IDENTICAL — both HunterSatellite's speed and turnRate ramp from the same HUNTER_FLOOR_FRAC floor up to
-// their own per-tier ceiling (see the ctor), so the ceiling cancels out of the ratio and both reduce to
-// this one fraction; logged as two fields (not one) because P4 may give them independent curves later.
-// CS017 P3 REPOINTED both to the cycle-wave sawtooth + cycleValue() spiral the HunterSatellite ctor now
-// samples — the field list is frozen, but what feeds it tracks the live sites (see the header note above).
-// Note these two can now exceed 1: they are a fraction OF THE CEILING, and the spiral term deliberately
-// carries deep cycles past it. saucerAimErr/saucerGapMin/saucerGapMax mirror the exact ramp() calls at the
-// saucer aim and spawn-gap sites (there is no cached variable to read at nextWave() time) — those are
-// FROZEN levers and still sample the absolute game.wave, which is exactly what makes this log able to
-// show the sawtooth/monotonic asymmetry side by side.
-function logDifficultySnapshot(debrisCount, debrisSpeedMul) {
+// junkCount/junkSpeedMul are passed in verbatim from nextWave()'s own `count`/`speedMul` locals (the exact
+// values that level's DebrisSatellite spawns just used). level/phase/rel/maxLargeHunters and the seven
+// tier names come from ONE levelDef(game.wave) call, so a row can never disagree with itself about which
+// level it describes. The seven tier columns log the TIER NAME ("low"/"normal"/"high"), which is what the
+// table decides; the px/s or seconds behind a name is a DEBUG_VARS knob and is not per-level data.
+// prevLevelSecs is game.waveTime captured by nextWave() BEFORE the reset — how long the level that just
+// ended took (FLAG-k, the field's only reader now that wavePressure() is retired).
+// saucerAimErr mirrors the exact ufoAccuracyRad() call at the saucer aim site (there is no cached
+// variable to read at nextWave() time) — REPOINTED in P7 from the retired ramp()+wavePressure() mirror
+// to the tier-derived one, following this column with its consumer rather than leaving it stale.
+// saucerGapMin/saucerGapMax were REPOINTED in P6 (not deleted): they now log the jittered-interval bounds
+// — center*(1 - freqJitter/100) / center*(1 + freqJitter/100) around the ufoAppearFreq tier centre — the
+// same "where the actual sampled timer can land" meaning the old ramp()-based gapMin/gapMax pair had.
+function logDifficultySnapshot(junkCount, junkSpeedMul, prevLevelSecs) {
+  const def = levelDef(game.wave);
+  const appearCenter = def.ufoAppearFreq === "low" ? DEBUG.ufoAppearFreqLow
+    : def.ufoAppearFreq === "high" ? DEBUG.ufoAppearFreqHigh : DEBUG.ufoAppearFreqNormal;
+  const appearJitter = DEBUG.freqJitter / 100;
   DiffLog.rows.push({
     t: performance.now(),
-    wave: game.wave,
-    cycle: game.cycle,
-    cycleWave: game.cycleWave,
+    level: def.level,
+    phase: def.phase,
+    rel: def.rel,
     score: game.score,
-    debrisCount,
-    debrisSpeedMul,
-    hunterSpeedFrac: cycleValue(ramp(HUNTER_FLOOR_FRAC, 1, game.cycleWave), game.cycle),
-    hunterTurnFrac: cycleValue(ramp(HUNTER_FLOOR_FRAC, 1, game.cycleWave), game.cycle),
-    saucerAimErr: ramp(SAUCER_AIM_ERR_FLOOR, SAUCER_AIM_ERR_CEIL, 1 + (game.wave - 1) * SAUCER_ACCURACY_RAMP_SCALE),
-    saucerGapMin: ramp(SAUCER_GAP_FLOOR_MIN, SAUCER_GAP_CEIL_MIN, game.wave),
-    saucerGapMax: ramp(SAUCER_GAP_FLOOR_MAX, SAUCER_GAP_CEIL_MAX, game.wave),
+    prevLevelSecs,
+    junkCount,
+    junkSpeedMul,
+    maxLargeHunters: def.maxLargeHunters,
     hunterCount: game.hunters.length, // FLAG-CS017-g: seeds the future music-intensity changeset
+    junkSpeed: def.junkSpeed,
+    ufoAppearFreq: def.ufoAppearFreq,
+    ufoFlightSpeed: def.ufoFlightSpeed,
+    ufoDirChangeFreq: def.ufoDirChangeFreq,
+    ufoFireFreq: def.ufoFireFreq,
+    ufoAccuracy: def.ufoAccuracy,
+    ufoShotSpeed: def.ufoShotSpeed,
+    saucerAimErr: ufoAccuracyRad(), // CS018 P7: tiered, was ramp(SAUCER_AIM_ERR_FLOOR, SAUCER_AIM_ERR_CEIL, ...)
+    saucerGapMin: appearCenter * (1 - appearJitter),
+    saucerGapMax: appearCenter * (1 + appearJitter),
     chainLen: game.chain.length,
     cargoMax: game.cargoMax,
     scoopLevel: game.scoopLevel,
@@ -2719,6 +3266,16 @@ function openDebug() {
   game.menu.rebinding = null; game.menu.modal = null;
   resetMenuNav();          // a direction held while typing the code must not fire a phantom first move
   AudioSys.ui(true);
+}
+// CS018 P2: the ONE entry point into the hidden panel — both secret-code routes (title and paused game) come
+// through here, so the panel's view state resets and the cursor lands on the first SELECTABLE row in a single
+// place. Row 0 is a section header now, so neither openDebug's nor gotoScreen's `index = 0` is a valid cursor
+// on its own; debugFirstRow() is applied after whichever route ran. openDebug keeps its own job (the
+// paused-from-title chrome) untouched.
+function enterDebug() {
+  DebugPanel.scroll = 0; DebugPanel.entry = null;
+  if (game.state === "title") openDebug(); else gotoScreen("debug");
+  game.menu.index = debugFirstRow();
 }
 
 // --- CS016 P3: modal confirmation dialogs ---
@@ -2986,22 +3543,110 @@ function menuDifficulty(a) {
   else if (a === "pause") closePause();
 }
 
-// Hidden Debug Options panel handler (CS015 P4). Generic over DEBUG_VARS: N value rows, then a trailing
-// "Dump difficulty log" ACTION row (CS017 P2 — no value, no chevrons, left/right is a no-op on it same as
-// Back), then Back. up/down move the cursor; left/right adjust the focused var by its step (clamped
-// [min,max]) then applyDebug + persist immediately; confirm on the dump row triggers dumpDifficultyLog(),
-// confirm on Back — or back anywhere — returns to context. Reached only by the secret code (see the
-// keydown listener), so there is no "Debug" menu row to restore the cursor to on return: debugReturn
-// mirrors menuOptions' routing and lands on the always-present Options row when a root exists. Adding a
-// debug var later touches nothing here — the registry drives the row count (CS015 P5 lesson: derive
-// dumpRow/backRow from DEBUG_VARS.length, never a literal).
+// --- CS018 P2: the debug panel's row model, scroll window and direct numeric entry ---
+// Every index below is DERIVED from DEBUG_ROWS (which is itself derived from the registry). There is no
+// literal row count, no "dumpRow = N" offset and no assumption that m.index maps onto DEBUG_VARS — that
+// mapping is exactly what section headers break, and it is what CS015 P5's "derive the index" lesson was
+// about in the first place. The registry can grow to 32 entries with headers interleaved and none of this
+// needs an edit.
+function debugFirstRow() { return DEBUG_ROWS.findIndex(r => r.kind !== "header"); }
+// The registry entry under the cursor, or null when the cursor is on a header / Dump / Back. The one place
+// "is a value row selected?" is answered — the keydown numeric-entry gate, the ◄► step and the renderer all
+// ask through it.
+function debugSelectedVar() {
+  const r = DEBUG_ROWS[game.menu.index];
+  return r && r.kind === "var" ? r.e : null;
+}
+// The next SELECTABLE row in `dir`, wrapping. Headers are skipped entirely (FLAG-j) so one can never become
+// the selection — including on the wrap from the last row back to the first, and vice versa. Walks at most
+// one full lap, so an all-headers registry (impossible: Dump and Back are always appended) returns `from`.
+function debugStep(from, dir) {
+  const n = DEBUG_ROWS.length;
+  for (let k = 1; k <= n; k++) {
+    const i = ((from + dir * k) % n + n) % n;
+    if (DEBUG_ROWS[i].kind !== "header") return i;
+  }
+  return from;
+}
+// The scroll window's top row. RECOMPUTED from the selection on every nav press and every draw rather than
+// nudged incrementally, so the window can never drift out of sync with the cursor: the selected row is
+// always inside [top, top + DEBUG_ROWS_VISIBLE), scrolling both directions and across the last→first wrap.
+function debugScrollTop() {
+  const max = Math.max(0, DEBUG_ROWS.length - DEBUG_ROWS_VISIBLE);
+  const i = game.menu.index;
+  let t = Math.max(0, Math.min(max, DebugPanel.scroll));
+  if (i < t) t = i;                                              // scrolled past the cursor going up
+  else if (i >= t + DEBUG_ROWS_VISIBLE) t = i - DEBUG_ROWS_VISIBLE + 1;   // ...or going down
+  // Pull a section header into view with the row it labels: without this, arriving on the first value under
+  // a header leaves that header one row above the window and the value reads as uncategorised.
+  if (t > 0 && i === t && DEBUG_ROWS[t - 1].kind === "header") t--;
+  DebugPanel.scroll = Math.max(0, Math.min(max, t));
+  return DebugPanel.scroll;
+}
+
+// Direct numeric entry. menuDebug() is fed ABSTRACT actions (up/down/left/right/confirm/back), so the digits
+// themselves are captured raw in the keydown listener and funnelled into debugEntryKey; commit and cancel
+// stay on the abstract layer (menuDebug's confirm/back) so gamepad A/B behave exactly like ENTER/ESC.
+const DEBUG_ENTRY_CHARS = /^[-.0-9]$/;
+function debugEntryActive() { return DebugPanel.entry !== null; }
+function debugEntryKey(key) {
+  const e = debugSelectedVar();
+  if (!e) return;                          // nothing typeable under the cursor (header / Dump / Back)
+  const cur = DebugPanel.entry === null ? "" : DebugPanel.entry;
+  let b = cur;
+  if (key === "Backspace") b = cur.slice(0, -1);
+  else if (key === "-") b = cur.startsWith("-") ? cur.slice(1) : "-" + cur;  // sign TOGGLE, usable mid-number
+  else if (key === ".") { if (!cur.includes(".")) b = cur + "."; }           // at most one decimal point
+  else b = cur + key;
+  if (b.length > DEBUG_ENTRY_MAXLEN) return;   // drop the keystroke rather than truncate someone's number
+  DebugPanel.entry = b;
+  AudioSys.ui(false);
+}
+// Commits through the SAME applyDebug + saveSettings path as ◄► stepping — one write path, one persistence
+// path, display units into afd_settings_v1.debug exactly as before. Clamped to the entry's own [min,max].
+// Deliberately does NOT snap to `step` (a typed value is an exact request, which is the point of typing it)
+// and deliberately performs NO cross-field comparison: CS018 ships four levers whose values DECREASE as
+// difficulty rises, so any low <= normal <= high check here would reject valid configuration.
+function debugEntryCommit() {
+  const e = debugSelectedVar(), raw = DebugPanel.entry;
+  DebugPanel.entry = null;
+  if (!e || raw === null) return;
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n)) { AudioSys.ui(false); return; }   // "", "-", "." — nothing typed; treat as cancel
+  applyDebug(e.id, Math.max(e.min, Math.min(e.max, n)));
+  saveSettings();
+  AudioSys.ui(true);
+}
+function debugEntryCancel() { DebugPanel.entry = null; AudioSys.ui(false); }
+
+// Hidden Debug Options panel handler (CS015 P4). Generic over DEBUG_ROWS: header rows (skipped by up/down),
+// value rows, then a trailing "Dump difficulty log" ACTION row (CS017 P2 — no value, no chevrons, left/right
+// is a no-op on it same as Back), then Back. up/down move the cursor; left/right adjust the focused var by
+// its step (clamped [min,max]) then applyDebug + persist immediately; confirm on the dump row triggers
+// dumpDifficultyLog(), confirm on Back — or back anywhere — returns to context. Reached only by the secret
+// code (see the keydown listener), so there is no "Debug" menu row to restore the cursor to on return:
+// debugReturn mirrors menuOptions' routing and lands on the always-present Options row when a root exists.
+// Adding a debug var later touches nothing here — the registry drives the rows.
 function menuDebug(a) {
-  const m = game.menu, N = DEBUG_VARS.length, dumpRow = N, backRow = N + 1, ROWS = N + 2;
-  if (a === "up")   { m.index = (m.index + ROWS - 1) % ROWS; AudioSys.ui(false); }
-  else if (a === "down") { m.index = (m.index + 1) % ROWS; AudioSys.ui(false); }
+  const m = game.menu;
+  // CS018 P2: a pending numeric entry OWNS the row. left/right must not step (a stray nudge would silently
+  // discard the digits and change the value anyway) and back must not leave the screen — ESC / B cancel the
+  // entry instead, which IS the "Escape cancels" contract. `pause` is treated as a leave too, for the same
+  // reason. up/down abandon the entry, since a half-typed value belongs to the row it was typed on.
+  if (debugEntryActive()) {
+    if (a === "confirm") { debugEntryCommit(); return; }
+    if (a === "back" || a === "pause") { debugEntryCancel(); return; }
+    if (a === "left" || a === "right") return;
+    if (a === "up" || a === "down") debugEntryCancel();
+  }
+  if (a === "up" || a === "down") {
+    m.index = debugStep(m.index, a === "up" ? -1 : 1);
+    debugScrollTop();
+    AudioSys.ui(false);
+  }
   else if (a === "left" || a === "right") {
-    if (m.index < N) { // a value row (not the dump action or Back)
-      const e = DEBUG_VARS[m.index];
+    const e = debugSelectedVar();   // null on a header / the dump action / Back — left/right is a no-op there
+    if (e) {
       const next = Math.max(e.min, Math.min(e.max, debugShown[e.id] + (a === "right" ? e.step : -e.step)));
       applyDebug(e.id, next);
       saveSettings();
@@ -3009,8 +3654,9 @@ function menuDebug(a) {
     }
   }
   else if (a === "confirm") {
-    if (m.index === dumpRow) dumpDifficultyLog();
-    else if (m.index === backRow) debugReturn();
+    const r = DEBUG_ROWS[m.index];
+    if (r && r.kind === "action") dumpDifficultyLog();
+    else if (r && r.kind === "back") debugReturn();
   }
   else if (a === "back") debugReturn();
   else if (a === "pause") closePause();
@@ -3175,8 +3821,10 @@ function loadSettings() {
     // CS015 P4: debug variables persist as an additive sub-object (display units; no new frozen key). Each
     // registry entry is validated independently — a finite in-[min,max] stored value applies via applyDebug,
     // anything else (missing / NaN / out of range / hand-edited garbage) leaves the seeded default in place.
+    // CS018 P2: iterate DEBUG_ENTRIES, not DEBUG_VARS — the registry now also holds non-selectable section
+    // header entries, which have no id/min/max and nothing to restore.
     if (data.debug) {
-      for (const e of DEBUG_VARS) {
+      for (const e of DEBUG_ENTRIES) {
         const dv = data.debug[e.id];
         if (Number.isFinite(dv) && dv >= e.min && dv <= e.max) applyDebug(e.id, dv);
       }
@@ -3189,23 +3837,26 @@ loadSettings(); // apply saved settings (if any) over the shipped defaults, once
 const rand = (a, b) => a + Math.random() * (b - a);
 const randSign = () => Math.random() < 0.5 ? -1 : 1;
 
-// Global difficulty ramp (F10). Returns 0 at wave 1 and climbs asymptotically toward 1
-// over many waves — the single curve every wave-driven threat parameter scales off.
-// RAMP_WAVES sets how fast the whole game gets hard; this is the one knob to turn.
+// The MUSIC-INTENSITY CURVE (F10; RETAINED by CS018 P4 per FLAG-l). Returns 0 at wave 1 and climbs
+// asymptotically toward 1 over many waves. Its ONLY direct caller is MusicSys.setIntensity() in
+// nextWave() — that is now this function's whole purpose, since every per-level difficulty quantity
+// comes from levelDef() instead. RAMP_WAVES sets how fast the music heats up. Do NOT re-derive music
+// intensity from the level table, and do not hang a new difficulty lever off this curve.
 function difficultyFactor(wave) {
   return 1 - Math.exp(-(wave - 1) / RAMP_WAVES);
 }
-// Interpolate a threat parameter between its easy wave-1 floor and its full-intensity
-// ceiling using the difficulty curve. Every early-game pacing value flows through this.
+// Interpolate a threat parameter between its easy wave-1 floor and its full-intensity ceiling using
+// the curve above. CS018 P4: still alive for the levers that remain on it — the small-saucer chance
+// (permanent), plus the saucer fire/aim pair until P7 repoints those onto levelDef tiers (the saucer
+// spawn-gap third of that group moved onto a tier in P6).
 function ramp(floor, ceil, wave) {
   return floor + (ceil - floor) * difficultyFactor(wave);
 }
-// CS017 P4 (FORK-CS017-B -> (b) COMPOSE): time-in-level pressure, 0 at level start rising to 1
-// once game.waveTime (P1) reaches DEBUG.saucerPressureSecs. Composes ON TOP of the wave-based
-// opening value at the saucer aim/gap sites — it never replaces it.
-function wavePressure() {
-  return Math.min(1, game.waveTime / DEBUG.saucerPressureSecs);
-}
+// RETIRED (CS018 P7): the time-in-level pressure axis (CS017 P4, FORK-CS017-B -> (b) COMPOSE) is gone —
+// its two consumers (the saucer gap in P6, the saucer aim above) both moved onto levelDef tiers, which
+// read game.wave/game.wave-derived level, not time-in-level. game.waveTime itself is KEPT (FLAG-k) —
+// nextWave() still captures it into prevLevelSecs for the difficulty log — but wavePressure() had no
+// other reader and is deleted outright rather than left retired-in-place, per the phase prompt.
 
 // A difficulty lever scales a quantity from `start` (wave 1) toward `floor` (full difficulty)
 // along the SHIPPED difficultyFactor() curve — levers never get their own curve. When
@@ -3217,29 +3868,123 @@ function leverScale(lever, wave) {
   return Math.max(lever.floor, s);
 }
 
-// CS017 P1: the FORK-CS017-A spiral term — each difficulty cycle's values are multiplied by this so
-// cycle N+1 starts above where cycle N started, even though the in-cycle sawtooth resets every
-// CYCLE_LENGTH waves. CS017 P3 wired it: the four SAWTOOTH levers (debris count, debris speed at both
-// sites, Hunter speed, Hunter turn rate) all read ramp/base off game.cycleWave and pass the result
-// through here with game.cycle. Every FROZEN lever bypasses this entirely and still samples game.wave.
-function cycleValue(base, cycle) {
-  return base * (1 + cycle * CYCLE_GAIN);
+// ---------- CS018 P4: the LARGE-HUNTER CAP (PLANNED-FEATURES-CS018 §4.1) ----------
+// The cap counts SPAWN SLOTS, not objects. Only size 3 is counted and only size 3 is capped: a split
+// (large -> 3 mediums) therefore FREES a slot rather than consuming three, middle/small hunters are
+// never counted and never capped, and destroying a large frees its slot immediately (dead-but-not-yet
+// -filtered hunters are excluded, so the slot is free within the same frame).
+function largeHunterCount() {
+  let n = 0;
+  for (const h of game.hunters) if (h.size === 3 && !h.dead) n++;
+  return n;
+}
+// The ceiling itself, straight off the level table: 0 at levels 1–4 (no large Hunter from EITHER
+// producer), 7 by 21, 12 from 59 on. Both producers — the ambient spawner in update() and the
+// coalescence conversion — gate on largeHunterCount() < largeHunterCap().
+function largeHunterCap() {
+  return levelDef(game.wave).maxLargeHunters;
+}
+// CS018 P4 (FLAG-i): Hunter's Bane counts kills within ONE lineage, and the shipped reset — "every
+// ambient spawnCore()" — breaks the moment lineages can coexist (the cap allows up to 12): a second
+// lineage arriving mid-fight would zero a counter the player was part-way through filling. Reset on
+// the 0 -> 1 transition instead: when the board goes from NO large Hunters to one, whichever producer
+// caused it. Call this IMMEDIATELY BEFORE pushing a new large, so the count read here is the
+// pre-spawn count. Accepted consequence (recorded in the GDD): the achievement loosens — a lineage's
+// tally now survives later lineages arriving, and a coalesced core onto an empty board resets it
+// where before it did not.
+function noteLargeHunterSpawn() {
+  if (largeHunterCount() === 0) game.stats.hunterLineageKills = 0;
 }
 
-// CS017 P5: the bonus canister's per-wave spawn probability — the ONE lever in this changeset that
-// EASES OFF instead of escalating. Common at the start of a cycle (the learning window right after a
-// sawtooth reset), rare at its end. Reads game.cycleWave, so it breathes with the sawtooth group.
+// CS018 P3: the ONE debris speedMul derivation, shared by nextWave() and destroyDebris()'s split
+// branch (see the byte-identical comment at each call site). levelDef's junkSpeed tier name picks a
+// DEBUG_VARS px/s knob (JUNK section); dividing by 70 — the shipped DEBRIS_SPEEDS[3] base — turns it
+// into the multiplier DebrisSatellite's ctor already applies to all three sizes, preserving the
+// 70/110/160 ratio rather than flattening it.
+function junkSpeedMul() {
+  const tier = levelDef(game.wave).junkSpeed; // "low" | "normal" | "high"
+  const pxPerSec = tier === "low" ? DEBUG.junkSpeedLow : tier === "high" ? DEBUG.junkSpeedHigh : DEBUG.junkSpeedNormal;
+  return pxPerSec / 70;
+}
+
+// CS018 P3 (FLAG-f): the bonus canister's per-wave spawn probability — the ONE lever in this
+// changeset that EASES OFF instead of escalating. Common right after a junk-cycle reset, rare at its
+// end. RE-HOMED off the (now-retired, CS018 P4) game.cycleWave onto the junk cycle position instead
+// — levelDef's `rel` mod JUNK_CYCLE.length (4) — so it keeps breathing with a reset-and-climb clock
+// now that the cycle clock itself is gone.
 //
 // DELIBERATE DEVIATION from DIFFICULTY-LEVERS.md 2.6 ("no lever gets its own curve"), documented
 // there: this is a straight LINEAR interpolation across the cycle, not ramp()/difficultyFactor().
 // The two constants are defined as the CYCLE'S ENDPOINTS, and difficultyFactor() is asymptotic — over
-// CYCLE_LENGTH (9) waves it only reaches 1-exp(-8/8) = 0.63, so a ramp() lever would top out near
-// 0.25 and BONUS_SPAWN_CHANCE_LATE would never be the value it says it is. A knob that lies is worse
-// than a private curve; this one hits both endpoints exactly.
+// a short cycle it would top out well short of 1, so a ramp() lever would never actually reach
+// BONUS_SPAWN_CHANCE_LATE. A knob that lies is worse than a private curve; this one hits both
+// endpoints exactly.
 function bonusSpawnChance() {
-  const t = CYCLE_LENGTH > 1 ? (game.cycleWave - 1) / (CYCLE_LENGTH - 1) : 1; // 0 at cycleWave 1, 1 at the cycle's last wave
-  const f = Math.min(1, Math.max(0, t));  // clamp: cycleWave is always in 1..CYCLE_LENGTH, but never trust a knob retune
+  const pos = (levelDef(game.wave).rel - 1) % JUNK_CYCLE.length; // 0..3: 0 right after a junk-cycle reset, 3 at its end
+  const t = JUNK_CYCLE.length > 1 ? pos / (JUNK_CYCLE.length - 1) : 1; // 0 at the cycle's first level, 1 at its last
+  const f = Math.min(1, Math.max(0, t));  // clamp: pos is always in 0..3, but never trust a knob retune
   return BONUS_SPAWN_CHANCE_EARLY + (BONUS_SPAWN_CHANCE_LATE - BONUS_SPAWN_CHANCE_EARLY) * f;
+}
+
+// CS018 P6: the ONE shared jitter helper for every frequency-shaped lever (§3.2) — UFO appearance and
+// UFO direction-change here; UFO firing frequency joins in P7, reusing this same helper rather than a
+// second implementation. A PERCENTAGE, not an absolute offset, so the spread scales down as a tier
+// centre itself shortens: rand(c*(1-j), c*(1+j)) with j = DEBUG.freqJitter / 100.
+function jitteredInterval(center) {
+  const j = DEBUG.freqJitter / 100;
+  return rand(center * (1 - j), center * (1 + j));
+}
+
+// CS018 P6: UFO flight speed, by TIER — the field holds the SMALL saucer's px/s (FLAG-c); the big
+// saucer derives at the shipped 100/150 ratio so the small/big spread survives the tier swap. Not a
+// frequency lever, so no jitter — one fixed value per tier, sampled once at Saucer construction.
+function ufoFlightSpeedPx(small) {
+  const tier = levelDef(game.wave).ufoFlightSpeed; // "low" | "normal" | "high"
+  const px = tier === "low" ? DEBUG.ufoFlightSpeedLow : tier === "high" ? DEBUG.ufoFlightSpeedHigh : DEBUG.ufoFlightSpeedNormal;
+  return small ? px : px * (100 / 150);
+}
+
+// CS018 P6: UFO appearance frequency, by TIER — one of the four INVERTED levers (§3.1): the number goes
+// DOWN as difficulty rises. Jittered around the tier centre via jitteredInterval().
+function ufoAppearInterval() {
+  const tier = levelDef(game.wave).ufoAppearFreq; // "low" | "normal" | "high"
+  const center = tier === "low" ? DEBUG.ufoAppearFreqLow : tier === "high" ? DEBUG.ufoAppearFreqHigh : DEBUG.ufoAppearFreqNormal;
+  return jitteredInterval(center);
+}
+
+// CS018 P6: UFO direction-change frequency, by TIER — INVERTED, same convention. Replaces the shipped
+// rand(0.8, 1.8) at both Saucer sites (ctor + update()).
+function ufoZigInterval() {
+  const tier = levelDef(game.wave).ufoDirChangeFreq; // "low" | "normal" | "high"
+  const center = tier === "low" ? DEBUG.ufoDirChangeFreqLow : tier === "high" ? DEBUG.ufoDirChangeFreqHigh : DEBUG.ufoDirChangeFreqNormal;
+  return jitteredInterval(center);
+}
+
+// CS018 P7: UFO firing frequency, by TIER — one of the four INVERTED levers (§3.1): the multiplier goes
+// DOWN as difficulty rises (1.8x slower at "low", 0.7x faster at "high"). A straight multiplier on the
+// shipped SAUCER_FIRE_BIG/SAUCER_FIRE_SMALL per-size ranges (FLAG-d) — NOT a jittered interval, since
+// rollFireTimer() already draws its own rand(range[0], range[1]); a second random draw here would
+// double-randomize the same quantity.
+function ufoFireMult() {
+  const tier = levelDef(game.wave).ufoFireFreq; // "low" | "normal" | "high"
+  return tier === "low" ? DEBUG.ufoFireFreqLow : tier === "high" ? DEBUG.ufoFireFreqHigh : DEBUG.ufoFireFreqNormal;
+}
+
+// CS018 P7: small-saucer shot accuracy, by TIER — INVERTED, same convention (high tier = smallest
+// error). Entered in the panel as DEGREES (0 = perfectly accurate); converted to radians here so every
+// caller gets the unit Saucer.update()'s angleTo()-based aim math already expects. Big saucers never
+// call this — they keep firing rand(0, TAU), unaimed, by design (FLAG-d).
+function ufoAccuracyRad() {
+  const tier = levelDef(game.wave).ufoAccuracy; // "low" | "normal" | "high"
+  const deg = tier === "low" ? DEBUG.ufoAccuracyLow : tier === "high" ? DEBUG.ufoAccuracyHigh : DEBUG.ufoAccuracyNormal;
+  return deg * Math.PI / 180;
+}
+
+// CS018 P7: UFO shot (Bullet) speed, by TIER. Not a frequency lever, so no jitter — one fixed px/s per
+// tier, applied to both saucer sizes' shots alike (the shipped 380 literal was never size-split either).
+function ufoShotSpeedPx() {
+  const tier = levelDef(game.wave).ufoShotSpeed; // "low" | "normal" | "high"
+  return tier === "low" ? DEBUG.ufoShotSpeedLow : tier === "high" ? DEBUG.ufoShotSpeedHigh : DEBUG.ufoShotSpeedNormal;
 }
 
 function wrap(obj) {
@@ -3639,9 +4384,9 @@ class DebrisSatellite {
     this.damage = DEBRIS_DAMAGE[size];   // contact damage to the ship (F2)
     // CS017 P3 (FLAG-CS017-a): clamp the RESULTING speed, never the multiplier — the three sizes have
     // different bases (70/110/160), so clamping the shared multiplier would squash the tier spread.
-    // GUARD RAIL only: at the shipped curve the fastest small debris reaches ~341 px/s (160 x the 1.64
-    // top-of-cycle speedMul x the 1.3 roll) against a 1040 cap, so this never binds in real play — it is
-    // insurance against a future CYCLE_GAIN / DEBRIS_SPEED_PER_WAVE retune, not a live constraint.
+    // GUARD RAIL only: at CS018 P3's tier system the fastest small debris reaches ~267 px/s (160 x the
+    // 1.286 "high"-tier junkSpeedMul x the 1.3 roll) against a 1040 cap, so this never binds in real
+    // play — it is insurance against a future tier retune, not a live constraint.
     const sp = Math.min(DEBRIS_SPEEDS[size] * speedMul * rand(0.7, 1.3), DEBRIS_SPEED_CAP);
     const a = rand(0, TAU);
     this.vx = Math.cos(a) * sp;
@@ -3649,6 +4394,12 @@ class DebrisSatellite {
     this.angle = rand(0, TAU);          // random spawn rotation (v3.3 item 5 — preserved by the SAT_ART draw path)
     this.spin = rand(-1.2, 1.2);        // random tumble (ditto)
     this.dead = false;
+    // CS019 P1: chain-guard absorb cooldown. A body that gets its break absorbed keeps overlapping the
+    // node it hit (nothing was severed), so without this it would re-present the same contact — and pay
+    // for it — every frame. Stamped in the guard branch of breakChain, skipped by the hazards-vs-chain
+    // scan while it is > 0 AND the guard is up. Bullets deliberately have no equivalent: a hostile round
+    // is marked dead before the break, so it can never re-present.
+    this.guardT = 0;
     // Authored satellite silhouette (v3.3 P2). Pick one archetype per instance (splits
     // re-roll independently), use the simplified `small` variant at the r=13 small tier,
     // then bake a per-instance copy scaled to `this.radius` with a small random per-vertex
@@ -3664,8 +4415,25 @@ class DebrisSatellite {
     }));
   }
   update(dt) {
-    this.x += this.vx * dt; this.y += this.vy * dt;
+    // CS021 P1: ORBIT MOTION MODE (spec §1.3/§4.3). The orbit state — orbitCenter / orbitRadius /
+    // orbitAngle / orbitAngVel — is OPTIONAL and absent on every field-level satellite, every split
+    // child (FORK-CS021-C2) and the title-screen decoration, so with it undefined this is byte-for-byte
+    // the linear drift path it has always been. With it present the ANGLE is integrated and the position
+    // is DERIVED from it, wrap-aware — which makes the RAIL authoritative, not vx/vy: anything that
+    // shoves an orbiting body has its shove overwritten on the very next frame. That is WHY CS021 P1b
+    // exists — the shield used to try exactly that, so the ship bounces off instead (see shieldBounce).
+    // Sprite spin (this.angle/this.spin) is a separate, unchanged thing, independent of the orbit.
+    if (this.orbitCenter) {
+      this.orbitAngle += this.orbitAngVel * dt;
+      const p = wrapPos({ x: this.orbitCenter.x + Math.cos(this.orbitAngle) * this.orbitRadius,
+                          y: this.orbitCenter.y + Math.sin(this.orbitAngle) * this.orbitRadius });
+      this.x = p.x; this.y = p.y;
+      orbitSyncVelocity(this);   // keep vx/vy honest for everything that only READS them
+    } else {
+      this.x += this.vx * dt; this.y += this.vy * dt;
+    }
     this.angle += this.spin * dt;
+    if (this.guardT > 0) this.guardT -= dt;   // CS019 P1: absorb cooldown, see the ctor
     wrap(this);
   }
   draw() {
@@ -3677,9 +4445,9 @@ class DebrisSatellite {
 // passively toward the ship (like the old Satellite); when shot it splits 3-ways into
 // actively-homing children — medium then small, each faster and more agile than the last
 // (like the old Wedge). Every tier emits garbage; the final small tier drops a larger burst
-// of LOW-mass scrap. All speeds/turn rates scale from a gentle wave-1 floor up to their
-// ceilings via the difficulty ramp (§2.13), so early waves are calm and full pressure
-// arrives ~wave 20. Tiers use the Debris 3/2/1 convention: 3 large, 2 medium, 1 small.
+// of LOW-mass scrap. CS018 P4: all speeds/turn rates are FROZEN constants (see the HUNTER_*
+// block) — the difficulty ramp no longer touches them, and escalation is carried entirely by
+// the large-Hunter CAP. Tiers use the Debris 3/2/1 convention: 3 large, 2 medium, 1 small.
 class HunterSatellite {
   constructor(x, y, size, scatterAngle = 0) {
     this.x = x; this.y = y;
@@ -3687,21 +4455,25 @@ class HunterSatellite {
     this.radius = HUNTER_RADII[size];
     this.damage = HUNTER_DAMAGE[size];      // contact damage to the ship (F2/F4)
     this.dead = false;
+    // CS019 P1: chain-guard absorb cooldown — same field, same reason, as DebrisSatellite's (see there).
+    // The homing tiers are the pathological case this exists for: a medium/small that loses contact
+    // re-acquires and comes straight back, so without a cooldown one attack could bill several times.
+    this.guardT = 0;
     // v3.3 P4 (9b, FORK-5): the `bornOfScrap` flag is GONE. Every Hunter of every origin now drops
     // garbage at its tier counts — the v3.2 P3 suppression is reversed. 9a's single-decay is the new
     // governor for the 12-in/66-out amplifier that flag used to close.
-    // Scaled from a gentle floor (HUNTER_FLOOR_FRAC × ceiling) up to the full ceiling. CS017 P3: the
-    // ramp now samples game.cycleWave — the SAWTOOTH, which resets every CYCLE_LENGTH waves — and the
-    // result is multiplied by the cycleValue() spiral term, so each cycle opens above the last
-    // (FORK-CS017-A). See GDD §2.13.
-    // SAMPLED ONCE, AT SPAWN, and never re-sampled. (The comment that used to sit here claimed
-    // "game.wave is fixed for a Hunter's lifetime (Hunters block wave-clear)" — that has been FALSE
-    // since CS015 P3, which removed Hunters from the wave-clear gate.) A Hunter can now carry across
-    // several waves and even across a cycle boundary, keeping its SPAWN cycle's speed and turn rate for
-    // life — so a Hunter born late in one cycle stays fast after the field around it has reset. That is
-    // ACCEPTED DESIGN (Paul's explicit call), not an oversight; do not "fix" it by re-sampling.
-    this.speed    = cycleValue(ramp(HUNTER_SPEED_CEIL[size] * HUNTER_FLOOR_FRAC, HUNTER_SPEED_CEIL[size], game.cycleWave), game.cycle);
-    this.turnRate = cycleValue(ramp(HUNTER_TURN_CEIL[size]  * HUNTER_FLOOR_FRAC, HUNTER_TURN_CEIL[size],  game.cycleWave), game.cycle);
+    // CS018 P4 (FLAG-a): FROZEN at the level-1 value for the whole game — NO CLOCK. There is no ramp,
+    // no cycle, no game.wave and no game state of any kind in these two lines: a Hunter spawned at
+    // level 1 and a Hunter spawned at level 63 move and turn identically. The _CEIL constants are the
+    // frozen value's DERIVATION (× HUNTER_FLOOR_FRAC), NOT a ramp target — nothing climbs toward them
+    // any more. The expression is kept rather than baked into literals so that derivation stays
+    // visible: 40.6 / 69.6 / 101.5 px/s and 0 / 0.928 / 1.508 rad/s for tiers 3 / 2 / 1.
+    // This also RETIRES the CS017 P3 wrinkle that used to live here: because the value no longer
+    // depends on when a Hunter spawned, a Hunter carried across several levels can no longer be
+    // "stale-fast" relative to the field around it. Escalating Hunter pressure now comes entirely from
+    // the level table's maxLargeHunters cap — how MANY can exist, not how fast they move.
+    this.speed    = HUNTER_SPEED_CEIL[size] * HUNTER_FLOOR_FRAC;
+    this.turnRate = HUNTER_TURN_CEIL[size]  * HUNTER_FLOOR_FRAC;
     if (size === 3) {
       // Large core: passive drift toward the ship's position AT SPAWN — no continuous re-aim
       // (confirmed design). Only its drift *speed* scales with difficulty, not its behavior.
@@ -3773,6 +4545,7 @@ class HunterSatellite {
         this.vy = Math.sin(this.heading) * HUNTER_LAST_STAND_SPEED;
       }
     }
+    if (this.guardT > 0) this.guardT -= dt;   // CS019 P1: absorb cooldown, see the ctor
     this.x += this.vx * dt; this.y += this.vy * dt;
     wrap(this);
   }
@@ -3799,24 +4572,24 @@ class Saucer {
     });
     this.x = p.x; this.y = p.y;
     this.baseY = this.y;   // vertical zig-zag stays in a band around the entry height
-    this.vx = (this.fromLeft ? 1 : -1) * (small ? 150 : 100);
+    this.vx = (this.fromLeft ? 1 : -1) * ufoFlightSpeedPx(small); // CS018 P6: tiered, was (small ? 150 : 100)
     this.vy = 0;
     this.dead = false;
     this.fireTimer = this.rollFireTimer(SAUCER_FIRE_INIT);   // first shot delayed harder at low waves (F10)
-    this.zigTimer = rand(0.8, 1.8);
+    this.zigTimer = ufoZigInterval(); // CS018 P6: tiered + jittered, was rand(0.8, 1.8)
     this.travel = 0;
   }
-  // Between-shot / first-shot delay for a [min,max] base range, slowed by the F10 fire
-  // multiplier: ~1.8× the shipped interval at wave 1, easing to 1.0× at full difficulty.
+  // Between-shot / first-shot delay for a [min,max] base range, scaled by the CS018 P7 UFO WEAPONS
+  // fire-frequency tier: 1.8x slower at "low", 1.0x (shipped cadence) at "normal", 0.7x faster at "high".
   rollFireTimer(range) {
-    const mult = ramp(SAUCER_FIRE_MULT_FLOOR, SAUCER_FIRE_MULT_CEIL, game.wave);
+    const mult = ufoFireMult(); // CS018 P7: tiered, was ramp(SAUCER_FIRE_MULT_FLOOR, SAUCER_FIRE_MULT_CEIL, game.wave)
     return rand(range[0], range[1]) * mult;
   }
   update(dt) {
     this.zigTimer -= dt;
     if (this.zigTimer <= 0) {
       this.vy = randSign() * rand(40, 110);
-      this.zigTimer = rand(0.8, 1.8);
+      this.zigTimer = ufoZigInterval(); // CS018 P6: tiered + jittered, was rand(0.8, 1.8)
     }
     this.x += this.vx * dt;
     this.y += this.vy * dt;
@@ -3829,17 +4602,17 @@ class Saucer {
     if (this.fireTimer <= 0 && !game.ship.dead) {
       let a;
       if (this.small) {
-        // aimed, but the error widens toward a barely-aimed spray at low waves (F10). CS017 P4: the
-        // wave-scaled value is the level's OPENING error; time-in-level (wavePressure) then tightens
-        // it further toward SAUCER_AIM_ERR_CEIL (the tighter/more-precise value) on top of that.
-        const base = ramp(SAUCER_AIM_ERR_FLOOR, SAUCER_AIM_ERR_CEIL, 1 + (game.wave - 1) * SAUCER_ACCURACY_RAMP_SCALE);
-        const err  = base + (SAUCER_AIM_ERR_CEIL - base) * wavePressure() * DEBUG.saucerAimPressure;
+        // aimed, error widens toward a barely-aimed spray at the "low" tier. CS018 P7: tiered and
+        // converted from degrees to radians at the call site (was ramp()+wavePressure()-driven — see
+        // ufoAccuracyRad()). Big saucers never aim (FLAG-d) — only the small (aimed) saucer reads this.
+        const err = ufoAccuracyRad();
         a = angleTo(this, game.ship) + rand(-err, err);
       } else {
         a = rand(0, TAU); // random
       }
+      const shotSpeed = ufoShotSpeedPx(); // CS018 P7: tiered, was the literal 380
       game.bullets.push(new Bullet(this.x, this.y,
-        Math.cos(a) * 380, Math.sin(a) * 380, true));
+        Math.cos(a) * shotSpeed, Math.sin(a) * shotSpeed, true));
       this.fireTimer = this.rollFireTimer(this.small ? SAUCER_FIRE_SMALL : SAUCER_FIRE_BIG);
     }
   }
@@ -4147,7 +4920,8 @@ function resetGameStats() {
     pacifistStreak: 0,       // consecutive deliveries with no shot fired between them
     pacifistBest: 0,         // best such streak this game (Pacifist Tow, goal 5)
     debrisKills: 0,          // Debris Satellites the player destroyed (Satellite Buster)
-    hunterLineageKills: 0,   // kills in the CURRENT Hunter lineage (reset when a fresh core spawns)
+    hunterLineageKills: 0,   // kills in the CURRENT Hunter lineage. CS018 P4 (FLAG-i): reset on the
+                             // 0 -> 1 large-Hunter transition (noteLargeHunterSpawn), not on every spawn
     hunterLineComplete: false,// wiped a full 13-member Hunter line from one spawn (Hunter's Bane)
     largeHunterKills: 0,     // large Hunter cores destroyed this game (Diamond Cutter)
     smallSaucerKills: 0,     // small (aimed) saucers destroyed this game (Small Ball)
@@ -4183,8 +4957,16 @@ const game = {
   menu: { screen: "titlemenu", index: 0, row: 0, col: 0, rebinding: null, scroll: 0, modal: null, achTab: ACH_TAB_DEFAULT }, // scroll: CS013 P3, Achievements-viewer vertical offset; modal: CS016 P3, the open confirmation dialog (null = none); achTab: CS016 P5, the viewer's active tab id
   ship: new Ship(),
   camera: { x: WORLD_W / 2, y: WORLD_H / 2 }, // world point at the center of the viewport
+  // CS022 P1: the world size the sim is CURRENTLY running at (WORLD_SIZE_FIELD | WORLD_SIZE_ORBIT).
+  // nextWave() compares worldSizeFor(game.wave) against this and resizes only on a real change.
+  // Declared in BOTH this literal and startGame()'s reset per the standing CS016 P3 rule (STATUS.md
+  // Known issues): a field that lands in only one of the two is `undefined` for a whole run.
+  worldSize: WORLD_SIZE_FIELD,
   debris: [], bullets: [], saucers: [], hunters: [], particles: [],
   garbage: [], chain: [], floaters: [], dock: null,
+  orbitLayout: null,   // CS021 P3: the live orbit-level layout (spawnOrbitWave's return), null on a field
+                        // level — set unconditionally by every nextWave() call, same as dock just above.
+                        // What the FLAG-CS021-c reroll keybind mutates; see rerollOrbitStartAngles().
   powerups: [],                                        // free-floating Powerup pickups (F6)
   // CS017 P6: every one of these four gains a `guard` key. powerBudget's is the one that matters most —
   // powerActive("guard") reads it in count mode, and a missing key would make the guard read as
@@ -4200,20 +4982,26 @@ const game = {
   scoopLevel: 0,                                       // PERSISTENT scoop upgrade level 0..SCOOP_MAX_LEVEL (v3.3 P3; NOT a timed effect)
   scoopHits: 0,                                        // running non-lethal-hit tally; every SCOOP_HITS_PER_LEVEL costs a level
   healthTimer: 0,                                      // countdown to the next ambient Health spawn
-  cargoMax: CARGO_BASE,                                // runtime tow cap; grows CARGO_BASE→CARGO_CAP_MAX per canisters delivered (B-8)
+  sweepPause: 0,                                       // CS018 P9: sec of Super-Mega-Delivery coalescence
+                                                        // pause remaining (0 = coalescence live). Set by
+                                                        // superMegaDelivery(), ticked+consumed at the
+                                                        // coalesceGarbage(dt) call site in update().
+  cargoMax: CARGO_BASE,                                // runtime tow cap; set from levelDef(game.wave).payloadSlots in nextWave() (CS018 P5) — this is only the pre-level-1 default
   cargoFlash: 0,                                       // CS009 P3: >0 for HUD_CAP_FLASH sec after a cap-up —
                                                         // a cap-up SHRINKS the CARGO ring's fraction (same chain,
                                                         // bigger denominator), so without this flash it reads as
                                                         // a bug instead of a promotion. Decayed in update().
   deliveryCount: 0, offloadTimer: 0,
+  comboGrace: 0,                                       // CS020 P1b: sec of one-effort grace left while the ship is
+                                                        // OUTSIDE the dock's neighborhood. Re-armed to
+                                                        // DEBUG.dockComboGrace every frame the ship is inside it;
+                                                        // when it runs out, game.deliveryCount zeroes.
   score: 0, wave: 0,
-  // CS017 P1: the difficulty cycle clock. wave stays the ABSOLUTE player-facing counter — every
-  // achievement, the HUD LEVEL readout, high-score records and musicStateFor keep reading game.wave,
-  // untouched. cycle/cycleWave are DERIVED from it in nextWave() (the sawtooth); waveTime is a per-wave
-  // seconds-elapsed accumulator ticked in update(). All three are inert this phase.
-  cycle: 0,      // 0-based difficulty cycle index
-  cycleWave: 1,  // 1-based wave within the current cycle
-  waveTime: 0,   // seconds elapsed in the current wave
+  // `wave` is the ABSOLUTE player-facing level counter and the ONE difficulty clock's input — every
+  // achievement, the HUD LEVEL readout, high-score records, musicStateFor and levelDef() read it.
+  // CS018 P4 retired its CS017 companions `cycle`/`cycleWave` outright (FORK-CS018-A).
+  waveTime: 0,   // seconds elapsed in the current level; ticked in update(), zeroed by nextWave().
+                 // CS018 P4 (FLAG-k): kept as telemetry — nextWave() logs the level just finished.
   nextRepair: REPAIR_MILESTONE,   // next score threshold that repairs the hull (F2)
   saucerTimer: 0,
   hunterTimer: 0,
@@ -4257,6 +5045,96 @@ const game = {
   caption: { text: "", life: 0, dur: 0 }
 };
 
+// ---------- CS022 P1: per-archetype world size (PLANNED-FEATURES-CS022 §4.1/§4.2/§4.3) ----------
+// Set the torus period and rebuild the active starfield. IT MOVES NOTHING: every entity keeps the
+// world coordinates it already had. That is deliberate — it is the right call at startGame() (the
+// field is empty) and the wrong one mid-run, which is exactly why resizeWorld() exists and is the
+// only thing nextWave() ever calls.
+function applyWorldSize(size) {
+  const [w, h] = worldDims(size);
+  WORLD_W = w; WORLD_H = h;
+  game.worldSize = size;
+  rebuildStarsActive();   // §4.3: filter the once-generated max-size sky down to this world
+}
+
+// Change the world size UNDER A LIVE FIELD (spec §4.2, FORK-CS022-D). nextWave() clears nothing, so
+// garbage, Hunters, saucers, powerups, the tow chain and the ship all cross every level boundary;
+// changing the torus period under them is the hard part of this changeset.
+//
+// THE SIX STEPS ARE ORDERED AND THE ORDER IS LOAD-BEARING. The snapshot measures with the OLD period
+// and the placement lands in the NEW one, so steps 1 and 4 straddle the dimension assignment in
+// step 2 and cannot be reordered around it. shortDelta/wrapPos both read the live WORLD_W/WORLD_H.
+//
+// Rejected alternatives, for the record: a bare wrap() re-home (a carried Hunter can materialise
+// 200 px from the ship on the shrink) and clearing the field at a transition (that would retire
+// CS015 P3's carried-pressure design 42 times a run).
+function resizeWorld(newSize) {
+  const ship = game.ship;
+
+  // ---- 1. SNAPSHOT, with the OLD period ----------------------------------------------------------
+  // Every carried body's wrap-aware offset from the ship. Bullets are deliberately NOT in this list
+  // (spec §4.2 enumerates the bodies); they are short-lived, wrap() folds them on the next frame, and
+  // nothing measures from them. Noted in STATUS.md rather than silently widened.
+  const bodies = [game.debris, game.hunters, game.saucers, game.garbage, game.powerups,
+                  game.particles, game.floaters];
+  const snap = [];
+  for (const arr of bodies) {
+    for (const e of arr) {
+      const [dx, dy] = shortDelta(ship.x, ship.y, e.x, e.y);
+      snap.push({ e, dx, dy });
+    }
+  }
+  // The chain is snapshotted HERE too, for the same old-period reason — a node that straddles the
+  // seam has a raw coordinate a whole period away from the ship's, and only shortDelta knows that.
+  const chainSnap = game.chain.map(n => {
+    const [dx, dy] = shortDelta(ship.x, ship.y, n.x, n.y);
+    return { n, dx, dy };
+  });
+
+  // ---- 2. APPLY the new dimensions ---------------------------------------------------------------
+  applyWorldSize(newSize);
+
+  // ---- 3. CENTRE THE SHIP ------------------------------------------------------------------------
+  // Absolute world coordinates are imperceptible — the camera follows the ship, and the only absolute
+  // reference, the starfield, was just rebuilt in step 2 — and the centre guarantees maximum clearance
+  // in the new world in both directions.
+  ship.x = WORLD_W / 2; ship.y = WORLD_H / 2;
+
+  // ---- 4. RE-PLACE each body ---------------------------------------------------------------------
+  // BEARING is kept exactly; MAGNITUDE is min(d, dmax). dmax is the same reachable-radius clamp v3.1
+  // P1 derived for the spawn rings, for the same reason — 660 at WORLD_SIZE_FIELD, 1380 at
+  // WORLD_SIZE_ORBIT. On the GROW almost nothing binds (old max reach 1,468 px against 1,380); on the
+  // SHRINK a great deal does, and an over-range body is pulled ALONG ITS OWN BEARING to the edge of
+  // the new world rather than teleported by one period. FLAG-CS022-k: that parks the whole over-range
+  // band in a shell at exactly dmax; monotone compression of the band is the fix if it reads badly,
+  // and it is a one-expression change at this site.
+  const dmax = Math.min(WORLD_W, WORLD_H) / 2 - 60;
+  for (const s of snap) {
+    const d = Math.hypot(s.dx, s.dy);
+    const k = d > dmax ? dmax / d : 1;   // d === 0 can never reach this branch (0 > dmax is false)
+    const p = wrapPos({ x: ship.x + s.dx * k, y: ship.y + s.dy * k });
+    s.e.x = p.x; s.e.y = p.y;
+  }
+
+  // ---- 5. TRANSLATE THE CHAIN --------------------------------------------------------------------
+  // Never scaled and never clamped: a tow is RIGID relative to its tug, and the whole chain spans at
+  // most CARGO_CAP_MAX * CHAIN_LINK = 480 px, comfortably inside dmax at either size — so keeping the
+  // offset verbatim can never place a node outside the new world and no wrapNode() call is needed.
+  // Each node's px/py shift by the IDENTICAL delta as its x/y, so the implied verlet velocity
+  // (n.x - n.px, which updateChain integrates next frame) survives the move — wrapNode's own contract
+  // from v3.1 P2, asserted directly rather than assumed.
+  for (const c of chainSnap) {
+    const ddx = (ship.x + c.dx) - c.n.x;
+    const ddy = (ship.y + c.dy) - c.n.y;
+    c.n.x += ddx; c.n.y += ddy;
+    c.n.px += ddx; c.n.py += ddy;
+  }
+
+  // ---- 6. SYNC THE CAMERA ------------------------------------------------------------------------
+  // So a draw() landing between this resize and the next update() can't show a stale view.
+  game.camera.x = ship.x; game.camera.y = ship.y;
+}
+
 function startGame() {
   game.state = "playing";
   game.paused = false;
@@ -4276,9 +5154,10 @@ function startGame() {
   game.toasts = [];               // clear any lingering unlock toasts
   game.score = 0;
   game.wave = 0;
-  // CS017 P1: fresh run never carries a stale cycle/cycleWave/waveTime — nextWave() (called at the end
-  // of this function) derives cycle/cycleWave for wave 1 and zeroes waveTime, same as every other wave.
-  game.cycle = 0; game.cycleWave = 1; game.waveTime = 0;
+  // A fresh run never carries a stale waveTime. nextWave() (called at the end of this function) zeroes
+  // it again for level 1, exactly as it does for every other level. (CS018 P4 removed the
+  // game.cycle/game.cycleWave resets that used to sit on this line with it.)
+  game.waveTime = 0;
   game.nextRepair = REPAIR_MILESTONE;
   game.debris = []; game.bullets = []; game.saucers = [];
   game.hunters = []; game.particles = [];
@@ -4290,13 +5169,22 @@ function startGame() {
   game.powerBankAmt = { rapid: 0, triple: 0, magnet: 0, engine: 0, guard: 0 };
   game.scoopLevel = 0; game.scoopHits = 0;               // persistent scoop upgrade resets each run (v3.3 P3)
   game.healthTimer = rand(POWERUP_HEALTH_GAP[0], POWERUP_HEALTH_GAP[1]);
-  game.cargoMax = CARGO_BASE;      // tow cap resets to base each run; grows with deliveries (B-8)
+  game.sweepPause = 0;             // CS018 P9: no sweep coalescence-pause carries into a fresh run
+  game.cargoMax = CARGO_BASE;      // pre-level-1 default; nextWave() below immediately overwrites it via levelDef(game.wave).payloadSlots (8 at level 1) — CS018 P5
   game.cargoFlash = 0;             // CS009 P3: no cap-up flash carries into a fresh run
   game.deliveryCount = 0; game.offloadTimer = 0;
+  game.comboGrace = 0;             // CS020 P1b: no one-effort grace carries into a fresh run
+  // CS022 P1: a fresh run always starts in the FIELD-sized world, and this line MUST precede
+  // `new Ship()` below — Ship.reset() reads WORLD_W/2 and WORLD_H/2 directly, so a run started after
+  // dying on an orbit level would otherwise spawn at the stale 5120x2880 world's centre and then be
+  // sitting outside the 2560x1440 one. It also re-sets game.worldSize (the CS016 P3 both-places rule)
+  // and rebuilds the active starfield. applyWorldSize MOVES NOTHING — there is nothing to move here:
+  // every entity array was emptied a few lines above.
+  applyWorldSize(WORLD_SIZE_FIELD);
   game.ship = new Ship();
   game.hudHull = game.ship.hp / SHIP_MAX_HP;   // CS009 P1: no drain animation on a fresh run
   game.camera = { x: game.ship.x, y: game.ship.y };
-  game.saucerTimer = rand(SAUCER_GAP_FLOOR_MIN, SAUCER_GAP_FLOOR_MAX); // first saucer waits the wave-1 floor gap (F10)
+  game.saucerTimer = ufoAppearInterval(); // CS018 P6: first saucer waits one tier-jittered appearance interval (game.wave is still 0 here, pre-nextWave(), so levelDef resolves the "low" tier, same as level 1)
   game.hunterTimer = rand(14, 22);
   game.lowHpSiren = false; AudioSys.lowhp(false); // fresh run never carries the siren over (v3.4 P5)
   game.lowHpPhase = 0;      // CS010 P3: the pulse accumulator starts a fresh run at 0
@@ -4311,39 +5199,307 @@ function startGame() {
   nextWave();
 }
 
-function nextWave() {
-  game.wave++;
-  // CS017 P1: derive the sawtooth cycle clock from the absolute wave counter. game.wave itself is
-  // UNTOUCHED and stays the player-facing absolute counter — every achievement, the HUD LEVEL readout,
-  // high-score records and musicStateFor keep reading game.wave, not cycle/cycleWave.
-  game.cycle     = Math.floor((game.wave - 1) / CYCLE_LENGTH);
-  game.cycleWave = ((game.wave - 1) % CYCLE_LENGTH) + 1;
-  game.waveTime  = 0;
-  VoiceSys.sayLevel(game.wave); // CS011 P4 — announces Level 1 too (VoiceSys.reset() ran just above in startGame)
-  // v3.4 P7: intensity recomputed ONLY on wave change, never per-frame — keeps updateMusic()'s
-  // per-frame path clean. Runs at wave 1 too (startGame calls nextWave()), so a fresh run starts
-  // pinned to difficultyFactor(1) === 0 (foundation layer only) before any track has even loaded.
-  MusicSys.setIntensity(difficultyFactor(game.wave));
-  game.stats.dmgThisWave = 0; // fresh damage-free window for the new wave (F9 perfect-wave tracking)
-  Achievements.lifetime.maxWave = Math.max(Achievements.lifetime.maxWave, game.wave); // Century Club / Master of the Field
-  // No Powerups Needed (MAX): best wave reached while still powerup-free this game. Frozen for the
-  // rest of the game the moment a powerup is picked (powerupsPicked > 0), so it records the deepest
-  // wave the player reached before ever touching a powerup. (FLAG A-1-b — a MAX counter, not a sum.)
-  if (game.stats.powerupsPicked === 0)
-    Achievements.lifetime.maxWaveNoPowerup = Math.max(Achievements.lifetime.maxWaveNoPowerup, game.wave);
-  game.dock = new Dock(); // recycling dock relocates each wave
-  // F3 first-pass balance: trimmed from min(4+wave, 11) to offset the ~8x higher garbage
-  // volume from guaranteed 3-per-tier drops. (v3.2 P3: garbage no longer decays; density is now
-  // held by coalescence + shatter-to-harvest, not a decay timer — see GDD §2.10.1.)
-  // CS017 P3 — the sawtooth. Both levers ramp on game.cycleWave, so they RESET at every cycle boundary,
-  // and both are then multiplied by the cycleValue() spiral term so cycle N+1 opens above cycle N: the
-  // player feels the reset as relief while the game still escalates over a long run (FORK-CS017-A).
-  // DEBRIS_COUNT_HARD_MAX is the absolute backstop on the spiralled count.
-  const count = Math.min(
-    Math.round(cycleValue(Math.min(3 + game.cycleWave, DEBRIS_COUNT_MAX), game.cycle)),
-    DEBRIS_COUNT_HARD_MAX);
-  const speedMul = cycleValue(1 + (game.cycleWave - 1) * DEBRIS_SPEED_PER_WAVE, game.cycle);
-  for (let i = 0; i < count; i++) {
+// ---------- CS021 P1: orbit-level layout (PLANNED-FEATURES-CS021 §1.1/§1.2/§4.1) ----------
+// PURE apart from rand(): the caller supplies every number, so the shipped geometry lives in the
+// ORBIT_* constants and this function only does the arithmetic. Per ring:
+//
+//     circumference     = 2π × radius
+//     minRequiredGap    = max(shipDiameter + safetyMargin, shipDiameter × minGapMultiplier)
+//     spacePerSatellite = satelliteDiameter + minRequiredGap
+//     maxCount          = floor(circumference / spacePerSatellite)
+//     count             = clamp(round(1 + density × (maxCount − 1)), 1, maxCount)
+//
+// THE GUARD THE HANDOFF OMITS: a ring whose maxCount comes out below 1 is unfair by construction — a
+// single satellite there would already sit closer than the fairness floor to itself around the loop —
+// so the ring is REJECTED (recorded in `rejected`, no satellites placed) rather than placed with a
+// negative computed gap. It never fires at the shipped geometry; it exists so a future radius/gap
+// retune fails loudly instead of quietly shipping an unpassable ring.
+//
+// `actualGapPx` is an ARC-LENGTH figure (circumference/count − satelliteDiameter). The straight-line
+// gap is marginally smaller at low counts; acceptable at these radii because the floor is already
+// conservative, and the test sweep asserts against the arc figure deliberately.
+//
+// Positions are wrap-aware on the way out (wrapPos), so a dock near a world edge lays its rings across
+// the seam correctly and every satellite's TOROIDAL distance to the centre is exactly its ring radius.
+// satelliteDiameter is passed IN, read from DEBRIS_RADII[3] * 2 at the call site — never a second
+// satellite-size constant.
+function generateOrbitLayout({ satelliteDiameter, shipDiameter, centerX, centerY, orbitCount,
+                               innerRadius, radiusStep, safetyMargin, minGapMultiplier,
+                               densityByOrbit, baseAngVel, fastRingIndex, fastRingMult, activeRings }) {
+  const minRequiredGap    = Math.max(shipDiameter + safetyMargin, shipDiameter * minGapMultiplier);
+  const spacePerSatellite = satelliteDiameter + minRequiredGap;
+  const rings = [], rejected = [], inactive = [];
+  for (let i = 0; i < orbitCount; i++) {
+    const radius        = innerRadius + i * radiusStep;
+    // CS022 P3 (spec §4.4): THE RING FILTER. `activeRings` is an optional array of 0-BASED ring indices;
+    // absent or null means every ring, which is the pre-CS022 behaviour byte-for-byte. The skip lands
+    // AFTER `radius` and BEFORE `maxCount` on purpose, so an inactive ring's radius is still known and
+    // reported. `inactive` is a NEW returned array and is deliberately NOT folded into `rejected`:
+    // `rejected` means "this ring is unfair by construction" (the maxCount guard below) and several
+    // tests read it with exactly that meaning. Every other per-ring quantity — radius, density, angVel,
+    // fastRingIndex — keeps its ORIGINAL index, so ring 4 is ring 4 whether or not rings 1-3 exist.
+    if (activeRings && activeRings.indexOf(i) === -1) { inactive.push({ index: i, radius }); continue; }
+    const circumference = TAU * radius;
+    const maxCount      = Math.floor(circumference / spacePerSatellite);
+    if (maxCount < 1) { rejected.push({ index: i, radius, circumference, maxCount }); continue; }
+    const density   = densityByOrbit[i];
+    const count     = Math.max(1, Math.min(maxCount, Math.round(1 + density * (maxCount - 1))));
+    const angleStep = TAU / count;
+    const ring = {
+      index: i, radius, circumference, maxCount, density, count, angleStep,
+      startAngle: 0,
+      // The fast ring trades spatial tightness for timing pressure (FORK-CS021-C1).
+      angVel: baseAngVel * (i === fastRingIndex ? fastRingMult : 1),
+      actualGapPx: circumference / count - satelliteDiameter,
+      satellites: [],
+    };
+    // startAngle is randomised per ring so the safe lanes never align into one straight radial path.
+    placeOrbitRing(ring, centerX, centerY, rand(0, angleStep));
+    rings.push(ring);
+  }
+  return {
+    centerX, centerY, rings, rejected, inactive, minRequiredGap, spacePerSatellite,
+    satelliteDiameter, shipDiameter,
+    total: rings.reduce((n, r) => n + r.count, 0),
+    // `rings` holds only ACTIVE rings, in ascending index order, so this is the OUTERMOST ACTIVE ring's
+    // satellite edge — 1,334 px at every occurrence, since the ramp fills from the outside in.
+    outerEdge: rings.length ? rings[rings.length - 1].radius + satelliteDiameter / 2 : 0,
+  };
+}
+
+// (Re)place ONE ring's satellites at `startAngle`. Split out of generateOrbitLayout so the spawn-safety
+// reroll below can rebuild a single ring without regenerating — and so re-randomising — the whole
+// layout: a reroll must move START ANGLES ONLY, leaving counts, radii, densities and velocities
+// byte-identical.
+function placeOrbitRing(ring, centerX, centerY, startAngle) {
+  ring.startAngle = startAngle;
+  ring.satellites.length = 0;
+  for (let k = 0; k < ring.count; k++) {
+    const angle = startAngle + k * ring.angleStep;
+    const p = wrapPos({ x: centerX + Math.cos(angle) * ring.radius,
+                        y: centerY + Math.sin(angle) * ring.radius });
+    ring.satellites.push({ angle, x: p.x, y: p.y });
+  }
+  return ring;
+}
+
+// Wrap-aware distance from `ship` to the nearest satellite of `ring`. Naive subtraction is wrong the
+// moment a ring straddles the world seam, which is exactly the case spawn safety must get right.
+function nearestOrbitDist(ring, ship) {
+  let best = Infinity;
+  for (const s of ring.satellites) best = Math.min(best, dist2(ship, s));
+  return Math.sqrt(best);
+}
+
+// SPAWN SAFETY (FORK-CS021-A -> (c)). The dock keeps its normal placement and THE SHIP IS NEVER MOVED;
+// instead, any ring whose band contains the ship rerolls its startAngle until the nearest satellite
+// clears it. Bounded by ORBIT_SPAWN_TRIES: on exhaustion we log and accept the last roll, because a
+// wave start must never be allowed to loop forever.
+//
+// THE BAND IS DERIVED FROM THE CLEARANCE RULE, NOT INVENTED. If the ship's wrap-aware distance to the
+// centre differs from a ring's radius by at least minRequiredGap, then no rotation of that ring can put
+// any satellite within minRequiredGap of the ship (the radially-aligned satellite is the closest one
+// possible, at exactly that radial offset), so the ring is already safe and there is nothing to reroll.
+//
+// CLEARANCE IS MEASURED CENTRE-TO-CENTRE, and that choice is load-bearing. minRequiredGap is an
+// EDGE-TO-EDGE lane width between two ADJACENT satellites (65 px at the shipped 2.5x); a ship sitting
+// exactly on a ring radius can never be further than half a lane from the nearest satellite's SURFACE,
+// so demanding 65 px of SURFACE clearance would be unsatisfiable by construction (ring 1's best
+// possible roll is 93.2 px centre-to-centre = 34.2 px surface-to-surface) and the bounded loop would
+// always exhaust — the opposite of "safe by construction". Centre-to-centre IS satisfiable for all four
+// shipped rings at every dock distance the Dock class can produce (DOCK_MIN_DIST..DOCK_MAX_DIST,
+// 260-620 px), so the attempt bound is genuine insurance and not the normal path. Recorded in STATUS.md.
+function spawnSafeOrbitLayout(layout, ship) {
+  const gap = layout.minRequiredGap;
+  const centre = { x: layout.centerX, y: layout.centerY };
+  const d = Math.sqrt(dist2(ship, centre));
+  for (const ring of layout.rings) {
+    ring.spawnSafetyTries = 0;
+    ring.spawnSafetyBand  = Math.abs(d - ring.radius) < gap;
+    if (!ring.spawnSafetyBand) { ring.spawnSafetyCleared = true; continue; }
+    while (nearestOrbitDist(ring, ship) < gap && ring.spawnSafetyTries < ORBIT_SPAWN_TRIES) {
+      placeOrbitRing(ring, layout.centerX, layout.centerY, rand(0, ring.angleStep));
+      ring.spawnSafetyTries++;
+    }
+    ring.spawnSafetyCleared = nearestOrbitDist(ring, ship) >= gap;
+    if (!ring.spawnSafetyCleared && typeof console !== "undefined" && console.warn) {
+      console.warn("orbit spawn safety: ring " + (ring.index + 1) + " exhausted " +
+                   ring.spawnSafetyTries + " rerolls; accepting the last roll");
+    }
+  }
+  return layout;
+}
+
+// The instantaneous orbital tangent of a body on a rail: speed = angVel × radius, perpendicular to the
+// centre ray (d/dt of centre + radius·(cos θ, sin θ) is radius·θ'·(−sin θ, cos θ)). Returns null for
+// anything not in orbit motion mode, which is what keeps the split site's handoff a one-line
+// conditional and inert on the field path.
+function orbitTangent(e) {
+  if (!e.orbitCenter) return null;
+  const sp = e.orbitAngVel * e.orbitRadius;
+  return [-Math.sin(e.orbitAngle) * sp, Math.cos(e.orbitAngle) * sp];
+}
+
+// Keep vx/vy telling the truth for a body whose POSITION is driven by the rail. Nothing integrates them
+// while orbitCenter is set, but plenty of code READS them — destroyDebris's garbage kick, shieldDeflect's
+// speed carry, the Hunter/powerup launch idiom — and a stale random drift vector left over from the
+// constructor would make every one of those lie.
+function orbitSyncVelocity(e) {
+  const t = orbitTangent(e);
+  if (t) { e.vx = t[0]; e.vy = t[1]; }
+}
+
+// CS021 P2 (spec §5): the fairness floor TIGHTENS per OCCURRENCE of the orbit archetype, not per level —
+// occurrence = level / ORBIT_LEVEL_EVERY, so level 3 is occurrence 1 (the base ORBIT_GAP_MULT, 2.5x),
+// level 6 is occurrence 2, and so on, clamped at the hard ORBIT_GAP_MULT_FLOOR (1.8x, reached at
+// occurrence 8 / level 24 and held through 63). ONE variable scales — densities and both angular
+// velocities stay fixed across occurrences (the handoff's own "change one variable at a time" rule); this
+// is the SOLE occurrence-scaled input to generateOrbitLayout(). Pure function of `level`, mirroring
+// levelDef()'s own purity; called from nextWave()'s orbit branch with game.wave. Do NOT push this read
+// down into the generator itself — it stays pure and unaware of occurrence, which is the seam P3's debug
+// override turns on next.
+function orbitGapMult(level) {
+  const occurrence = level / ORBIT_LEVEL_EVERY;
+  return Math.max(ORBIT_GAP_MULT_FLOOR, ORBIT_GAP_MULT - (occurrence - 1) * ORBIT_GAP_MULT_STEP);
+}
+
+// CS022 P2 (Correction C3): the ring SPACING is the invariant, not the outer edge. Paul's stated
+// spacing (ORBIT_RADIUS_STEP) is a design constant; where the outer ring lands is the CONSEQUENCE of
+// that spacing and the ring count, not the other way round. The RETIRED CS021 P3 rule redistributed a
+// fixed outer edge (ORBIT_INNER_RADIUS + (ORBIT_RING_COUNT-1) * ORBIT_RADIUS_STEP) evenly across
+// `count - 1` gaps, which reproduced ORBIT_RADIUS_STEP bit-for-bit only at the shipped count (4) and
+// silently widened the spacing at any other count (225 px at a requested 3 — not the specified 150).
+// `count` no longer changes the result at all; kept as a parameter only because every caller passes one.
+function orbitRadiusStepFor(count) {
+  return ORBIT_RADIUS_STEP;
+}
+// CS022 P2 (spec §6/§9): the orbitCount registry entry's `clampShown`, redefined against the WRAP-CLEAN
+// BUDGET now that the step above is held fixed — the retired step-pad floor (ORBIT_RADIUS_STEP_PAD)
+// never binds once the step can't narrow under a higher requested count. Walks a requested ring count
+// down while its outermost satellite EDGE would exceed the largest wrap-clean circle available to an
+// orbit level. Deliberately reads worldDims(WORLD_SIZE_ORBIT) — the size an orbit level actually RUNS
+// at — rather than the live WORLD_H, which is 1440 whenever a FIELD level is on screen (CS022 P1) and
+// would clamp this knob to nonsense mid-run; this is the one place in the changeset a world dimension
+// is read from the size table instead of the live variable.
+function orbitEffectiveCount(requested) {
+  const orbitBudget = worldDims(WORLD_SIZE_ORBIT)[1] / 2 - 20;
+  let count = Math.round(requested);
+  while (count > 1 &&
+         ORBIT_INNER_RADIUS + (count - 1) * ORBIT_RADIUS_STEP + DEBRIS_RADII[3] > orbitBudget) count--;
+  return count;
+}
+// CS022 P3 (spec §1.2/§4.4, FORK-CS022-E): THE RING RAMP. Rather than every ring appearing at the first
+// occurrence, ONE RING IS ADDED PER OCCURRENCE OF THE ARCHETYPE, OUTERMOST FIRST — [3], [3,2], [3,2,1],
+// [3,2,1,0] — complete at occurrence 4 (level 12) and held from there through 63 and past the plateau.
+// Radii never move: this SELECTS rings, it does not re-space them, so ring 4 sits at 1288 px at level 3
+// exactly as it does at level 63.
+//
+// NO NEW CONSTANT AND NO NEW CLOCK. Occurrence is CS021 P2's own derivation, level / ORBIT_LEVEL_EVERY,
+// the same coarse tick orbitGapMult() above reads — game.wave stays the ONE difficulty clock.
+//
+// IT COMPOSES WITH THE orbitCount DEBUG KNOB RATHER THAN IGNORING IT (FLAG-CS022-h): the count it walks
+// down from is the EFFECTIVE ring count, so a requested 3 gives [2], [2,1], [2,1,0] and completes at
+// occurrence 3 instead of 4. No knob is added for the ramp itself. orbitEffectiveCount() is idempotent
+// at this call — applyDebug()'s clampShown has already run on every write to DEBUG.orbitCount — so this
+// can never disagree with the ring count spawnOrbitWave() actually lays down.
+function activeRingsFor(level) {
+  const count = orbitEffectiveCount(DEBUG.orbitCount);
+  const n = Math.max(1, Math.min(Math.floor(level / ORBIT_LEVEL_EVERY), count));
+  const rings = [];
+  for (let i = 0; i < n; i++) rings.push(count - 1 - i);   // outermost first
+  return rings;
+}
+// CS021 P3 (spec §6 table): the debug slider OVERRIDES orbitGapMult()'s occurrence-scaled curve only
+// while it has been moved off its own default — an untouched knob must not silently freeze every orbit
+// level at the occurrence-1 value (2.5x), which is what unconditionally reading DEBUG.orbitGapMult here
+// would do. Touched, it is used AS-IS (its own [1.5, 4.0] registry range is the only clamp it gets — the
+// occurrence floor/step arithmetic is what it's overriding, not a second ceiling on top of it).
+function orbitEffectiveGapMult(level) {
+  const e = DEBUG_ENTRIES.find(v => v.id === "orbitGapMult");
+  return debugShown.orbitGapMult === e.def ? orbitGapMult(level) : DEBUG.orbitGapMult;
+}
+
+// The orbit-level spawn, called from nextWave()'s archetype branch in place of the scatter loop.
+// Returns the layout so tests (and the P3 debug reroll, rerollOrbitStartAngles() below) can read the
+// geometry that was actually laid down rather than re-deriving it. CS021 P2: gapMult is the caller's
+// OCCURRENCE-SCALED (or debug-overridden, P3) multiplier — the generator itself stays pure and unaware
+// of occurrence. CS021 P3: every other geometry input now reads its live DEBUG_VARS knob instead of the
+// fixed ORBIT_* const directly; orbitCount is ALREADY geometry-clamped by the time DEBUG.orbitCount is
+// read (applyDebug's clampShown ran at adjustment time), so radiusStep is derived from that clamped
+// value, never the raw requested one.
+function spawnOrbitWave(speedMul, gapMult, activeRings) {
+  const orbitCount = DEBUG.orbitCount;
+  const layout = spawnSafeOrbitLayout(generateOrbitLayout({
+    satelliteDiameter: DEBRIS_RADII[3] * 2,   // read HERE, at the call site — never a new constant
+    shipDiameter:      SHIP_RADIUS * 2,
+    centerX:           game.dock.x,
+    centerY:           game.dock.y,
+    orbitCount,
+    innerRadius:       ORBIT_INNER_RADIUS,
+    radiusStep:        orbitRadiusStepFor(orbitCount),   // CS021 P3: auto-derived, FLAG-CS021-a
+    safetyMargin:      DEBUG.orbitSafetyMargin,
+    minGapMultiplier:  gapMult,   // CS021 P2: occurrence-scaled — never the fixed ORBIT_GAP_MULT past occurrence 1
+    densityByOrbit:    [DEBUG.orbitDensity1, DEBUG.orbitDensity2, DEBUG.orbitDensity3,
+                         DEBUG.orbitDensity4, DEBUG.orbitDensity5],   // FLAG-CS021-b: first `orbitCount` consumed
+    baseAngVel:        DEBUG.orbitAngVel,
+    fastRingIndex:     ORBIT_FAST_RING - 1,   // ORBIT_FAST_RING is the human, 1-based ring number; not a knob
+    fastRingMult:      DEBUG.orbitFastMult,
+    activeRings,       // CS022 P3: the CALLER's ramp (spec §4.4/§4.6) — resolved at the call site exactly
+                       // like gapMult, so the generator stays pure and still knows nothing about
+                       // occurrence. This is the P2/P1 seam, widened by one argument, not breached.
+  }), game.ship);
+  // orbitCenter is captured ONCE, here, and never re-read (spec §4.3): if a future changeset ever
+  // relocates the dock mid-wave, the rings stay exactly where they were laid down. One shared object
+  // per wave — the rings do not each own a copy, so there is nothing to keep in sync.
+  const centre = { x: layout.centerX, y: layout.centerY };
+  for (const ring of layout.rings) {
+    for (const s of ring.satellites) {
+      const a = new DebrisSatellite(s.x, s.y, 3, speedMul);
+      a.orbitCenter = centre;
+      a.orbitRadius = ring.radius;
+      a.orbitAngle  = s.angle;
+      a.orbitAngVel = ring.angVel;
+      orbitSyncVelocity(a);   // the constructor's random drift is not this body's velocity
+      game.debris.push(a);
+    }
+  }
+  return layout;
+}
+
+// CS021 P3 (FLAG-CS021-c): the start-angle reroll — a debug-panel-only action with no button idiom to
+// hang off DEBUG_ROWS (see the keydown listener + drawDebug's footer), so it's a raw keybind reaching
+// straight into the live layout rather than a registry row. Touches ONLY what placeOrbitRing touches —
+// each ring's startAngle and derived satellite positions — so counts/radii/densities/angVel are
+// byte-identical before and after; re-runs the SAME spawnSafeOrbitLayout() pass a fresh spawn gets.
+// Live entities are matched back to their ring by `orbitRadius` (the ring-identity field every other
+// orbit test already keys off) in surviving creation order — a ring that lost members to harvesting
+// simply has fewer of them to reposition; the ones destroyed have no orbit state left to update.
+// Returns false (no-op) off an orbit level, where game.orbitLayout is null.
+function rerollOrbitStartAngles() {
+  const layout = game.orbitLayout;
+  if (!layout) return false;
+  for (const ring of layout.rings) placeOrbitRing(ring, layout.centerX, layout.centerY, rand(0, ring.angleStep));
+  spawnSafeOrbitLayout(layout, game.ship);
+  for (const ring of layout.rings) {
+    const live = game.debris.filter(d => d.orbitRadius === ring.radius);
+    live.forEach((d, i) => {
+      const s = ring.satellites[i];
+      if (!s) return;   // more survivors than the ring's (unchanged) count can't happen, but stay inert if it did
+      d.orbitAngle = s.angle; d.x = s.x; d.y = s.y;
+      orbitSyncVelocity(d);
+    });
+  }
+  return true;
+}
+
+// CS022 P3 (spec §4.6): the FIELD SCATTER, extracted VERBATIM out of nextWave()'s field branch so both
+// archetypes can call it — a field level spawns its own junkCount this way, and an orbit level now
+// spawns levelDef(n - 1).junkCount of them ON TOP OF its rings (spec §1.4, FORK-CS022-F). The body is a
+// pure extraction: `git diff -w` on the field branch reads as an indent change, and test-cs022-p3.js
+// §E pins that against the pre-P3 commit rather than trusting the eye. Ship-relative and wrap-aware, so
+// it is correct at either world size without knowing which one it is running in.
+function spawnFieldSatellites(n, speedMul) {
+  for (let i = 0; i < n; i++) {
     // spawn in a ring around the ship's current world position so the wave is
     // reachable (min distance keeps it off the ship, max keeps it from being
     // stranded on the far side of the big world)
@@ -4351,6 +5507,70 @@ function nextWave() {
     const d = rand(SPAWN_MIN_DIST, SPAWN_MAX_DIST);
     const p = wrapPos({ x: game.ship.x + Math.cos(a) * d, y: game.ship.y + Math.sin(a) * d });
     game.debris.push(new DebrisSatellite(p.x, p.y, 3, speedMul));
+  }
+}
+
+function nextWave() {
+  game.wave++;
+  // CS018 P4: the cycle-clock derivation that used to sit here is gone — game.wave is the ONE
+  // difficulty clock and levelDef(game.wave) reads it directly. FLAG-k: waveTime's value is captured
+  // BEFORE it is zeroed so logDifficultySnapshot can record how long the level just finished took;
+  // reading it after the reset would only ever log 0.
+  const prevLevelSecs = game.waveTime;
+  game.waveTime  = 0;
+  VoiceSys.sayLevel(game.wave); // CS011 P4 — announces Level 1 too (VoiceSys.reset() ran just above in startGame)
+  // v3.4 P7: intensity recomputed ONLY on wave change, never per-frame — keeps updateMusic()'s
+  // per-frame path clean. Runs at wave 1 too (startGame calls nextWave()), so a fresh run starts
+  // pinned to difficultyFactor(1) === 0 (foundation layer only) before any track has even loaded.
+  MusicSys.setIntensity(difficultyFactor(game.wave));
+  // CS018 P5 / FORK-CS018-B: payload capacity is GRANTED by level, not earned by deliveries. Set on
+  // every level including level 1 (startGame calls nextWave()), so a fresh run starts at 8 slots.
+  game.cargoMax = levelDef(game.wave).payloadSlots;
+  game.stats.dmgThisWave = 0; // fresh damage-free window for the new wave (F9 perfect-wave tracking)
+  Achievements.lifetime.maxWave = Math.max(Achievements.lifetime.maxWave, game.wave); // Century Club / Master of the Field
+  // No Powerups Needed (MAX): best wave reached while still powerup-free this game. Frozen for the
+  // rest of the game the moment a powerup is picked (powerupsPicked > 0), so it records the deepest
+  // wave the player reached before ever touching a powerup. (FLAG A-1-b — a MAX counter, not a sum.)
+  if (game.stats.powerupsPicked === 0)
+    Achievements.lifetime.maxWaveNoPowerup = Math.max(Achievements.lifetime.maxWaveNoPowerup, game.wave);
+  // CS022 P1 (§4.1/§4.2): the torus period is a function of the level's ARCHETYPE, so it can change at
+  // every wave boundary — up at every 3rd level and back down at the level after, 42 times in a
+  // 63-level run. THIS SITE IS THE ONLY CORRECT ONE and both halves of that are load-bearing: it must
+  // run AFTER game.wave++ (worldSizeFor reads the NEW level) and BEFORE `new Dock()` on the next line
+  // (dock placement is ship-relative and wrap-aware, so it needs both the new period and the
+  // re-centred ship). Only a real change resizes — a field level following a field level moves nothing.
+  const nextWorldSize = worldSizeFor(game.wave);
+  if (nextWorldSize !== game.worldSize) resizeWorld(nextWorldSize);
+  game.dock = new Dock(); // recycling dock relocates each wave
+  // F3 first-pass balance: trimmed from min(4+wave, 11) to offset the ~8x higher garbage
+  // volume from guaranteed 3-per-tier drops. (v3.2 P3: garbage no longer decays; density is now
+  // held by coalescence + shatter-to-harvest, not a decay timer — see GDD §2.10.1.)
+  // CS018 P3 — repointed onto levelDef(). The table is already bounded (3/5/9/13, capped at 13), so
+  // the old DEBRIS_COUNT_MAX/DEBRIS_COUNT_HARD_MAX clamps are no longer applied at this site.
+  const count = levelDef(game.wave).junkCount;
+  const speedMul = junkSpeedMul();
+  // CS021 P1 (FORK-CS021-E): the level table decides the level's ARCHETYPE, and that is the only thing
+  // this branch is. "field" is the shipped scatter, now living in spawnFieldSatellites() above with its
+  // body byte-unchanged. "orbit" adds concentric rings around the dock.
+  //
+  // CS022 P3 (spec §1.4, Correction C6) RETIRES CS021's rule that an orbit level does not consume
+  // junkCount. It still does not consume its OWN — it spawns levelDef(n - 1).junkCount ordinary scatter
+  // satellites (the `fieldCount` column) IN ADDITION to its rings, through the very same call the field
+  // branch makes. Since orbit levels are every 3rd, n - 1 is never itself an orbit level, so that column
+  // always reads a real field level's junk cycle. `count`/`speedMul` stay declared out here because
+  // logDifficultySnapshot() below still reports the LEVEL TABLE's own junk count either way — on an
+  // orbit level that figure is now unread by the spawn, which is FLAG-CS022-g and is deliberate — and
+  // the orbit spawn reuses the same speedMul rather than deriving a third one.
+  if (levelDef(game.wave).archetype === "orbit") {
+    // CS021 P3: orbitEffectiveGapMult reads the occurrence-scaled curve (spec §5) UNLESS the debug
+    // slider has been moved off its default, in which case it overrides — spec §6 table.
+    // CS022 P3: activeRingsFor() is the ring RAMP (spec §4.4), resolved at this call site for the same
+    // reason gapMult is — the generator stays pure and unaware of occurrence.
+    game.orbitLayout = spawnOrbitWave(speedMul, orbitEffectiveGapMult(game.wave), activeRingsFor(game.wave));
+    spawnFieldSatellites(levelDef(game.wave).fieldCount, speedMul);
+  } else {
+    game.orbitLayout = null;   // CS021 P3: a field level has no live layout for the reroll keybind to act on
+    spawnFieldSatellites(count, speedMul);
   }
   // CS017 P5 — the rare bonus canister (FORK-CS017-D -> (b) PRE-LINKED CLUMP). ONE roll per wave, on
   // the EASING-OFF curve (bonusSpawnChance()): common right after a cycle reset, rare at the cycle's
@@ -4369,7 +5589,7 @@ function nextWave() {
     bonusClump.bonus  = true;
     game.garbage.push(bonusClump);
   }
-  logDifficultySnapshot(count, speedMul); // CS017 P2: dev-only, one row per wave (see DiffLog above)
+  logDifficultySnapshot(count, speedMul, prevLevelSecs); // CS017 P2: dev-only, one row per level (see DiffLog above)
 }
 
 function addScore(pts) {
@@ -4411,12 +5631,21 @@ function destroyDebris(a, awardScore = true) {
   }
   // Large -> 3 mediums, medium -> 3 smalls, small -> destroyed (F3: 3-way splits)
   if (a.size > 1) {
-    // CS017 P3: the SECOND debris-speed site. Kept byte-identical to nextWave()'s speedMul expression —
+    // CS018 P3: the SECOND debris-speed site. Kept byte-identical to nextWave()'s speedMul expression —
     // a split child must move like a freshly-spawned piece of the same wave, so if one site is retuned
-    // the other has to move with it. (These two are the only places debris speed is derived.)
-    const speedMul = cycleValue(1 + (game.cycleWave - 1) * DEBRIS_SPEED_PER_WAVE, game.cycle);
+    // the other has to move with it. (These two are the only places debris speed is derived — both now
+    // just call the shared junkSpeedMul() helper.)
+    const speedMul = junkSpeedMul();
+    // CS021 P1 (FORK-CS021-C2 -> (i)): a shattered ORBITING parent hands its children its instantaneous
+    // orbital tangent as vx/vy and NO orbit state — they leave the rail as ordinary drifting debris.
+    // That is what lets an orbit level erode naturally into a normal field as it is harvested: no rail
+    // bookkeeping, no end-of-ring cleanup, nothing to keep a ring's membership in. `tangent` is null for
+    // every field-level parent, so the shipped scatter path is untouched.
+    const tangent = orbitTangent(a);
     for (let i = 0; i < 3; i++) {
-      game.debris.push(new DebrisSatellite(a.x, a.y, a.size - 1, speedMul));
+      const child = new DebrisSatellite(a.x, a.y, a.size - 1, speedMul);
+      if (tangent) { child.vx = tangent[0]; child.vy = tangent[1]; }
+      game.debris.push(child);
     }
   }
 }
@@ -4593,6 +5822,68 @@ function spawnHealthPowerup() {
   const a = rand(0, TAU), d = rand(POWERUP_HEALTH_MIN_DIST, POWERUP_HEALTH_MAX_DIST);
   const p = wrapPos({ x: game.ship.x + Math.cos(a) * d, y: game.ship.y + Math.sin(a) * d });
   game.powerups.push(new Powerup(p.x, p.y, "health"));
+}
+
+// CS018 P9: the SUPER MEGA DELIVERY (PLANNED-FEATURES-CS018.md §4.2 + FLAG-g; source doc §7.3/§7.3.1)
+// — the distinct event a full-cap 24-piece dock visit triggers, NOT a fifth reward tier. Three parts.
+// PART 1, the guaranteed set: ONE of each droppable type launches from the dock. A guaranteed floor,
+// not six weighted rolls, so it bypasses dropPowerup() entirely: no POWERUP_DROP_WEIGHTS roll, and no
+// DEBUG.chainGuardMinTow gate — the chain is EMPTY at this instant (the 24th pop just cleared it), so
+// the gate would ALWAYS exclude guard; FORK-CS018-C bypasses it deliberately. The set derives from
+// POWERUP_DROP_WEIGHTS' keys (the drop table) so a future droppable type joins automatically — it is
+// NOT POWERUP_DROP_TYPES, the timed-effect list, which excludes Scoop (see the constants block).
+// PART 2, the sweep — SNAPSHOT SEMANTICS (§7.3.1, the changeset's flagged most-likely bug): every
+// hunter piece alive AT THE TRIGGER INSTANT takes exactly one hit and pays exactly one powerup;
+// fragments created BY the sweep do neither, because they are not in the snapshot. The snapshot is an
+// explicit filtered copy — NOT Array.forEach's fixed-visited-range guarantee, and NOT for...of over
+// game.hunters (the shield-ring site's idiom, which WOULD visit the children destroyHunter appends
+// mid-iteration and cascade the whole board to nothing in one frame — exactly the board-clear this
+// design must avoid).
+// PART 3: the sweep pauses coalescence for DEBUG.sweepCoalescePause sec — see the coalesceGarbage(dt)
+// call site in update() for what "paused" means and why.
+// This is NOT a board clear: N larges become 3N mediums, total threat does not fall, so there is no
+// farming incentive and no cooldown. SILENT this phase — the dock_24 Dan line is P10's (voice-lab-
+// gated); no new floater either (the Maxed Out "MAX HAUL" at the same instant already marks it).
+function superMegaDelivery() {
+  const setTypes = Object.keys(POWERUP_DROP_WEIGHTS);  // rapid, triple, scoop, magnet, engine, guard
+  for (const type of setTypes) {
+    const a = rand(0, TAU);  // fresh random vector per powerup — the reward tiers' launch idiom
+    game.powerups.push(new Powerup(game.dock.x, game.dock.y, type,
+      Math.cos(a) * DOCK_POWERUP_SPEED, Math.sin(a) * DOCK_POWERUP_SPEED));
+  }
+
+  const snap = game.hunters.filter(h => !h.dead);  // THE SNAPSHOT — iterate this, never game.hunters
+  // SWEEP_POWERUP_CAP bookkeeping: the ceiling counts the guaranteed set plus every per-piece payout.
+  // A swept LARGE pays its one powerup from INSIDE destroyHunter (the v3.6 P3 large-core drop) — which
+  // is also why the sweep spawns nothing extra for size 3 (FLAG-g: two powerups for one piece would
+  // make the ceiling a lie). Those interior drops can't be stopped once destroyHunter is called, so
+  // their count is RESERVED out of the budget up front and the medium/small payouts spend what's left.
+  // Under the game's own largeHunterCap() (hard ceiling 12) the reservation never exhausts the budget.
+  const pool = setTypes.concat("health");  // sweep rolls ADD Health (ambient-only everywhere else)
+  let budget = SWEEP_POWERUP_CAP - setTypes.length - snap.filter(h => h.size === 3).length;
+  for (const h of snap) {
+    destroyHunter(h, true);      // one hit, resolved exactly as a player shot: score + achievement
+                                 // counters credited (awardScore gates both), normal split + scatter
+    if (h.size === 3) continue;  // FLAG-g: this piece's one powerup just dropped inside destroyHunter
+    if (budget-- > 0) {
+      // FLAT pick over the 7-type pool, rolled independently per piece (source §7.3: "one randomly-
+      // chosen powerup... a scattered mix") — not the weighted dropPowerup roll, and guard is in the
+      // pool ungated for the same chain-is-empty reason as the guaranteed set above. Normal
+      // POWERUP_DECAY float lifetime (no special casing), launched on the piece's own drift — the
+      // same idiom as destroyHunter's large-core drop.
+      const type = pool[Math.floor(Math.random() * pool.length)];
+      game.powerups.push(new Powerup(h.x, h.y, type, h.vx, h.vy));
+    }
+  }
+
+  game.sweepPause = DEBUG.sweepCoalescePause;  // PART 3 — consumed at the coalesceGarbage call site
+
+  // CS018 P10: the SMD's own line, fired from the event itself — NOT a fifth VoiceSys.dockDelivery
+  // tier. dockDelivery still fires separately on the pop that empties the chain (a different moment,
+  // untouched — its 5/10/15/20 chain would try dock_20 for a 24-piece visit) but claims the channel
+  // AFTER this call, so the shared cooldown/priority gate drops it in dock_24's favor, same as any two
+  // same-priority lines landing back to back.
+  VoiceSys.say("dock_24");
 }
 
 // Collect a powerup. Health is instant (repair, capped). The four timed effects BANK — a same-type
@@ -5129,6 +6420,53 @@ function shieldDeflect(obj) {
   AudioSys.shieldPing();
 }
 
+// CS021 P1b: shieldDeflect's MIRROR IMAGE, for a hazard that cannot be pushed. Everything shieldDeflect
+// does to the hazard, this does to the SHIP — separate to just outside contact, take the velocity
+// change, pay the same SHIELD_HIT_COST, count the same deflect, make the same sound. The hazard is left
+// COMPLETELY untouched: an orbiting satellite stays on its rail, which is the whole point of the orbit
+// archetype (FORK-CS021-C2 keeps rings intact; knocking one off its rail would be a different game).
+//
+// The reflection is done in the HAZARD'S OWN FRAME, not the world frame, which is what makes the fast
+// ring feel different from the slow ones: subtract the satellite's tangential velocity, reflect the
+// APPROACHING part of what's left, then add the satellite's velocity back. Sweep into a satellite
+// travelling the other way and you leave much faster than you arrived; ride alongside one and barely
+// anything happens. Only the approaching component is reflected — a ship already moving away is not
+// yanked backwards.
+//
+// The FLOOR is applied last and is not optional (see SHIELD_BOUNCE_MIN): reflection alone leaves a
+// stationary ship stationary, and a stationary ship in contact is exactly the case this whole function
+// exists to fix.
+function shieldBounce(obj) {
+  // Outward contact normal, hazard -> ship. angleTo is wrap-aware; a ship exactly on the hazard's
+  // centre yields atan2(0,0) === 0, i.e. a defined direction rather than a NaN.
+  const a  = angleTo(obj, game.ship);
+  const nx = Math.cos(a), ny = Math.sin(a);
+  // Relative velocity, in the hazard's frame.
+  let ux = game.ship.vx - obj.vx, uy = game.ship.vy - obj.vy;
+  const un = ux * nx + uy * ny;
+  if (un < 0) {                                   // approaching: reflect that component
+    ux -= (1 + SHIELD_BOUNCE_RESTITUTION) * un * nx;
+    uy -= (1 + SHIELD_BOUNCE_RESTITUTION) * un * ny;
+  }
+  game.ship.vx = ux + obj.vx;
+  game.ship.vy = uy + obj.vy;
+  // Guarantee real separation, so one contact costs ONE deflect instead of one per frame.
+  const outward = game.ship.vx * nx + game.ship.vy * ny;
+  if (outward < SHIELD_BOUNCE_MIN) {
+    game.ship.vx += (SHIELD_BOUNCE_MIN - outward) * nx;
+    game.ship.vy += (SHIELD_BOUNCE_MIN - outward) * ny;
+  }
+  // Push the SHIP out of overlap — the mirror of shieldDeflect's own separation step. wrap() is the
+  // same helper Ship.update() ends on, so a bounce across the world seam lands the ship exactly where
+  // an ordinary crossing would; the tow chain's solver is wrap-aware and needs nothing special.
+  game.ship.x = obj.x + nx * (SHIELD_RADIUS + obj.radius + 2);
+  game.ship.y = obj.y + ny * (SHIELD_RADIUS + obj.radius + 2);
+  wrap(game.ship);
+  game.ship.energy = Math.max(0, game.ship.energy - SHIELD_HIT_COST);
+  game.stats.deflects++;   // Shield Surfer (F9): same event, same counter, as a deflect
+  AudioSys.shieldPing();
+}
+
 // ---------- Tow chain physics ----------
 // Verlet nodes with position-based distance constraints, wrap-aware.
 // The ship is the (mostly) kinematic head; nodes trail serpentine behind.
@@ -5174,7 +6512,8 @@ function wrapNode(n) { // wrap verlet nodes; shift prev pos too so velocity surv
 // and a piece already marked dead this pass is skipped. Both the attraction and the merge require
 // BOTH pieces active (coalesceDelay <= 0), so a fresh burst disperses for 1 s before it can clump.
 // FORK-1: coalesced Hunters are spawned independent of game.hunterTimer, so neglect can breed several
-// concurrent lineages. Relies on the existing end-of-frame dead-filter for compaction (no new filter).
+// concurrent lineages — bounded since CS018 P4 by the shared large-Hunter cap (§4.1), which this pass
+// respects at the conversion site. Relies on the existing end-of-frame dead-filter (no new filter).
 function coalesceGarbage(dt) {
   const gs = game.garbage;
   for (let i = 0; i < gs.length; i++) {
@@ -5208,11 +6547,26 @@ function coalesceGarbage(dt) {
         a.bonus = a.bonus || b.bonus;
         b.dead = true;
         if (a.pieces >= HUNTER_COALESCE_COUNT) {
+          // CS018 P4 (§4.1): coalescence is the SECOND large-Hunter producer and is capped by the same
+          // level-table ceiling as the ambient spawner. With the cap full the clump HOLDS AT THE FINAL
+          // COALESCENCE STAGE instead of converting: it does not become a Hunter, it does not grow past
+          // HUNTER_COALESCE_COUNT pieces (the overflow this merge just added is shed, per-piece mass
+          // preserved), and its decay clock — already reset by the merge above, per the shipped rule —
+          // keeps running, so a held clump that nothing else touches still ages out and the player can
+          // still shatter or scoop it as ordinary 12-piece salvage. Destroy a large anywhere on the
+          // board and the next merge into this clump converts it.
+          if (largeHunterCount() >= largeHunterCap()) {
+            a.mass   = a.mass * (HUNTER_COALESCE_COUNT / a.pieces); // shed the overflow, keep mass-per-piece
+            a.pieces = HUNTER_COALESCE_COUNT;
+            a.radius = 7 * Math.sqrt(a.pieces);                     // the ONE clump-radius expression
+            continue;  // survivor lives on, saturated; keep scanning further pieces against it this pass
+          }
           // Clump collapses into a new large Hunter core. Independent of game.hunterTimer (FORK-1).
           // v3.3 P4 (9b, FORK-5): no bornOfScrap tag anymore — this coalesced core drops garbage like
           // any other Hunter. hunterCoalesced still counts the transform (it never read the flag) so the
           // "Waste Not" achievement is untouched.
           a.dead = true;
+          noteLargeHunterSpawn();   // FLAG-i: same 0 -> 1 rule as the ambient producer, one choke point
           game.hunters.push(new HunterSatellite(a.x, a.y, 3));
           game.stats.hunterCoalesced++;
           AudioSys.hunterborn();
@@ -5288,7 +6642,12 @@ function updateChain(dt) {
   chain.forEach(wrapNode);
 }
 
-function breakChain(i) { // node i destroyed; everything aft breaks loose
+// CS019 P1: `src` is the SOURCE of the break — the hostile bullet or the debris/Hunter body that caused
+// it — and exists solely so an absorbed break can stamp a persistent source's guardT. It defaults to null
+// so a sourceless call (a direct call from a test harness, or any future caller with no persistent
+// object behind the hit) keeps exactly the pre-CS019 behaviour: absorb, spend once, stamp nothing. A
+// break with no persistent source is a one-shot event and needs no cooldown.
+function breakChain(i, src = null) { // node i destroyed; everything aft breaks loose
   const chain = game.chain;
   const hit = chain[i];
   // CS017 P6 — CHAIN GUARD. This function is the single HOSTILE break choke point: both call sites (a
@@ -5309,6 +6668,10 @@ function breakChain(i) { // node i destroyed; everything aft breaks loose
     game.floaters.push(new FloatText("GUARDED", hit.x, hit.y - 18, POWERUP_COLOR.guard));
     AudioSys.shieldPing();
     VoiceSys.say("chain_guard"); // CS017 P7 — same single choke point: a multi-node hit speaks once
+    // CS019 P1: this contact has now been paid for. Stamping the source is what stops it presenting the
+    // SAME contact again next frame — nothing was severed here, so a body that was overlapping still is.
+    // The scan (not this function) does the skipping; see the hazards-vs-chain pass for why.
+    if (src) src.guardT = DEBUG.chainGuardCooldown;
     return; // no node severed, deliveryCount untouched — the load is byte-identical
   }
   boom(hit.x, hit.y, 1, COLOR.garbage);
@@ -5563,12 +6926,33 @@ function update(dt) {
         addScore(BONUS_CANISTER_SCORE);
         game.floaters.push(new FloatText("+" + BONUS_CANISTER_SCORE, g.x, g.y, COLOR.garbageBonus));
       }
+      // CS020: a node is TOWED if it was hooked OUTSIDE the dock's neighborhood, and an INCIDENTAL if
+      // it was hooked inside it. Computed HERE — once, at the moment of capture, above the single/clump
+      // branch so ONE expression covers both push paths (the same placement idiom as the bonus-canister
+      // award directly above). Tagging at capture rather than counting pops at the dock is load-bearing:
+      // the chain is LIFO and both push sites append to the tail the offload pops from, so a piece
+      // hooked while parked JUMPS THE QUEUE and is delivered first — any count-based scheme would spend
+      // the escalation on the in-ring pickups and demote the genuinely towed load. See GDD 2.10.
+      const pad = game.dock ? game.dock.radius + DOCK_NEIGHBORHOOD_PAD : 0;
+      const inRing = !!game.dock && dist2(game.ship, game.dock) < pad * pad;
+      // CS020 P1b: gathering again starts a NEW effort. An INCIDENTAL never does this —
+      // it is neutral to the counter in both directions (FORK-CS020-B).
+      // THE `!inRing` GUARD IS LOAD-BEARING: resetting on EVERY hook would mean a magnet grab at the
+      // dock kills a player's own run mid-offload — the exact unfairness this phase exists to remove.
+      // This is also what BOUNDS the counter, and the bound is structural rather than policed:
+      // between any two resets only nodes already in the chain can be counted, and the pickup gate
+      // above bounds the chain at game.cargoMax, therefore deliveryCount <= cargoMax. That is what
+      // makes Maxed Out (=== CARGO_CAP_MAX) a level-12+ achievement BY CONSTRUCTION, and what kills
+      // the farmable annulus a grace window alone would open (hover just outside the ring with a
+      // 380px magnet, fill, dip in, offload, repeat — every hook out there now resets).
+      if (!inRing) game.deliveryCount = 0;
       if (g.pieces === 1) {
         // A single hooks onto the chain as one node (unchanged behavior).
         g.dead = true;
         game.chain.push({
           x: g.x, y: g.y, px: g.x, py: g.y,
-          spin: g.spin, spinRate: g.spinRate, mass: g.mass  // carry towing weight onto the node (F5)
+          spin: g.spin, spinRate: g.spinRate, mass: g.mass,  // carry towing weight onto the node (F5)
+          towed: !inRing                                     // CS020: earns the delivery combo (see above)
         });
         AudioSys.pickup();
         // Count-based Magnet expiry (B-5): spend one budget per canister HOOKED — counted at the hook,
@@ -5586,7 +6970,9 @@ function update(dt) {
         for (let k = 0; k < take; k++) {
           game.chain.push({
             x: g.x, y: g.y, px: g.x, py: g.y,
-            spin: g.spin, spinRate: g.spinRate, mass: pMass
+            spin: g.spin, spinRate: g.spinRate, mass: pMass,
+            towed: !inRing         // CS020: one scoop is one capture — every `take` node gets the
+                                   // SAME tag, from the expression computed once above the branch
           });
         }
         AudioSys.pickup();
@@ -5615,7 +7001,15 @@ function update(dt) {
       if (game.chain.length === game.cargoMax) VoiceSys.say("cargo_full");
     }
   }
-  coalesceGarbage(dt); // v3.1 P3: neglected scrap clumps; a 12-piece clump becomes a Hunter
+  // CS018 P9: a Super Mega Delivery pauses coalescence for DEBUG.sweepCoalescePause sec — without
+  // this, N larges splitting at once frees the WHOLE largeHunterCap() and fresh larges convert while
+  // the player is still in the fragment swarm. The pause holds the ENTIRE pass — conversion, merging
+  // AND the attraction that feeds them: pausing only the merge/convert branches while attraction kept
+  // pulling would just pile pieces up inside merge range for a mass conversion the frame the pause
+  // expires, recreating exactly what the pause exists to prevent. Decay clocks are NOT frozen — they
+  // live in Garbage.update(), which runs regardless, so pieces still age out mid-pause.
+  if (game.sweepPause > 0) game.sweepPause -= dt;
+  else coalesceGarbage(dt); // v3.1 P3: neglected scrap clumps; a 12-piece clump becomes a Hunter
   updateChain(dt);
 
   // --- Powerups: field pickups + active-effect countdown (F6) ---
@@ -5649,83 +7043,115 @@ function update(dt) {
 
   // --- Recycling dock offload ---
   if (game.dock) {
+    // CS020 P1b / FORK-CS020-E: one effort = one chain delivered in one go. It survives LEAVING the
+    // dock — a skirt-and-return is still one effort — for DEBUG.dockComboGrace seconds. It does NOT
+    // survive gathering again; that reset lives at the pickup gate, and it is the reset that BOUNDS
+    // the counter (this timer must never be the safety mechanism — see DOCK_COMBO_GRACE).
+    // HOISTED to the top of the dock block deliberately: it has to evaluate every frame, independent
+    // of the offload branch, or it would not run while the ship is actively delivering. Re-arming
+    // happens at the RING (dock.radius + DOCK_NEIGHBORHOOD_PAD), not the +10 offload radius — once
+    // back inside the neighborhood the run is safe indefinitely and the player can take their time
+    // closing the last 30px. Loitering there is harmless: pickups in here are incidentals, so nothing
+    // advances. Ship-dead is excluded from the DECAY arm so a corpse's run can never be timed out
+    // mid-death (scatterChain has already zeroed the counter anyway, which is why the dead ship
+    // falling into the re-arm branch is a harmless no-op rather than a second rule).
+    // Replaces the old distance-based reset that lived in the offload
+    // block's else branch, which destroyed a run the instant the ship crossed the ring.
+    const npad = game.dock.radius + DOCK_NEIGHBORHOOD_PAD;
+    if (!game.ship.dead && dist2(game.ship, game.dock) > npad * npad) {
+      game.comboGrace -= dt;
+      if (game.comboGrace <= 0) game.deliveryCount = 0;
+    } else {
+      game.comboGrace = DEBUG.dockComboGrace;   // inside the ring: the run is safe, window re-armed
+    }
     const nearDock = !game.ship.dead &&
       dist2(game.ship, game.dock) < (game.dock.radius + 10) * (game.dock.radius + 10);
     if (nearDock && game.chain.length > 0) {
       game.offloadTimer -= dt;
       if (game.offloadTimer <= 0) {
         const node = game.chain.pop(); // canisters peel off from the tail
-        game.deliveryCount++;
-        const pts = DOCK_BASE_SCORE + DOCK_BONUS_STEP * (game.deliveryCount - 1);
-        addScore(pts);
-        // Achievement stats (F9): per-game delivered count (Scrap Runner) + best combo this visit
-        // (Combo Collector); a first-canister-within-60s flag (Speed Recycler); a full 12-in-one-visit
-        // milestone (Heavy Hauler weekly + The Long Haul lifetime); and lifetime delivered/score.
-        game.stats.delivered++;
-        // Tow-capacity progression (B-8): every CARGO_GROW_PER canisters recycled this run raises
-        // the cap by 1, up to CARGO_CAP_MAX. Keyed off the per-run delivered count (increments by 1
-        // here, so the cap climbs at most one step per canister) — a "TOW +1" float marks each bump.
-        const growCap = Math.min(CARGO_CAP_MAX, CARGO_BASE + Math.floor(game.stats.delivered / CARGO_GROW_PER));
-        if (growCap > game.cargoMax) {
-          game.cargoMax = growCap;
-          game.floaters.push(new FloatText("TOW +1", game.ship.x, game.ship.y - 22, COLOR.dock));
-          // CS009 P3 (FORK-2 A): a cap-up SHRINKS the CARGO ring (same chain, bigger denominator) —
-          // arm the flash so the ring reads gold+thick for HUD_CAP_FLASH sec, and drop the reward
-          // text at the dock (where it was earned), not the ship.
-          game.cargoFlash = HUD_CAP_FLASH;
-          game.floaters.push(new FloatText("+1 CAP", game.dock.x, game.dock.y - 22, COLOR.ach));
+        // CS020: TOWED (hooked outside the dock neighborhood, the work of an actual haul) vs INCIDENTAL
+        // (hooked while already parked in it). `!== false` is load-bearing, not style: a node with no
+        // `towed` field at all — which is every chain node any older test seeds by hand — defaults to
+        // TOWED, so absence never silently demotes a delivery. Only an explicit false demotes.
+        const towed = node.towed !== false;   // absent => towed
+        if (towed) {
+          game.deliveryCount++;
+          const pts = DOCK_BASE_SCORE + DOCK_BONUS_STEP * (game.deliveryCount - 1);
+          addScore(pts);
+          // Achievement stats (F9): per-game delivered count (Scrap Runner) + best combo this visit
+          // (Combo Collector); a first-canister-within-60s flag (Speed Recycler); a full 12-in-one-visit
+          // milestone (Heavy Hauler weekly + The Long Haul lifetime); and lifetime delivered/score.
+          game.stats.delivered++;
+          game.stats.bestCombo = Math.max(game.stats.bestCombo, game.deliveryCount);
+          // CS018 P8 (PLANNED-FEATURES-CS018.md §4.3, replaces the v3.6 P3 single ===10 emitter):
+          // four independent "passes through N exactly once per visit" latches — same idiom as the
+          // deliveryCount===12 Heavy Hauler / ===CARGO_CAP_MAX Maxed Out latches below — each awarding
+          // ONE powerup. Cumulatively: 1 for 8-11, 2 for 12-15, 3 for 16-19, 4 for 20-23 delivered.
+          // Each launches from the dock's own position on a fresh random vector, exactly as the old
+          // ===10 emitter did. The "SALVAGE BONUS" floater fires only on the first award (8) so the
+          // dock doesn't repeat identical text four times in one visit.
+          if (game.deliveryCount === 8 || game.deliveryCount === 12 ||
+              game.deliveryCount === 16 || game.deliveryCount === 20) {
+            const a = rand(0, TAU);
+            dropPowerup(game.dock.x, game.dock.y, Math.cos(a) * DOCK_POWERUP_SPEED, Math.sin(a) * DOCK_POWERUP_SPEED);
+            if (game.deliveryCount === 8) {
+              game.floaters.push(new FloatText("SALVAGE BONUS", game.dock.x, game.dock.y - 22, COLOR.dock));
+            }
+          }
+          // Salvage King (lifetime MAX): best canisters delivered in one game. game.stats.delivered only
+          // climbs within a run, so Math.max here tracks the per-game best and keeps the all-time record.
+          Achievements.lifetime.bestDeliveredGame = Math.max(Achievements.lifetime.bestDeliveredGame, game.stats.delivered);
+          game.stats.pacifistStreak++;
+          game.stats.pacifistBest = Math.max(game.stats.pacifistBest, game.stats.pacifistStreak);
+          // Zen Master (lifetime, per-EVENT): each haul whose no-fire delivery streak REACHES 5 counts once.
+          // pacifistStreak passes through 5 exactly once per haul (firing resets it to 0), so === 5 latches
+          // once; a longer haul (6,7,…) doesn't re-fire, and a fresh 5-streak after firing is a new event.
+          if (game.stats.pacifistStreak === 5) Achievements.lifetime.pacifistTowEvents++;
+          if (game.stats.delivered === 1 && game.stats.gameTime <= 60) game.stats.speedRecycler = true;
+          // Heavy Hauler (weekly) + The Long Haul (lifetime fullChains) + Freight Baron (lifetime, per-EVENT):
+          // a FIXED >=12-in-one-visit milestone, deliberately decoupled from the growing game.cargoMax
+          // (FLAG A-5-a / B-8-b) — deliveryCount passes through 12 exactly once per qualifying visit, so all
+          // three latch once per visit.
+          if (game.deliveryCount === 12) { game.stats.fullChainVisit = true; Achievements.lifetime.fullChains++; Achievements.lifetime.heavyHaulerEvents++; }
+          // Maxed Out (lifetime, CS012 P3): deliveryCount passes through CARGO_CAP_MAX exactly once per
+          // qualifying visit (same "passes through" latch idiom as the ===12 check above). Celebration
+          // (floater + gold ring pulse) fires at this same instant — no voice line (deferred, FORK-CS012-B b).
+          if (game.deliveryCount === CARGO_CAP_MAX) {
+            game.stats.maxChainVisit = true;
+            game.floaters.push(new FloatText("MAX HAUL", game.dock.x, game.dock.y - 22, COLOR.ach, 24));
+            game.cargoFlash = HUD_CAP_FLASH;
+          }
+          // CS018 P9: a full-cap 24-piece visit ALSO triggers the SUPER MEGA DELIVERY — guaranteed
+          // six-type set + the snapshot hunter sweep + the coalescence pause (see superMegaDelivery()).
+          // Same "passes through CARGO_CAP_MAX exactly once per visit" latch as Maxed Out above, kept
+          // as its OWN block: Maxed Out is an achievement latch, this is a game event — and P10 hooks
+          // the dock_24 voice line HERE, not into VoiceSys.dockDelivery's tier chain. SILENT this phase.
+          if (game.deliveryCount === CARGO_CAP_MAX) superMegaDelivery();
+          Achievements.lifetime.delivered++;
+          Achievements.lifetime.deliveryScore += pts;
+          game.floaters.push(new FloatText("+" + pts, node.x, node.y, COLOR.dock));
+          AudioSys.deliver(game.deliveryCount);
+          // CS010 P9 (FORK-5 = b): Dan sizes up the haul on the pop that EMPTIES the chain — the offload
+          // block only runs while chain.length > 0, so the emptying pop happens exactly once (THE GATE IS
+          // THE LATCH, no flag needed) and deliveryCount is intact at this instant. 1–4 pieces says nothing.
+          // breakChain()/scatterChain() also zero deliveryCount but never reach here, so they stay silent.
+          if (game.chain.length === 0) VoiceSys.dockDelivery(game.deliveryCount);
+        } else {
+          // CS020: an incidental. It recycles and it PAYS — a canister is a canister — but it is not part
+          // of the haul, so it earns no combo and touches nothing else: not game.deliveryCount, not the
+          // delivery stats, not the lifetime counters, and therefore none of the deliveryCount-keyed
+          // latches downstream (the 8/12/16/20 reward tiers, Heavy Hauler, Maxed Out, the Super Mega
+          // Delivery). Fixing it AT THE COUNTER is what keeps those correct without a second guard.
+          // AudioSys.deliver(1) deliberately, not the combo pitch: audible, but flat.
+          addScore(DOCK_BASE_SCORE);
+          game.floaters.push(new FloatText("+" + DOCK_BASE_SCORE, node.x, node.y, COLOR.dock));
+          AudioSys.deliver(1);
         }
-        game.stats.bestCombo = Math.max(game.stats.bestCombo, game.deliveryCount);
-        // v3.6 P3 (Source 3, FORK-2): the recycle hub emits one powerup per visit, the first time
-        // a visit's deliveryCount passes through 10 — same "exactly once per visit" idiom as the
-        // deliveryCount===12 Heavy Hauler latch just below. Launched from the dock's own position
-        // on a fresh random vector so it clears the dock's footprint before it's collectable.
-        if (game.deliveryCount === 10) {
-          const a = rand(0, TAU);
-          dropPowerup(game.dock.x, game.dock.y, Math.cos(a) * DOCK_POWERUP_SPEED, Math.sin(a) * DOCK_POWERUP_SPEED);
-          game.floaters.push(new FloatText("SALVAGE BONUS", game.dock.x, game.dock.y - 22, COLOR.dock));
-        }
-        // Salvage King (lifetime MAX): best canisters delivered in one game. game.stats.delivered only
-        // climbs within a run, so Math.max here tracks the per-game best and keeps the all-time record.
-        Achievements.lifetime.bestDeliveredGame = Math.max(Achievements.lifetime.bestDeliveredGame, game.stats.delivered);
-        game.stats.pacifistStreak++;
-        game.stats.pacifistBest = Math.max(game.stats.pacifistBest, game.stats.pacifistStreak);
-        // Zen Master (lifetime, per-EVENT): each haul whose no-fire delivery streak REACHES 5 counts once.
-        // pacifistStreak passes through 5 exactly once per haul (firing resets it to 0), so === 5 latches
-        // once; a longer haul (6,7,…) doesn't re-fire, and a fresh 5-streak after firing is a new event.
-        if (game.stats.pacifistStreak === 5) Achievements.lifetime.pacifistTowEvents++;
-        if (game.stats.delivered === 1 && game.stats.gameTime <= 60) game.stats.speedRecycler = true;
-        // Heavy Hauler (weekly) + The Long Haul (lifetime fullChains) + Freight Baron (lifetime, per-EVENT):
-        // a FIXED >=12-in-one-visit milestone, deliberately decoupled from the growing game.cargoMax
-        // (FLAG A-5-a / B-8-b) — deliveryCount passes through 12 exactly once per qualifying visit, so all
-        // three latch once per visit.
-        if (game.deliveryCount === 12) { game.stats.fullChainVisit = true; Achievements.lifetime.fullChains++; Achievements.lifetime.heavyHaulerEvents++; }
-        // Maxed Out (lifetime, CS012 P3): deliveryCount passes through CARGO_CAP_MAX exactly once per
-        // qualifying visit (same "passes through" latch idiom as the ===12 check above). Celebration
-        // (floater + gold ring pulse) fires at this same instant — no voice line (deferred, FORK-CS012-B b).
-        if (game.deliveryCount === CARGO_CAP_MAX) {
-          game.stats.maxChainVisit = true;
-          game.floaters.push(new FloatText("MAX HAUL", game.dock.x, game.dock.y - 22, COLOR.ach, 24));
-          game.cargoFlash = HUD_CAP_FLASH;
-        }
-        Achievements.lifetime.delivered++;
-        Achievements.lifetime.deliveryScore += pts;
-        game.floaters.push(new FloatText("+" + pts, node.x, node.y, COLOR.dock));
-        AudioSys.deliver(game.deliveryCount);
-        // CS010 P9 (FORK-5 = b): Dan sizes up the haul on the pop that EMPTIES the chain — the offload
-        // block only runs while chain.length > 0, so the emptying pop happens exactly once (THE GATE IS
-        // THE LATCH, no flag needed) and deliveryCount is intact at this instant. 1–4 pieces says nothing.
-        // breakChain()/scatterChain() also zero deliveryCount but never reach here, so they stay silent.
-        if (game.chain.length === 0) VoiceSys.dockDelivery(game.deliveryCount);
         game.offloadTimer = DOCK_OFFLOAD_INTERVAL;
       }
     } else {
       game.offloadTimer = 0;
-      // combo resets once you leave the dock's neighborhood
-      if (!game.ship.dead &&
-          dist2(game.ship, game.dock) > (game.dock.radius + 40) * (game.dock.radius + 40)) {
-        game.deliveryCount = 0;
-      }
     }
   }
 
@@ -5738,24 +7164,24 @@ function update(dt) {
     const small = Math.random() < smallChance;
     game.saucers.push(new Saucer(small));
     AudioSys.saucer(true, small);
-    // Longer gaps between saucers early, tightening toward the shipped cadence at full difficulty.
-    // CS017 P4: the wave-scaled value is the level's OPENING gap; time-in-level (wavePressure) then
-    // shortens it further toward each bound's own _CEIL on top of that (FORK-CS017-B -> COMPOSE).
-    const gapMinBase = ramp(SAUCER_GAP_FLOOR_MIN, SAUCER_GAP_CEIL_MIN, game.wave);
-    const gapMaxBase = ramp(SAUCER_GAP_FLOOR_MAX, SAUCER_GAP_CEIL_MAX, game.wave);
-    const gapPressure = wavePressure() * DEBUG.saucerGapPressure;
-    const gapMin = gapMinBase + (SAUCER_GAP_CEIL_MIN - gapMinBase) * gapPressure;
-    const gapMax = gapMaxBase + (SAUCER_GAP_CEIL_MAX - gapMaxBase) * gapPressure;
-    game.saucerTimer = rand(gapMin, gapMax);
+    // CS018 P6: appearance frequency, by TIER — INVERTED (§3.1), jittered around the tier centre.
+    // Replaces the old wave-ramp + time-in-level-pressure derivation; the pressure axis's
+    // DEBUG.saucerGapPressure knob retired with this site (SAUCER_GAP_* retire alongside, below).
+    game.saucerTimer = ufoAppearInterval();
   }
 
-  // One Hunter lineage at a time: a fresh large core only spawns once the whole family is
-  // clear (core + any homing children). Cadence is unchanged from the old Satellite; only the
-  // Hunters' movement speed/agility ramps with difficulty (F4), not how often they appear.
+  // The AMBIENT Hunter producer, one of two (the other is coalescence). CS018 P4 (§4.1): the old
+  // `game.hunters.length === 0` gate — "one lineage at a time, and not even a leftover small may be
+  // alive" — was a de facto cap of ONE, so it had to go for a table cap of 7/10/12 to mean anything.
+  // Several lineages can now coexist, bounded by largeHunterCap(); middle/small hunters no longer
+  // block a spawn at all. The `game.wave >= 2` gate and the rand(20, 32) cadence are UNCHANGED — how
+  // often a Hunter appears is still not a difficulty lever, only how many may exist at once.
+  // Levels 1–4 have a cap of 0, so no ambient Hunter appears there: levels 2–4 lose the Hunter they
+  // used to get, which is the intended consequence of the table (§4.1), not an oversight.
   game.hunterTimer -= dt;
-  if (game.hunterTimer <= 0 && game.hunters.length === 0 && game.wave >= 2) {
+  if (game.hunterTimer <= 0 && largeHunterCount() < largeHunterCap() && game.wave >= 2) {
+    noteLargeHunterSpawn();   // FLAG-i: arms Hunter's Bane only on the 0 -> 1 transition, not every spawn
     game.hunters.push(HunterSatellite.spawnCore());
-    game.stats.hunterLineageKills = 0; // start counting this lineage for Hunter's Bane (F9)
     game.hunterTimer = rand(20, 32);
   }
 
@@ -5816,7 +7242,7 @@ function update(dt) {
       if (!b.dead && game.chain.length) {
         for (let i = 0; i < game.chain.length; i++) {
           if (dist2(b, game.chain[i]) < 9 * 9) {
-            b.dead = true; breakChain(i); break;
+            b.dead = true; breakChain(i, b); break;   // CS019 P1: src passed for symmetry; a dead bullet never re-presents
           }
         }
       }
@@ -5838,6 +7264,12 @@ function update(dt) {
             game.stats.deflects++; // Shield Surfer (F9): a homing Hunter killed on the shield
             AudioSys.shieldPing();
             destroyHunter(h);
+          } else if (h.orbitCenter) {
+            // CS021 P1b: a hazard ON A RAIL cannot be pushed — its position is re-derived from its
+            // orbit angle every frame, so shieldDeflect's shove is undone before it separates. Bounce
+            // the SHIP instead. Same gate as the motion mode itself (one concept, not two), so this
+            // branch is unreachable for every free-moving hazard and shieldDeflect below is untouched.
+            shieldBounce(h);
           } else {
             shieldDeflect(h);
           }
@@ -5871,8 +7303,18 @@ function update(dt) {
       const n = game.chain[i];
       for (const h of chainHazards) {
         if (h.dead) continue;
+        // CS019 P1: a body whose break was just absorbed keeps overlapping (nothing was severed), so it
+        // would otherwise bill the identical contact every frame. Skip it while its stamp holds.
+        //   The skip lives HERE, not at the choke point, because this scan `break chainScan`s on the
+        // FIRST overlapping pair it finds: a stamped hazard sitting on node 0 would consume the scan's
+        // one slot every frame and hide a different, UNSTAMPED hazard genuinely hitting node 5 for the
+        // whole cooldown window. Skipping in the inner loop lets the scan keep looking.
+        //   The powerActive("guard") clause is NOT redundant. If the guard ends mid-contact — the clock
+        // runs out, or the budget is spent on another hazard — a stamped body must cut the chain on the
+        // very next frame. Without it, a stale stamp would grant free passage through an UNPROTECTED tow.
+        if (h.guardT > 0 && powerActive("guard")) continue;
         const r = h.radius + 7;
-        if (dist2(n, h) < r * r) { breakChain(i); break chainScan; }
+        if (dist2(n, h) < r * r) { breakChain(i, h); break chainScan; }
       }
     }
   }
@@ -6177,31 +7619,50 @@ function drawDifficulty() {
   drawMenuHint("↑↓ move    ◄► toggle    ENTER / A select    ESC / B back", VIEW_W / 2, y + 452);
 }
 
-// Hidden Debug Options panel renderer (CS015 P4) — generic over DEBUG_VARS, following drawSound's
-// value-row layout (left-aligned label + value + ◄► chevrons on the focused row) plus a centered Back
-// row. Panel height grows with the registry, so P5/P6 knobs slot in with no layout edit. CS017 P2 adds
-// one more row between the values and Back: "Dump difficulty log" — an ACTION row, rendered like Back
+// Hidden Debug Options panel renderer (CS015 P4) — generic over DEBUG_ROWS, following drawSound's value-row
+// layout (left-aligned label + value + ◄► chevrons on the focused row) plus a centered Back row. CS017 P2
+// added one more row between the values and Back: "Dump difficulty log" — an ACTION row, rendered like Back
 // (centered, ▶ marker, no value, no chevrons even when selected) rather than like a value row.
+//
+// CS018 P2 rebuilt the layout. The panel used to size itself to the registry (`h = 220 + (N + 1) * 46`) and
+// already overflowed the viewport at 12 entries; it is now a FIXED DEBUG_PANEL_H with a SCROLLING WINDOW of
+// DEBUG_ROWS_VISIBLE rows, so growing the registry never touches layout. Rows come straight off DEBUG_ROWS —
+// section headers, value rows, the Dump action and Back are all just rows and all scroll together, which is
+// what keeps the last row reachable at any size. A position indicator below the band shows the cursor's place
+// in the whole list, with ▲/▼ when there is more above/below.
 function drawDebug() {
-  const N = DEBUG_VARS.length, h = 220 + (N + 1) * 46;
-  const { x, y } = menuPanel(560, h, "DEBUG OPTIONS");
-  const m = game.menu;
-  let cy = y + 100;
-  DEBUG_VARS.forEach((e, i) => {
-    const sel = m.index === i;
-    drawText(e.label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
-    const ox = x + 340;
-    drawText(debugShown[e.id] + (e.unit ? " " + e.unit : ""), ox, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
-    if (sel) { drawText("◄", ox - 24, cy + 7, 16, COLOR.text); drawText("►", ox + 120, cy + 7, 16, COLOR.text); }
-    cy += 46;
-  });
-  const dumpSel = m.index === N;
-  drawText((dumpSel ? "▶ " : "   ") + "Dump difficulty log", VIEW_W / 2, cy + 6, 18, dumpSel ? COLOR.text : COLOR.menuIdle);
-  cy += 46;
-  cy += 14;
-  const backSel = m.index === N + 1;
-  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, cy + 6, 22, backSel ? COLOR.text : COLOR.menuIdle);
-  drawMenuHint("↑↓ move    ◄► adjust    ENTER / A select    ESC / B back", VIEW_W / 2, y + h - 30);
+  const { x, y } = menuPanel(DEBUG_PANEL_W, DEBUG_PANEL_H, "DEBUG OPTIONS");
+  const m = game.menu, total = DEBUG_ROWS.length;
+  const top = debugScrollTop(), end = Math.min(total, top + DEBUG_ROWS_VISIBLE);
+  let cy = y + DEBUG_ROWS_Y;
+  for (let i = top; i < end; i++) {
+    const r = DEBUG_ROWS[i], sel = m.index === i;
+    if (r.kind === "header") {
+      drawText("— " + r.label + " —", x + 40, cy + 6, 15, COLOR.dim, "left");   // never selectable, never a cursor
+    } else if (r.kind === "var") {
+      const e = r.e, ox = x + DEBUG_VALUE_X, typing = sel && debugEntryActive();
+      drawText(e.label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
+      // While typing, the pending digits REPLACE the live value (with a caret, in the "uncommitted" tint) so
+      // it is unambiguous that nothing has been written yet — and the ◄► chevrons drop, because arrows don't
+      // step while an entry is pending.
+      const val = typing ? DebugPanel.entry + "_" : debugShown[e.id] + (e.unit ? " " + e.unit : "");
+      drawText(val, ox, cy + 6, 18, typing ? COLOR.garbageBonus : sel ? COLOR.text : COLOR.menuIdle, "left");
+      if (sel && !typing) { drawText("◄", ox - 24, cy + 7, 16, COLOR.text); drawText("►", ox + 120, cy + 7, 16, COLOR.text); }
+    } else {   // the Dump action row and Back — centered, ▶ marker, no value, no chevrons
+      drawText((sel ? "▶ " : "   ") + r.label, VIEW_W / 2, cy + 6,
+               r.kind === "back" ? 22 : 18, sel ? COLOR.text : COLOR.menuIdle);
+    }
+    cy += DEBUG_ROW_STEP;
+  }
+  const more = (top > 0 ? "▲  " : "    ") + (m.index + 1) + " / " + total + (end < total ? "  ▼" : "    ");
+  drawText(more, VIEW_W / 2, y + DEBUG_PANEL_H - 58, 15, COLOR.dim);
+  // CS021 P3 (FLAG-CS021-c): the reroll hint only appears while there's a live orbit layout to reroll —
+  // documented here rather than as a permanent row, since it's a raw keybind with no DEBUG_ROWS entry.
+  drawMenuHint(debugEntryActive()
+    ? "type value    ENTER / A commit    ESC / B cancel    BKSP delete"
+    : "↑↓ move    ◄► adjust    0-9 type    ENTER / A select    ESC / B back" +
+      (game.orbitLayout ? "    R reroll orbit start angles" : ""),
+    VIEW_W / 2, y + DEBUG_PANEL_H - 30);
 }
 
 function drawControlsMenu() {
@@ -6506,11 +7967,29 @@ function drawToasts() {
 // Background stars scattered across the whole world (count scales with world area
 // to preserve the original on-screen density). Drawn in screen space, wrap-aware,
 // so the field scrolls seamlessly and never shows a tiling repeat or an edge seam.
-const STAR_COUNT = Math.round(STAR_DENSITY * (WORLD_W * WORLD_H) / (VIEW_W * VIEW_H));
+//
+// CS022 P1 (§4.3, FLAG-CS022-d): GENERATE ONCE FOR THE LARGEST SIZE, FILTER PER WORLD. WORLD_W/WORLD_H
+// are mutable now, so an area-derived count cached at module load would be stale the moment the world
+// grew — this was the ONLY such cache in the file. `stars` is therefore laid over
+// worldDims(WORLD_SIZE_MAX) once, and applyWorldSize() rebuilds `starsActive` as the subset inside the
+// CURRENT world. Because the distribution is uniform, that subset's count is the area-derived value for
+// whatever size is live (~320 at size 4, all 1280 at size 16) with no scaling — and, more to the point,
+// THE SKY IS STABLE ACROSS TRANSITIONS: a size-4 sky is literally a sub-region of the size-16 sky
+// rather than a fresh roll every level. The filter runs once per transition, never per frame.
+const [STAR_WORLD_W, STAR_WORLD_H] = worldDims(WORLD_SIZE_MAX);
+const STAR_COUNT = Math.round(STAR_DENSITY * (STAR_WORLD_W * STAR_WORLD_H) / (VIEW_W * VIEW_H));
 const stars = [];
 for (let i = 0; i < STAR_COUNT; i++) {
-  stars.push({ x: Math.random() * WORLD_W, y: Math.random() * WORLD_H, s: rand(1, 1.8), a: rand(STAR_BRIGHT_MIN, STAR_BRIGHT_MAX) });
+  stars.push({ x: Math.random() * STAR_WORLD_W, y: Math.random() * STAR_WORLD_H, s: rand(1, 1.8), a: rand(STAR_BRIGHT_MIN, STAR_BRIGHT_MAX) });
 }
+// The far stars inside the CURRENT world — what drawStarfield()'s far loop iterates. Mutated IN PLACE
+// (never reassigned) so the array identity is stable for anything holding a reference to it.
+const starsActive = [];
+function rebuildStarsActive() {
+  starsActive.length = 0;
+  for (const st of stars) if (st.x < WORLD_W && st.y < WORLD_H) starsActive.push(st);
+}
+rebuildStarsActive();   // module load: the FIELD-sized world the game boots in
 
 // Near parallax layer — sparse, brighter, tiled in *screen* space (not world-fixed) so it can
 // move at a fraction of the camera offset without needing toroidal wrap math (FLAG B-3-a).
@@ -6525,8 +8004,10 @@ for (let i = 0; i < STAR_NEAR_COUNT; i++) {
 function drawStarfield() {
   const cam = game.camera;
 
-  // Far layer: world-fixed, 1.0x camera offset, wrap-aware (unchanged reference layer).
-  for (const st of stars) {
+  // Far layer: world-fixed, 1.0x camera offset, wrap-aware (unchanged reference layer). CS022 P1:
+  // iterates starsActive — the subset of `stars` inside the CURRENT world (§4.3). A star outside it
+  // would be measured by shortDelta against the wrong period and could smear across the seam.
+  for (const st of starsActive) {
     const [dx, dy] = shortDelta(cam.x, cam.y, st.x, st.y);
     if (Math.abs(dx) > VIEW_W / 2 || Math.abs(dy) > VIEW_H / 2) continue;
     ctx.fillStyle = `rgba(120, 160, 210, ${st.a})`;
@@ -6730,6 +8211,18 @@ function drawHUD() {
   // a display label only ("level" is player-facing vocabulary, "wave" stays the code term).
   drawText("LEVEL " + game.wave, 30, 62, 22, COLOR.text, "left");
 
+  // CS021 P4: delivery-combo readout, closes FLAG-CS020-i. DISPLAY ONLY — reads game.deliveryCount and
+  // game.cargoMax exactly as the dock-offload block (update(), above) already tracks them; nothing here
+  // writes either field or keeps a second copy of the counter. Shown whenever an effort is live and gone
+  // the instant it isn't: the dock block already zeroes game.deliveryCount on all three routes an effort
+  // can end — a towed hook outside the ring (a fresh gather resets the old one), the DOCK_COMBO_GRACE
+  // window expiring, and scatterChain on ship death — so `> 0` alone tracks every one of them without
+  // this readout duplicating any route logic. Ships PLAIN per spec §10 — no grace-window countdown.
+  if (game.deliveryCount > 0) {
+    drawText("COMBO " + game.deliveryCount + "/" + game.cargoMax,
+      HUD_COMBO_X, HUD_COMBO_Y, HUD_COMBO_SIZE, COLOR.dock, "left");
+  }
+
   // CS009 P2: the hull + shield fill bars are gone from the left column — they are now the HULL ring in
   // the top-right corner (drawn below). Left column top-to-bottom is now Score, Level, Cargo, Powerups.
 
@@ -6776,9 +8269,9 @@ function drawHUD() {
   ctx.globalAlpha = 1;   // ALWAYS restore — a leaked alpha would tint the rest of the frame
   drawText("HULL", HUD_HULL_CX, HUD_RING_LABEL_Y, 13, COLOR.dim, "center");
 
-  // CARGO ring (top-right, beside HULL). FORK-2 A: game.cargoMax is NOT a constant — it grows
-  // CARGO_BASE->CARGO_CAP_MAX at runtime (+1 per CARGO_GROW_PER delivered), so the fraction and the
-  // "/N" label both read it live every frame; never cache it, never substitute a literal.
+  // CARGO ring (top-right, beside HULL). FORK-2 A: game.cargoMax is NOT a constant — it steps
+  // 8->24 at level boundaries per levelDef(game.wave).payloadSlots (CS018 P5), so the fraction and
+  // the "/N" label both read it live every frame; never cache it, never substitute a literal.
   const cargoFull = game.chain.length >= game.cargoMax;
   // Full-cap or a fresh cap-up both mean gold — same idiom as the HULL ring's MAX state: gold means
   // exactly one thing across the whole HUD, "this resource is at its cap; more is wasted."
