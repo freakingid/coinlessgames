@@ -3,9 +3,9 @@ title: Orbital Overhaul
 series: Atomic Dustbin Dan
 order: 1
 tagline: Blast space junk. Haul it in. Beware the Hunters
-description: A free, open-source vector arcade game about cleaning up orbital
-  debris. Shoot dead satellites into pieces, then tow the radioactive salvage
-  home on a physics-driven chain.
+description: A free multidirectional (rotate-and-thrust) space shooter vector
+  arcade game about cleaning up orbital debris. Shoot dead satellites into
+  pieces, then tow the radioactive salvage home on a physics-driven chain.
 status: Playable in browser
 playUrl: /play/orbital-overhaul/
 draft: false
