@@ -1,5 +1,6 @@
 backend:
-  name: git-gateway
+  name: github
+  repo: freakingid/coinlessgames
   branch: main
 media_folder: "coinlessgames/public/uploads"
 public_folder: "/uploads"
