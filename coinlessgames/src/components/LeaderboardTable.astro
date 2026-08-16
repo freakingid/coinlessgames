@@ -1,0 +1,401 @@
+---
+// Renders a live leaderboard for one game. Read-only: it calls fetchBoard()
+// and nothing else. No player identity, no submission, no achievements.
+//
+// Data is fetched CLIENT-SIDE on load, deliberately — build-time fetching
+// would tie board freshness to unrelated site rebuilds (a devlog post
+// shouldn't be what refreshes the scores).
+import type { LeaderboardConfig } from '../lib/leaderboards';
+import { LEADERBOARD_ENDPOINT } from '../lib/leaderboards';
+
+interface Props {
+  config: LeaderboardConfig;
+}
+
+const { config } = Astro.props;
+
+// Handed to the client script through a data attribute rather than
+// `define:vars`, because define:vars makes the script inline-and-unbundled,
+// which would break the `import` of the kit module.
+const clientConfig = JSON.stringify({
+  endpoint: LEADERBOARD_ENDPOINT,
+  gameId: config.gameId,
+  windows: config.windows,
+  limit: config.limit,
+  statColumns: config.statColumns,
+});
+---
+
+<section class="lb" data-leaderboard={clientConfig}>
+  <div class="lb__controls">
+    <div class="lb__windows" role="group" aria-label="Time window">
+      {
+        config.windows.map((w, i) => (
+          <button
+            type="button"
+            class="lb__win"
+            data-window={w.value}
+            aria-pressed={i === 0 ? 'true' : 'false'}
+          >
+            {w.label}
+          </button>
+        ))
+      }
+    </div>
+
+    <div class="lb__freshness">
+      <span class="lb__updated" data-updated aria-live="polite">—</span>
+      <button type="button" class="lb__refresh" data-refresh>Refresh</button>
+    </div>
+  </div>
+
+  <div class="lb__viewport" data-viewport>
+    <table class="lb__table" data-table hidden>
+      <thead>
+        <tr>
+          <th scope="col" class="lb__th lb__th--rank">#</th>
+          <th scope="col" class="lb__th">Player</th>
+          <th scope="col" class="lb__th lb__th--num" data-metric-head>Score</th>
+          {
+            config.statColumns.map((c) => (
+              <th scope="col" class="lb__th lb__th--num">
+                {c.label}
+              </th>
+            ))
+          }
+        </tr>
+      </thead>
+      <tbody data-tbody></tbody>
+    </table>
+
+    <p class="lb__msg" data-msg>Loading board…</p>
+  </div>
+
+  <p class="lb__legend" data-legend hidden>
+    <span class="lb__flag" aria-hidden="true">⚑</span> Flagged for review — still a real
+    board entry, just noted.
+  </p>
+</section>
+
+<script>
+  import * as KitLeaderboard from '../lib/kit-leaderboard.js';
+
+  interface StatColumn {
+    key: string;
+    label: string;
+  }
+
+  interface ClientConfig {
+    endpoint: string;
+    gameId: string;
+    windows: { value: string; label: string }[];
+    limit: number;
+    statColumns: StatColumn[];
+  }
+
+  function relativeTime(from: number): string {
+    const secs = Math.round((Date.now() - from) / 1000);
+    if (secs < 5) return 'Updated just now';
+    if (secs < 60) return `Updated ${secs}s ago`;
+    const mins = Math.round(secs / 60);
+    if (mins < 60) return `Updated ${mins}m ago`;
+    return `Updated ${Math.round(mins / 60)}h ago`;
+  }
+
+  function initBoard(root: HTMLElement) {
+    const raw = root.dataset.leaderboard;
+    if (!raw) return;
+    const config: ClientConfig = JSON.parse(raw);
+
+    const table = root.querySelector<HTMLTableElement>('[data-table]')!;
+    const tbody = root.querySelector<HTMLElement>('[data-tbody]')!;
+    const msg = root.querySelector<HTMLElement>('[data-msg]')!;
+    const metricHead = root.querySelector<HTMLElement>('[data-metric-head]')!;
+    const updatedEl = root.querySelector<HTMLElement>('[data-updated]')!;
+    const legend = root.querySelector<HTMLElement>('[data-legend]')!;
+    const refreshBtn = root.querySelector<HTMLButtonElement>('[data-refresh]')!;
+    const winBtns = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-window]'));
+
+    // getPlayer is omitted on purpose: it is only read by submit(), which this
+    // page never calls. See the note in the planning doc about create()'s
+    // queue-flush side effect.
+    const board = KitLeaderboard.create({
+      endpoint: config.endpoint,
+      gameId: config.gameId,
+      gameVersion: 'site-leaderboard-page',
+    });
+
+    let currentWindow = config.windows[0]?.value ?? 'all';
+    let fetchedAt = 0;
+    // Bumped per request so a slow response can never overwrite a newer one.
+    let token = 0;
+
+    function setMessage(text: string | null) {
+      if (text === null) {
+        msg.hidden = true;
+        return;
+      }
+      msg.hidden = false;
+      msg.textContent = text;
+    }
+
+    function tickFreshness() {
+      updatedEl.textContent = fetchedAt ? relativeTime(fetchedAt) : '—';
+    }
+
+    function render(boardData: any) {
+      metricHead.textContent = boardData.metricLabel || 'Score';
+      tbody.replaceChildren();
+
+      if (!boardData.entries.length) {
+        table.hidden = true;
+        legend.hidden = true;
+        setMessage('No scores posted in this window yet.');
+        return;
+      }
+
+      let anyFlagged = false;
+
+      for (const entry of boardData.entries) {
+        const tr = document.createElement('tr');
+        tr.className = 'lb__row';
+
+        const rank = document.createElement('td');
+        rank.className = 'lb__td lb__td--rank';
+        rank.textContent = String(entry.rank);
+        tr.append(rank);
+
+        const name = document.createElement('td');
+        name.className = 'lb__td lb__td--name';
+        name.textContent = entry.displayName;
+        if (entry.flagged) {
+          anyFlagged = true;
+          const flag = document.createElement('span');
+          flag.className = 'lb__flag';
+          flag.textContent = ' ⚑';
+          flag.title = 'Flagged for review';
+          name.append(flag);
+        }
+        tr.append(name);
+
+        const metric = document.createElement('td');
+        metric.className = 'lb__td lb__td--num lb__td--metric';
+        metric.textContent = Number(entry.metric).toLocaleString();
+        tr.append(metric);
+
+        for (const col of config.statColumns) {
+          const td = document.createElement('td');
+          td.className = 'lb__td lb__td--num';
+          const value = entry.stats ? entry.stats[col.key] : undefined;
+          td.textContent =
+            typeof value === 'number' ? value.toLocaleString() : value != null ? String(value) : '—';
+          tr.append(td);
+        }
+
+        tbody.append(tr);
+      }
+
+      table.hidden = false;
+      legend.hidden = !anyFlagged;
+      setMessage(null);
+    }
+
+    async function load() {
+      const mine = ++token;
+      refreshBtn.disabled = true;
+      if (table.hidden) setMessage('Loading board…');
+
+      try {
+        const data = await board.fetchBoard({ window: currentWindow, limit: config.limit });
+        if (mine !== token) return;
+        fetchedAt = Date.parse(data.generatedAt) || Date.now();
+        render(data);
+      } catch {
+        if (mine !== token) return;
+        table.hidden = true;
+        legend.hidden = true;
+        setMessage("Couldn't reach the scoreboard. Try Refresh in a moment.");
+      } finally {
+        if (mine === token) refreshBtn.disabled = false;
+        tickFreshness();
+      }
+    }
+
+    for (const btn of winBtns) {
+      btn.addEventListener('click', () => {
+        const value = btn.dataset.window!;
+        if (value === currentWindow) return;
+        currentWindow = value;
+        for (const other of winBtns) {
+          other.setAttribute('aria-pressed', other === btn ? 'true' : 'false');
+        }
+        load();
+      });
+    }
+
+    refreshBtn.addEventListener('click', () => load());
+
+    // Display-only ticker for the "updated Ns ago" label. This is NOT polling —
+    // it never touches the network; the board only refetches on an explicit
+    // window change or Refresh press.
+    setInterval(tickFreshness, 10000);
+
+    load();
+  }
+
+  for (const root of document.querySelectorAll<HTMLElement>('[data-leaderboard]')) {
+    initBoard(root);
+  }
+</script>
+
+<style>
+  .lb {
+    border: 2px solid var(--color-border);
+    background: var(--color-bg-inset);
+    border-radius: var(--radius);
+    padding: 1.25rem;
+  }
+
+  .lb__controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 1.25rem;
+  }
+
+  .lb__windows {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .lb__win,
+  .lb__refresh {
+    font-family: var(--font-body);
+    font-weight: 700;
+    font-size: 0.7rem;
+    letter-spacing: 1px;
+    color: var(--color-text);
+    background: var(--color-bg-raised);
+    border: 2px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: 0.45rem 0.7rem;
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease;
+  }
+
+  .lb__win:hover,
+  .lb__refresh:hover {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+
+  .lb__win[aria-pressed='true'] {
+    color: var(--color-bg);
+    background: var(--color-marquee);
+    border-color: var(--color-marquee);
+  }
+
+  .lb__refresh[disabled] {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .lb__freshness {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .lb__updated {
+    font-size: 0.75rem;
+    color: var(--color-text-muted);
+    white-space: nowrap;
+  }
+
+  .lb__viewport {
+    overflow-x: auto;
+  }
+
+  .lb__table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-body);
+    font-size: 0.9rem;
+  }
+
+  .lb__th {
+    font-family: var(--font-display);
+    font-size: 0.5rem;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--color-text-muted);
+    text-align: left;
+    padding: 0 0.6rem 0.75rem;
+    border-bottom: 2px solid var(--color-border);
+    white-space: nowrap;
+  }
+
+  .lb__th--num {
+    text-align: right;
+  }
+
+  .lb__th--rank {
+    width: 3ch;
+  }
+
+  .lb__td {
+    padding: 0.6rem;
+    border-bottom: 1px solid var(--color-border);
+    color: var(--color-text);
+  }
+
+  .lb__td--rank {
+    color: var(--color-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .lb__td--name {
+    color: var(--color-accent);
+    letter-spacing: 1px;
+  }
+
+  .lb__td--num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .lb__td--metric {
+    color: var(--color-marquee);
+    font-weight: 700;
+  }
+
+  .lb__row:last-child .lb__td {
+    border-bottom: none;
+  }
+
+  .lb__flag {
+    color: var(--color-accent-rare);
+  }
+
+  .lb__msg {
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+    margin: 1rem 0 0;
+  }
+
+  .lb__legend {
+    color: var(--color-text-muted);
+    font-size: 0.75rem;
+    margin: 1rem 0 0;
+  }
+
+  @media (max-width: 480px) {
+    .lb__controls {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+  }
+</style>
