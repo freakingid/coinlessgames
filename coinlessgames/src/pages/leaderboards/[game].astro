@@ -1,0 +1,64 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import LeaderboardTable from '../../components/LeaderboardTable.astro';
+import { LEADERBOARDS } from '../../lib/leaderboards';
+
+export async function getStaticPaths() {
+  return LEADERBOARDS.map((config) => ({
+    params: { game: config.slug },
+    props: { config },
+  }));
+}
+
+const { config } = Astro.props;
+---
+
+<BaseLayout
+  title={`${config.title} — Leaderboard`}
+  description={`Live internet leaderboard for ${config.title}. No coins required.`}
+>
+  <div class="board wrap">
+    <header class="board__head">
+      <p class="board__eyebrow">// HIGH SCORES</p>
+      <h1 class="board__title">{config.title}</h1>
+      <p class="board__sub">
+        Live scores posted from the game. <a href={`/games/${config.gameSlug}/`}>Back to the game page</a>.
+      </p>
+    </header>
+
+    <LeaderboardTable config={config} />
+  </div>
+</BaseLayout>
+
+<style>
+  .board {
+    padding: 3rem 1.5rem 5rem;
+  }
+
+  .board__head {
+    margin-bottom: 2rem;
+  }
+
+  .board__eyebrow {
+    font-family: var(--font-display);
+    font-size: 0.6rem;
+    letter-spacing: 1px;
+    color: var(--color-marquee);
+    margin: 0 0 1rem;
+  }
+
+  .board__title {
+    font-family: var(--font-display);
+    font-size: 1.25rem;
+    line-height: 1.5;
+    margin: 0;
+    color: var(--color-text);
+    text-shadow: 0 0 12px rgba(74, 222, 128, 0.35);
+  }
+
+  .board__sub {
+    color: var(--color-text-muted);
+    margin: 1rem 0 0;
+    font-size: 0.9rem;
+  }
+</style>

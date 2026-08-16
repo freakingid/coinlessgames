@@ -1,6 +1,7 @@
 ---
 import { getCollection } from 'astro:content';
 import BaseLayout from '../../layouts/BaseLayout.astro';
+import { getLeaderboardForGame } from '../../lib/leaderboards';
 
 export async function getStaticPaths() {
   const games = await getCollection('games', ({ data }) => !data.draft);
@@ -15,6 +16,9 @@ const { Content } = await game.render();
 const d = game.data;
 
 const logParagraphs = d.logEntry.trim().split(/\n\s*\n/);
+
+// undefined for games with no public board — the link simply doesn't render.
+const board = getLeaderboardForGame(game.slug);
 ---
 
 <BaseLayout title={`${d.title} — Coinless Games`} description={d.description}>
@@ -26,12 +30,19 @@ const logParagraphs = d.logEntry.trim().split(/\n\s*\n/);
     </header>
 
     {
-      d.playUrl && (
+      (d.playUrl || board) && (
         <p class="game__cta-row">
-          <a class="game__cta" href={d.playUrl} target="_blank" rel="noopener">
-            ▶ Play in browser
-          </a>
-          <span class="game__status">{d.status} — no coins required</span>
+          {d.playUrl && (
+            <a class="game__cta" href={d.playUrl} target="_blank" rel="noopener">
+              ▶ Play in browser
+            </a>
+          )}
+          {board && (
+            <a class="game__cta game__cta--ghost" href={`/leaderboards/${board.slug}/`}>
+              ★ Leaderboard
+            </a>
+          )}
+          {d.playUrl && <span class="game__status">{d.status} — no coins required</span>}
         </p>
       )
     }
@@ -99,6 +110,21 @@ const logParagraphs = d.logEntry.trim().split(/\n\s*\n/);
     color: var(--color-bg);
     transform: translateY(-2px);
     box-shadow: 0 0 26px rgba(251, 191, 36, 0.6);
+  }
+
+  /* Secondary CTA: same shape as the play button, phosphor-green outline rather
+     than filled marquee-yellow, so it reads as the lesser of the two actions. */
+  .game__cta--ghost {
+    color: var(--color-accent);
+    background: transparent;
+    border-color: var(--color-accent);
+    box-shadow: 0 0 12px rgba(74, 222, 128, 0.2);
+  }
+
+  .game__cta--ghost:hover,
+  .game__cta--ghost:focus-visible {
+    color: var(--color-accent);
+    box-shadow: 0 0 22px rgba(74, 222, 128, 0.45);
   }
 
   .game__status { font-size: 0.8rem; color: var(--color-text-muted); }
