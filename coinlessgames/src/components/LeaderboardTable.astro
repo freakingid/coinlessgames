@@ -338,8 +338,16 @@ const clientConfig = JSON.stringify({
     white-space: nowrap;
   }
 
+  /* Optical alignment, not box alignment. `letter-spacing` on .lb__th adds a
+     trailing gap after the final glyph, and Press Start 2P carries more right
+     side bearing than the Space Mono numerals below it — so an identically
+     padded heading reads as sitting left of its column. Trim the difference
+     off the heading's right padding and drop the trailing letter-space. */
   .lb__th--num {
     text-align: right;
+    padding-right: calc(0.6rem - 3px);
+    letter-spacing: 0;
+    word-spacing: 1px;
   }
 
   .lb__th--rank {
