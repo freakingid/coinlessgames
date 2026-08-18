@@ -459,7 +459,10 @@ const SCORES_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 // CS030 P7: "1.0.0.29" -> "1.0.0.30". Still tracking the changeset number.
 // CS031 P7: "1.0.0.30" -> "1.0.0.31". Still tracking the changeset number.
 // CS032 P7: "1.0.0.31" -> "1.0.0.32". Still tracking the changeset number.
-const GAME_VERSION = "1.0.0.33";
+// CS034 P9: "1.0.0.33" -> "1.0.0.34". Still tracking the changeset number.
+// CS035 P7: "1.0.0.34" -> "1.0.0.35". Still tracking the changeset number.
+// CS036 P7: "1.0.0.35" -> "1.0.0.36". Still tracking the changeset number.
+const GAME_VERSION = "1.0.0.36";
 const VERSION_STAMP_INSET_X = 16; // px in from the right edge of the viewport (title screen only)
 const VERSION_STAMP_INSET_Y = 16; // px in from the bottom edge of the viewport (title screen only)
 
@@ -629,14 +632,17 @@ const CARGO_TURN = 0.0;         // PLAYTEST KNOB (CS010 §3, the proposed "inert
 const DOCK_RADIUS = 88;
 const DOCK_BASE_SCORE = 50;     // 1st canister of a visit
 const DOCK_BONUS_STEP = 25;     // each additional canister: +25 over the last
-// CS020: px PAST dock.radius — the dock's "neighborhood". Two readers, and they must be the same
-// number: the towed/incidental tag at capture (a piece hooked INSIDE the neighborhood was never
-// towed in, so it earns no combo) and the CS020 P1b grace window's arm/decay gate (inside the
-// neighborhood a delivery run is safe indefinitely; outside it the run is on a countdown).
-// Deliberately NOT the dock's +10 offload radius, which is a different, smaller number and stays as
-// it is: at +10 a parked player's own magnet grabs would tag `towed` and therefore reset their own
-// combo continuously (the P1b hook reset below). +40 keeps a parked ship's pickups neutral.
-// See GDD 2.10.
+// CS020: px PAST dock.radius — the dock's "neighborhood". Readers, and they must all be the same
+// number: the CS035 P2 DOCK LOCKOUT at the pickup gate (inside the ring the ship cannot hook Debris
+// at all, and a piece that reaches the capture region is pushed back out), the CS020 P1b
+// deliveryCount reset that rides the same gate, and the CS020 P1b grace window's arm/decay gate
+// (inside the neighborhood a delivery run is safe indefinitely; outside it the run is on a
+// countdown). Deliberately NOT the dock's +10 offload radius, which is a different, smaller number
+// and stays as it is: at +10 the lockout would leave a 30px annulus of live pickups around a parked
+// ship — under CS020 that annulus tagged incidentals, and under CS035 it would be the one place the
+// lockout does not reach. +40 makes the incidental category empty by construction.
+// CS035 P2 (§2.4): the third reader named here through CS034 — the towed/incidental tag at capture —
+// is gone with the tag itself. See GDD 2.10.
 const DOCK_NEIGHBORHOOD_PAD = 40;
 // CS020 P1b (FORK-CS020-E): sec a delivery run survives OUTSIDE the dock's neighborhood before
 // game.deliveryCount zeroes. A delivery run is ONE EFFORT — one chain, delivered in one go — and a
@@ -652,6 +658,9 @@ const DOCK_OFFLOAD_INTERVAL = 0.05; // PLAYTEST KNOB (v3.4 P1; was a bare litera
                                      // canisters peeling off at the dock.
 const DOCK_POWERUP_SPEED = 120;     // PLAYTEST KNOB (v3.6 P3): launch speed of the hub's per-visit
                                      // powerup drop, random direction from the dock's own position.
+                                     // CS035 P6 (spec §5.5): only the registry's `def` source now —
+                                     // both call sites (the reward-tier drops here and the Super Mega
+                                     // Delivery guaranteed set) read DEBUG.dockPowerupSpeed.
 // CS026 P6 (gate Q5) moved the delivery "+pts" floaters' origin to the ship — "closer to the ship"
 // was Paul's stated answer at that gate, read against DELIVERY_FLOAT_DY, a fixed nudge above the
 // hull. CS029 §0.3: that was a misreading. The ship moves every frame, so a ship-relative origin
@@ -660,10 +669,15 @@ const DOCK_POWERUP_SPEED = 120;     // PLAYTEST KNOB (v3.6 P3): launch speed of 
 // STATIC anchor at the dock, which is fixed for the whole visit (`Dock.update()` only advances
 // `spin`). DELIVERY_FLOAT_DY is retired; both delivery branches now share ONE origin,
 // `dock.y - DOCK_RADIUS * DELIVERY_FLOAT_ANCHOR_FRAC`, gated via tools/dock-float-lab.html (CS029
-// P3/P4, gate G2). 0.5 sits the anchor halfway between the dock's centre and its rim — high enough
-// that SALVAGE BONUS/MAX HAUL's own dock.y-22 climb (they use FloatText's un-passed 30px/s·1.1s
-// defaults) doesn't cross it. Not a knob: like DELIVERY_FLOAT_DY before it, this is a fixed
-// placement decision, not a playtest dial.
+// P3/P4, gate G2; re-gated CS034 P1/GATE A against the larger CS034 P8 ticker). 0.75 sits the
+// anchor three-quarters of the way from the dock's centre to its rim — high enough that SALVAGE
+// BONUS/MAX HAUL's own dock.y-22 climb (they use FloatText's un-passed 30px/s·1.1s defaults)
+// doesn't cross it, confirmed clear at CS034's GATE A (was 0.50 through CS029; measured -11.4px
+// overlap at that value once the ticker's ink-aware clearance was actually measured — CS034 P1).
+// Not a knob: like DELIVERY_FLOAT_DY before it, this is a fixed placement decision, not a playtest
+// dial.
+// CS035 P1 (§1.1): re-tuned to 0.50 from a later dock-float-lab session, superseding CS034's GATE A
+// value above; the two milestone floaters that value was guarding against are deleted this phase.
 const DELIVERY_FLOAT_ANCHOR_FRAC = 0.50;
 
 // Larger world & scrolling camera (v1.2)
@@ -1042,12 +1056,16 @@ const POWERUP_DROP_TYPES = ["rapid", "triple", "magnet", "engine", "guard"]; // 
 // CS017 P6: "guard" is the first CONDITIONAL entry — dropPowerup only admits it to the roll while the
 // player is towing >= DEBUG.chainGuardMinTow nodes (a guard with nothing to guard is a dead pickup).
 // Below that threshold the roll renormalises over the other five and is byte-identical to pre-P6.
-// Weight 1 puts it in the existing rare tier alongside magnet/engine — a PLAYTEST KNOB, like the rest.
-const POWERUP_DROP_WEIGHTS = { rapid: 3, triple: 3, scoop: 2, magnet: 1, engine: 1, guard: 1 };
-// CS018 P9: hard ceiling on powerups spawned by ONE Super Mega Delivery — the guaranteed six PLUS
+// CS035 P6 (spec §5.2): every non-guard weight x10 — integers with no room between them, before, at
+// a table total of 10. `guard`'s own entry is now a PLACEHOLDER: guardDropWeight() overwrites it at
+// roll time (dropPowerup's weightOf indirection, below), and it is set to 20 only so a reader of this
+// table sees a plausible number rather than a lie — it is never actually read as a weight.
+const POWERUP_DROP_WEIGHTS = { rapid: 30, triple: 30, scoop: 20, magnet: 10, engine: 10, guard: 20 };
+// CS018 P9: hard ceiling on powerups spawned by ONE Super Mega Delivery — the guaranteed set PLUS
 // every per-piece sweep payout (source doc §7.3: "No more than 48 powerups may spawn simultaneously
-// from a sweep"). A FIXED bound, deliberately NOT a DEBUG_VARS knob — the source doc pins it
-// ("Fixed value, not configurable"). See superMegaDelivery() for the reservation bookkeeping.
+// from a sweep"). CS035 P6 (spec §5.5): this constant is now only the registry's `def` source — the
+// live value is DEBUG.sweepPowerupCap (POWERUPS section), which superMegaDelivery() reads. The old
+// "fixed, not configurable" pin is superseded by that gate decision; see the knob for the shipped 24.
 const SWEEP_POWERUP_CAP = 48;
 const POWERUP_HEALTH_GAP = [18, 26]; // sec between ambient Health spawns (saucer-like cadence)
 const POWERUP_HEALTH_AMOUNT = 25;    // +HP on Health pickup, capped at max (matches the F2 milestone repair)
@@ -2398,6 +2416,17 @@ const CAPTION_LINGER = 1.5, CAPTION_FADE = 0.4, CAPTION_Y = 64, CAPTION_SIZE = 2
 //          centres the glyph box, since drawText positions by baseline, not by box centre.
 const LEVEL_BANNER_TIME = 2.2, LEVEL_BANNER_FADE = 0.5, LEVEL_BANNER_SIZE = 72, LEVEL_BANNER_Y = 24;
 
+// CS036 P2 (spec §1.3) — the COMPLETION ANNOUNCEMENT's two look-calls, the "Level N Complete" twins of
+// the four above. Everything else it draws with is the banner's own: DEBUG.levelBannerSize / ...Y /
+// ...Fade and COLOR.text, read live, so the two announcements can never drift apart on a slider drag.
+//   HINT:  the prompt line under it, in CELEB_HINT's idiom — the ACTUAL bindings named, not a physical
+//          button ("ENTER / A"). ESC / B dismiss too (the same confirm-or-back pair the celebration
+//          panel takes), and are left off the line deliberately: it is a two-key hint at a moment with
+//          exactly one thing to do, not a control reference. ⚠ Wording is a CS036 gate question (H3).
+//   HINT_DY: px DOWN from the announcement's own baseline to the hint's. Clears the descenders of a
+//          72px line with air to spare, and stays clear up to the size knob's 160 ceiling.
+const LEVEL_DONE_HINT = "ENTER / A  continue", LEVEL_DONE_HINT_DY = 44;
+
 // VoiceSys — Dan's speech. A SEPARATE module alongside AudioSys/MusicSys (NOT folded into AudioSys, a
 // flat bag of one-shots): it owns a small sequencer + a radio-processing chain that feeds AudioSys.voice
 // (the volume bus). Every entry point no-ops when AudioSys.ctx is null (the headless-safe guard idiom).
@@ -2996,6 +3025,24 @@ window.addEventListener("keydown", e => {
   if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
   keys[k] = true;
 
+  // CS036 P2 (spec §1.4): the "Level N Complete" announcement owns input while it is up — and it sits
+  // IMMEDIATELY ABOVE the celebration panel's branch so input priority matches the visual order:
+  // announcement -> panel -> play. ⛔ THIS BRANCH MIRRORS THAT ONE; it does not invent a contract. Same
+  // confirm-or-back pair, same `!e.repeat` edge, same unconditional `return`, and the same two functions
+  // shared with the gamepad path so neither handler carries its own copy of the fork.
+  //   The `return` is load-bearing twice over here: without it the confirm that just dismissed the
+  // announcement would fall through into the panel branch below and dismiss the panel it JUST opened, in
+  // one keypress — and ESC (which is `back` AND `pause`) would dismiss and then open the pause menu.
+  //   ⛔ A HELD BUTTON CANNOT SKIP THE ANNOUNCEMENT, structurally, which is why no minimum-hold timer
+  // was added (spec §1.4): the keydown that fired the killing shot arrived BEFORE the freeze armed, and
+  // every keydown after it carries e.repeat. Fire is " " and confirm is "enter", so the key the player is
+  // most likely holding at a wave clear is not even a candidate. ⚠ Gate question H2 verifies this in the
+  // hand.
+  if (levelDoneActive()) {
+    if (!e.repeat && (bindings.confirm.keys.includes(k) || bindings.back.keys.includes(k))) dismissLevelDone();
+    return;
+  }
+
   // CS030 P4 (FORK-CS030-C): the achievement celebration panel owns input while it is up. The `return`
   // is load-bearing: without it the confirm that just dismissed the panel would fall straight through
   // into the startGame() check below in the SAME keypress. ESC resolves as "dismiss" here rather than
@@ -3070,6 +3117,19 @@ function handleGamepadMenu() {
     if (pressedConfirm) menuInput("confirm");
     if (pressedBack)    menuInput("back");
     if (pressedStart)   menuInput("pause");   // Start fully resumes from any menu screen
+    return;
+  }
+
+  // (2.3) CS036 P2 (spec §1.4): the "Level N Complete" announcement — the MANDATORY mirror of the keydown
+  // branch above, sitting ahead of the panel's (2.4) for the same priority reason it does there
+  // (announcement -> panel -> play). ⛔ BOTH HANDLERS OR NEITHER (CLAUDE.md's standing CS030 P4 rule): a
+  // guard added to one and not the other lets a controller player blow straight through with Start and
+  // never see the announcement. Start is SWALLOWED, not acted on — exactly as at (2.4), and that is what
+  // stops it reaching the startGame()/openPause() chain at (3). gpPressed() is a rising edge, so A held
+  // through the killing shot cannot dismiss this either; nothing here reads a direction, so the arm's
+  // resetMenuNav() has no consumer in this branch and is there for whatever takes input next.
+  if (levelDoneActive()) {
+    if (pressedConfirm || pressedBack) dismissLevelDone();
     return;
   }
 
@@ -3569,6 +3629,18 @@ const DEBUG_VARS = [
     def: 5, min: 0, max: 24, step: 1 },
   { id: "chainGuardCooldown", label: "Chain guard cooldown", unit: "s",
     def: 0.75, min: 0.1, max: 3, step: 0.05 },
+  // CS035 P6 (spec §5.3): guard's DROP weight (not the intercept budget above) goes pity-driven —
+  // see guardDropWeight(), read by dropPowerup()'s weightOf indirection. game.stats.cargoDamageEvents
+  // is the pity counter: it climbs on an unguarded chain-sever (breakChain()'s sever path only — a
+  // GUARDED absorb and scatterChain() both leave it untouched) and resets to 0 the instant a guard
+  // powerup drops (not on pickup). base 4 -> ~3.8% of a 100 non-guard total (was 9.1% at the old
+  // flat weight 1-in-11); +8 per event; capped at 40 -> ~29%.
+  { id: "chainGuardDropBase", label: "Chain guard drop base", unit: "",
+    def: 4, min: 0, max: 60, step: 1 },
+  { id: "chainGuardDropPity", label: "Chain guard drop pity", unit: "",
+    def: 8, min: 0, max: 40, step: 1 },
+  { id: "chainGuardDropMax", label: "Chain guard drop cap", unit: "",
+    def: 40, min: 0, max: 120, step: 1 },
   // CS020 P1b: the delivery combo's one-effort grace window — how long a delivery run survives while
   // the ship is outside the dock's neighborhood. Same `unit: "ms"` + `toNative: v => v / 1000` idiom
   // as autoShieldRegenPause: the panel shows and persists milliseconds, the consumer (the dock block's
@@ -3589,13 +3661,46 @@ const DEBUG_VARS = [
   // floater per visit, text rewritten per canister, released as an ordinary floater only at the last
   // canister. There is no delivery COLUMN under C, so there is nothing for DOCK_OFFLOAD_INTERVAL or a
   // bigger rise to space apart — the instruction above is obsolete, not wrong for what it described.
-  // rise/life now govern exactly two things: how the released ticker (and every incidental floater)
-  // rises and fades after that release. DOCK_OFFLOAD_INTERVAL stayed at 0.05 (gate G5) because C
+  // rise/life now govern exactly two things: how the released ticker rises and fades after that
+  // release. (It said "and every incidental floater" through CS034; CS035 P2 deleted the incidental
+  // category outright, so the ticker is the only delivery floater there is.)
+  // DOCK_OFFLOAD_INTERVAL stayed at 0.05 (gate G5) because C
   // dissolves the trade it used to control, not because the trade was re-won.
   { id: "deliveryFloatRise", label: "Delivery floater rise", unit: "px/s",
-    def: 160, min: 30, max: 600, step: 10 },
-  { id: "deliveryFloatLife", label: "Delivery floater life", unit: "s",
-    def: 1.2, min: 0.2, max: 2.0, step: 0.05 },
+    def: 150, min: 30, max: 600, step: 10 },
+  // CS034 P8 (spec §3.5, GATE A): the old single delivery-floater life knob is retired — its two
+  // readers (the delivery ticker's construction and the incidental floater's push) both move to the
+  // hold/fade pair below. `fade` is what FloatText's new `fade` field reads; `hold` is folded into
+  // `life` at each call site as `hold + fade`, so the floater holds full opacity for `hold` seconds
+  // after release, then fades linearly over `fade`. Size grows per piece: `deliveryFloatSize +
+  // deliveryFloatSizeStep * (deliveryCount - 1)`, clamped at `deliveryFloatSizeMax`.
+  // CS035 P1 (§1.1): `def` on all five rows replaced with a later dock-float-lab session's numbers,
+  // superseding CS034 P8's GATE A values above. `sizeStep` moving off 0.0 turns on per-piece growth
+  // for the first time — CS034 shipped the mechanism with its step at zero. min/max/step unchanged.
+  { id: "deliveryFloatSize", label: "Delivery floater size", unit: "px",
+    def: 16, min: 12, max: 64, step: 1 },
+  { id: "deliveryFloatSizeStep", label: "Delivery floater size/piece", unit: "px",
+    def: 1.0, min: 0, max: 6, step: 0.5 },
+  { id: "deliveryFloatSizeMax", label: "Delivery floater size cap", unit: "px",
+    def: 48, min: 16, max: 96, step: 1 },
+  { id: "deliveryFloatHold", label: "Delivery floater hold", unit: "s",
+    def: 0.00, min: 0, max: 3.0, step: 0.05 },
+  { id: "deliveryFloatFade", label: "Delivery floater fade", unit: "s",
+    def: 1.20, min: 0.1, max: 3.0, step: 0.05 },
+  // CS035 P2 (§2.3): the dock lockout's push. Inside the dock's neighborhood ring the ship cannot hook
+  // Debris at all, and a piece that reaches the capture region is shoved straight back out at this
+  // speed instead. The velocity is SET, not added (see the push site in the garbage loop) — a knob that
+  // reads as "how fast it leaves", not "how hard it was hit".
+  { id: "dockBounceSpeed", label: "Dock bounce speed", unit: "px/s",
+    def: 90, min: 20, max: 300, step: 10 },
+  // CS036 P5 (spec §3.1, FORK-CS036-K): a rate limit on the push's shieldPing(), not on the push
+  // itself. Several pieces of Debris landing on the hull in one frame used to fire one ping each,
+  // stacking into a stutter. `game.dockPingTimer` counts down beside cargoFlash/hpReliefFlash; the
+  // push site pings only at 0, then re-arms to this def. ⛔ At 0 the feature is OFF and every push
+  // pings, exactly as shipped before this knob existed — the clean A/B, same property
+  // magnetResumeDelay's own 0 has, and why min is 0 and not 0.05.
+  { id: "dockPingCooldown", label: "Dock push ping cooldown", unit: "s",
+    def: 0.50, min: 0, max: 3.0, step: 0.05 },
   // CS024 P5/P6c (spec §2.4/§2.6/§4.5/§5): the JUNK chain, THREE knobs per lever (floor, ceil, steps) —
   // see leverKnob() above, which also derives the ▼ / ↳ / (inv) markers straight off LEVERS. junkCount
   // is the driver (sawtooths every 10 levels, so it wears ▼); the three sizes are fully independent (no
@@ -3642,6 +3747,39 @@ const DEBUG_VARS = [
   // would let ~18 clumps consume the whole garbage budget and starve the field.
   { id: "heldClumpMax", label: "Held clump max", unit: "",
     def: 4, min: 1, max: 20, step: 1, clampShown: v => Math.round(v) },
+  // CS035 P4 (spec §4.2/§4.3): Hunter volatility — a large core (size 3) that has lived
+  // `hunterVolatileAge` seconds starts a visible size heartbeat (pulseScale, draw-only). NOT A LEVER
+  // (spec §4.5, note in DIFFICULTY-LEVERS.md): a flat rule at every wave, same spirit as the CS018 P4
+  // frozen turn rates. Grow/shrink are deliberately ASYMMETRIC — fast growth, slow shrink — because a
+  // symmetric oscillation reads as breathing, and this needs to read as pumping.
+  //   CS035 P7 (GATE G15/G16): three of the five `def`s moved off P4's proposals after the playtest.
+  // hunterVolatileAge 30 -> 60 (a large now gets a full minute of grace before it can be split by
+  // something the player did not do), and the pulse envelope widens 92/115 -> 87/125 because at the
+  // narrow one the heartbeat was legible but did not read as ALARMING (G18). Grow/shrink came back
+  // unchanged at 55/28, so the cycle stretches with the envelope: ~0.69 s out, ~1.36 s back, ~2.05 s
+  // per beat against P4's ~1.24 s. G18 also asked for a COLOUR change on top of the motion — that is a
+  // design decision spec §6 explicitly excluded, so it is DEFERRED, not taken here (see STATUS.md).
+  //   CS036 P4 (spec §2): the shape stayed right, the numbers were too subtle. Paul reversed G18's
+  // colour ask outright (no COLOR.satellite change, lerpColor() stays deleted — the motion is still the
+  // only tell) and asked for a harder punch out, slower settle back. Envelope widens 87/125 -> 80/150
+  // (38% -> 70%). `hunterPulseGrow`'s bound (300 %/s) was the binding constraint identified in spec: a
+  // wider envelope at the old ceiling is SLOWER, not punchier, so the bound is raised to 5000 %/s —
+  // enough that cranking it to max sweeps the new 70-point envelope in under one 60 fps frame
+  // (70/5000 = 0.014 s < 1/60 s), i.e. genuinely instantaneous, not just faster. The `def` itself moves
+  // to 900 %/s: the envelope sweeps in ~0.08 s (≈5 frames), read as a punch, not a ramp.
+  // `hunterPulseShrink` drops 28 -> 20, slowing the settle to ~3.5 s. Net cycle: ~0.08 s out, ~3.5 s
+  // back, ~3.58 s per beat, against P7's ~2.05 s. `hunterPulseMax`'s own bound (200 %) was not binding
+  // and is untouched. `hunterVolatileAge` is untouched at 60 — nothing here argues for moving it.
+  { id: "hunterVolatileAge", label: "Hunter volatile age", unit: "s",
+    def: 60, min: 0, max: 120, step: 1 },
+  { id: "hunterPulseMin", label: "Hunter pulse min", unit: "%",
+    def: 80, min: 50, max: 100, step: 1 },
+  { id: "hunterPulseMax", label: "Hunter pulse max", unit: "%",
+    def: 150, min: 100, max: 200, step: 1 },
+  { id: "hunterPulseGrow", label: "Hunter pulse grow rate", unit: "%/s",
+    def: 900, min: 5, max: 5000, step: 5 },
+  { id: "hunterPulseShrink", label: "Hunter pulse shrink rate", unit: "%/s",
+    def: 20, min: 5, max: 300, step: 1 },
   // CS024 P5 (spec §2.4/§4.5/§4.6): the UFO chain, the deepest in the odometer (a two-generation carry,
   // FLAG-CS024-d) and the one where §4.6 splits every quantity by saucer size. ufoAppearFreq (INVERTED)
   // is the ONE driver — there is exactly one appearance timer, which size spawns is the flat
@@ -3712,6 +3850,17 @@ const DEBUG_VARS = [
     def: 120, min: 0, max: 600, step: 10 },
   { id: "magnetPushSpread", label: "Magnet push spread", unit: "°",
     def: 45, min: 0, max: 180, step: 5 },
+  // CS035 P6 (spec §5.5): two Super Mega Delivery volume knobs. SWEEP_POWERUP_CAP/DOCK_POWERUP_SPEED
+  // stay in the file, unchanged, as the shipped-default consts these rows retune away from — call
+  // sites move to DEBUG.*, the chainGuardIntercepts idiom every knob in this build follows.
+  // dockPowerupSpeed has TWO call sites (both dock emitters) and they move together — the complaint
+  // being addressed is powerups landing on a parked ship, and both emitters launch from the dock.
+  // sweepPowerupCap's min of 0 lets the budget go negative on purpose if dragged down; the
+  // reservation's `budget-- > 0` already handles that — no clamp added.
+  { id: "sweepPowerupCap", label: "Sweep powerup cap", unit: "",
+    def: 24, min: 0, max: 64, step: 1 },
+  { id: "dockPowerupSpeed", label: "Dock powerup speed", unit: "px/s",
+    def: 180, min: 40, max: 400, step: 10 },
   // CS018 P6: GLOBAL fields — not per-lever tiers. Frequency jitter (formerly this section's own
   // `freqJitter` knob, scaling every frequency-shaped lever — appearance + direction-change) is CS024
   // P2's to freeze at its shipped 25% default (FREQ_JITTER, at jitteredInterval()'s site) and remove
@@ -3725,7 +3874,13 @@ const DEBUG_VARS = [
   // CS023 P2's satellite-vs-satellite bounce restitution — archetype-independent, stays (spec §0).
   // CS024 P5 gives it its proper GLOBAL-trailing home in this rebuild (it previously trailed the ORBIT
   // block as a layout artefact of that block's CS024 P1 removal, not a scoping claim).
-  { id: "debrisBounceRestitution", label: "Satellite bounce restitution", unit: "",
+  // CS036 P5 (FLAG-CS034-e, spec §3.3): label only, "Satellite bounce restitution" -> "Garbage Sat
+  // bounce restitution" — the non-canonical "Satellite" read as the wrong object under CLAUDE.md's
+  // Vocabulary table (this is the GARBAGE SATELLITE'S own bounce). ⛔ `id` is UNCHANGED — it is a
+  // debugShown persistence key inside afd_settings_v1.debug, and renaming it would orphan every
+  // player's saved tuning for this row. "Garbage Sat", not the full "Garbage Satellite", to stay
+  // inside drawDebug's hard 32-char column (drawDebug neither wraps nor truncates).
+  { id: "debrisBounceRestitution", label: "Garbage Sat bounce restitution", unit: "",
     def: DEBRIS_BOUNCE_RESTITUTION, min: 0, max: 1.5, step: 0.05 },
   // CS026 P3 (spec §2.2): how many levels run in the small 1920x1080 world (WORLD_SIZE_EARLY) before the
   // game settles into the 2560x1440 field world for good. worldSizeFor(level) reads this LIVE at every
@@ -3779,6 +3934,27 @@ const DEBUG_VARS = [
     def: 60, min: 10, max: 200, step: 10 },
   { id: "celebrationEmblemSize", label: "Celebration emblem size", unit: "px",
     def: 32, min: 12, max: 64, step: 2 },
+  // CS035 P3 (spec §3.2): the LEVEL-END PROTECTION WINDOW's knobs. They live under CELEBRATION
+  // because the window exists to wrap the celebration-panel seam — wave clear -> hold -> panel (if any)
+  // -> "Level N" banner -> grace -> vulnerable. NOT LEVERS: no floor/ceil/steps triple, no carriesTo, no
+  // LEVERS row. A protection window is a look-and-feel call, not a pressure axis (DIFFICULTY-LEVERS.md §4).
+  //   ⛔ CS036 P2 (spec §1.2, FORK-CS036-E) RETIRED `levelEndHold` — the fourth row, which stood at the
+  // top of this group and timed the pre-nextWave() pause (5.00 s, min 0 / max 15 / step 0.25). The hold
+  // it timed is now PLAYER-PACED: the completion announcement holds until confirm or back, so there is
+  // nothing left for a duration knob to time. Registry 106 -> 105. ⛔ NO MIGRATION SHIM AND NONE IS
+  // WANTED — a saved `debug.levelEndHold` in afd_settings_v1 orphans harmlessly under loadSettings'
+  // known-value-else-default rule, which is the whole point of that rule (CLAUDE.md, Save data).
+  //   ⛔ BOTH TIME KNOBS BELOW ARE ONE-WAY TRANSITION TIMES — "how long does 100% -> 20% take". The full
+  // pulse PERIOD is 2x each of them (0.5 s at rest, 0.16 s at the end of the grace). They are in the same
+  // units as each other deliberately: levelEndGracePulseEnd was offered in conversation as a 0.15 s
+  // PERIOD, and a mixed-units pair sitting two rows apart would eventually be read against each other and
+  // be wrong by a factor of two. Do not "fix" one of them into a period.
+  { id: "levelEndGrace", label: "Level-end grace", unit: "s",
+    def: 3.00, min: 0, max: 10, step: 0.25 },
+  { id: "levelEndFade", label: "Level-end fade time", unit: "s",
+    def: 0.25, min: 0.05, max: 1.50, step: 0.05 },
+  { id: "levelEndGracePulseEnd", label: "Level-end grace pulse end", unit: "s",
+    def: 0.08, min: 0.02, max: 0.50, step: 0.02 },
 ];
 // CS018 P2: the registry's VALUE entries, with the section headers filtered out. Every loop that wants
 // "each knob" (the startup seed below, loadSettings' per-entry validation) goes through this — a header has
@@ -5932,8 +6108,33 @@ class Ship {
   }
   draw() {
     if (this.dead) return;
-    const blink = this.invuln > 0 && Math.floor(this.invuln * 10) % 2 === 0;
+    // CS035 P3 (spec §3.5): the LEVEL-END PROTECTION WINDOW's tell — a continuous triangle wave on the
+    // ship's alpha, 100% -> 20% -> 100%, for the whole window. It is deliberately NOT the hit-stun blink:
+    // the blink is a hard 10Hz square that says "I just got hit", and this says "the level ended".
+    // ⛔ WHILE THE WINDOW IS OPEN THE BLINK IS SKIPPED ENTIRELY. A hit taken in the seconds before the
+    // clear leaves invuln running into the window, and the two together would strobe the ship at 10Hz on
+    // top of the 2Hz pulse. The pulse REPLACES it; ship.invuln itself is untouched and still decays.
+    // ⛔ THE 0.2 FLOOR AND THE 1.0 CEILING ARE NOT KNOBS (spec §3.5). Two more sliders for a thing whose
+    // whole job is "obviously not normal" is knob sprawl; a different floor is a later one-line change.
+    // ⛔ CS036 P3 (FORK-CS036-D -> D1) — TWO QUESTIONS, TWO CONDITIONS, DELIBERATELY NOT ONE. `pulsing`
+    // is the GRACE (the window's last step, the only one that is live gameplay with damage off) and gates
+    // the alpha pulse; `levelEndSafe` is the WHOLE window and still gates the blink suppression, because
+    // that answers the different question "is a hit-stun strobe allowed to run", and a hit taken just
+    // before the clear leaves invuln decaying across the frozen hold whether anything pulses or not.
+    // Merging them would strobe the ship at 10Hz over a stopped field. The accumulator in update() reads
+    // the same `levelEndGraceT > 0`; the two sites move together or not at all.
+    const levelEndSafe = game.levelEndSafe;
+    const pulsing = game.levelEndGraceT > 0;
+    const blink = !levelEndSafe && this.invuln > 0 && Math.floor(this.invuln * 10) % 2 === 0;
     if (!blink) {
+      // ⛔ SET-DRAW-RESTORE, the file's standing idiom (three other sites, the shield block below among
+      // them). The restore MUST land before that block, which sets its own alpha and assumes it enters
+      // at 1. The phase is accumulated in update(); this only reads it.
+      if (pulsing) {
+        const p = game.levelEndPulseT % 2;
+        const tri = p < 1 ? p : 2 - p;      // 0 -> 1 -> 0
+        ctx.globalAlpha = 1 - 0.8 * tri;    // 1.0 -> 0.2 -> 1.0
+      }
       // Scoop mouth (v3.3 P3; prong-V render restored CS010 P1 — see GDD §2.14.1 for the box-render
       // supersession history). Drawn BEFORE the hull in COLOR.dock green so it reads as a collector's
       // throat: an open V from the ship's nose (16,0) flaring forward to +/-SCOOP_WIDTH[lvl]/2 at
@@ -5957,6 +6158,7 @@ class Ship {
         const flame = [[-7, -4], [-15 - Math.random() * 6, 0], [-7, 4]];
         drawPoly(flame, this.x, this.y, this.angle, "#ffb060", false);
       }
+      if (pulsing) ctx.globalAlpha = 1;   // CS035 P3: restore BEFORE the shield block below
     }
     if (this.shieldOn) {
       ctx.beginPath();
@@ -6509,6 +6711,12 @@ class HunterSatellite {
     // The homing tiers are the pathological case this exists for: a medium/small that loses contact
     // re-acquires and comes straight back, so without a cooldown one attack could bill several times.
     this.guardT = 0;
+    // CS035 P4 (spec §4.2/§4.3): age from construction — the only spawn event a large core has
+    // (static spawnCore() was deleted in CS024 P3). pulseScale/pulseUp drive the volatility
+    // heartbeat once age crosses DEBUG.hunterVolatileAge; see volatile() and update()/draw() below.
+    this.age = 0;
+    this.pulseScale = 100;
+    this.pulseUp = true;
     // v3.3 P4 (9b, FORK-5): the `bornOfScrap` flag is GONE. Every Hunter of every origin now drops
     // garbage at its tier counts — the v3.2 P3 suppression is reversed. 9a's single-decay is the new
     // governor for the 12-in/66-out amplifier that flag used to close.
@@ -6556,6 +6764,11 @@ class HunterSatellite {
       ? [[r * 0.5, 0], [0, -r * 0.4], [-r * 0.4, 0], [0, r * 0.4]]
       : null;
   }
+  // CS035 P4 (spec §4.2): only a large core (size 3) ages into volatility. Mediums/smalls accrue
+  // `age` too (cheap, and leaves the field available to a later changeset) but never read it.
+  volatile() {
+    return this.size === 3 && this.age >= DEBUG.hunterVolatileAge;
+  }
   // CS024 P3 (spec §1.3/§4.3): `static spawnCore()` STOOD HERE — the AMBIENT producer's factory, which
   // slid a fresh large core in from just beyond a random viewport edge on a rand(20, 32) timer. It is
   // deleted along with game.hunterTimer and update()'s spawn block. HUNTERS NOW ARISE FROM EXACTLY ONE
@@ -6564,6 +6777,18 @@ class HunterSatellite {
   // thing that becomes a hunter — and it is only survivable because §1.4 made loose garbage permanent.
   // Children are still created directly at the parent's position in destroyHunter.
   update(dt) {
+    this.age += dt;   // CS035 P4 (spec §4.2): unconditional, every tier — construction is the origin
+    if (this.volatile()) {
+      // CS035 P4 (spec §4.3): draw-only heartbeat. Asymmetric — fast growth, slow shrink — reads as
+      // pumping rather than breathing. Never touches this.radius/shape/inner; see draw().
+      if (this.pulseUp) {
+        this.pulseScale += DEBUG.hunterPulseGrow * dt;
+        if (this.pulseScale >= DEBUG.hunterPulseMax) { this.pulseScale = DEBUG.hunterPulseMax; this.pulseUp = false; }
+      } else {
+        this.pulseScale -= DEBUG.hunterPulseShrink * dt;
+        if (this.pulseScale <= DEBUG.hunterPulseMin) { this.pulseScale = DEBUG.hunterPulseMin; this.pulseUp = true; }
+      }
+    }
     if (this.homing) {
       if (this.scatter > 0) {
         this.scatter -= dt;
@@ -6608,10 +6833,15 @@ class HunterSatellite {
   }
   draw() {
     const ang = this.homing ? this.heading : this.angle;
-    drawPoly(this.shape, this.x, this.y, ang, COLOR.satellite);
+    // CS035 P4 (spec §4.3): draw-only scale. this.shape/this.inner are baked at construction and
+    // never mutated — scaling into a fresh array each frame, never in place, keeps the hitbox honest.
+    const s = this.pulseScale / 100;
+    const shape = s === 1 ? this.shape : this.shape.map(p => [p[0] * s, p[1] * s]);
+    drawPoly(shape, this.x, this.y, ang, COLOR.satellite);
     if (this.inner) {
       // homers: inner tracks the nose; core: counter-rotate for a faceted shimmer
-      drawPoly(this.inner, this.x, this.y, this.homing ? ang : -this.angle * 1.5, COLOR.satellite);
+      const inner = s === 1 ? this.inner : this.inner.map(p => [p[0] * s, p[1] * s]);
+      drawPoly(inner, this.x, this.y, this.homing ? ang : -this.angle * 1.5, COLOR.satellite);
     }
   }
 }
@@ -6918,9 +7148,13 @@ class FloatText {
   // so update() falls straight through to the original two lines, byte-identical. It exists for the
   // model-C delivery ticker (tools/dock-float-lab.html, gate G1): a pinned floater holds its position
   // and life at birth, unaffected by time, until something un-pins it (releaseDeliveryTicker()).
-  constructor(text, x, y, color, size = 16, rise = 30, life = 1.1) {
+  // CS034 P8 (spec §3.5): `fade` is optional, defaults to `life` — every pre-existing call site omits
+  // it and stays byte-identical, since life never exceeds life0 so life/fade never exceeds 1 when
+  // fade === life0. With fade < life0 the floater holds full opacity while life > fade, then fades
+  // linearly over the final `fade` seconds.
+  constructor(text, x, y, color, size = 16, rise = 30, life = 1.1, fade = life) {
     this.text = text; this.x = x; this.y = y; this.color = color; this.size = size;
-    this.rise = rise; this.life = life; this.life0 = life; this.dead = false;
+    this.rise = rise; this.life = life; this.life0 = life; this.fade = fade; this.dead = false;
     this.pinned = false;
   }
   update(dt) {
@@ -6930,7 +7164,7 @@ class FloatText {
     if (this.life <= 0) this.dead = true;
   }
   draw() {
-    ctx.globalAlpha = Math.max(0, this.life / this.life0);
+    ctx.globalAlpha = Math.max(0, Math.min(1, this.life / this.fade));
     drawText(this.text, this.x, this.y, this.size, this.color);
     ctx.globalAlpha = 1;
   }
@@ -7020,6 +7254,10 @@ function resetGameStats() {
     closeShave: false,       // survived a Hunter collision under 10 HP (Close Shave)
     everBelowHalf: false,    // HP ever dropped below 50% this game (Untouchable inverts this)
     hunterCoalesced: 0,      // Hunters born this game from neglected scrap coalescing (Waste Not, v3.2 P3)
+    cargoDamageEvents: 0,    // CS035 P6: unguarded chain severs this game (the sever path of
+                             // breakChain only — a guarded absorb and scatterChain() don't count). The
+                             // chain-guard drop-weight pity counter, read by guardDropWeight(); NOT
+                             // reset in nextWave() — pity carries across waves within a run, like cargoMax growth
     gameEnded: false         // set at game over so end-of-game achievements can evaluate
   };
 }
@@ -7172,6 +7410,12 @@ const game = {
   // guard stops a cheerful pop firing at the moment of death). Decayed in update() beside cargoFlash;
   // zeroed at every direct siren teardown (pause/quit/start/death) so no stale exhale survives.
   hpReliefFlash: 0,
+  // CS036 P5 (spec §3.1): >0 suppresses the dock lockout's push shieldPing() — an audio rate limit,
+  // not a physics one (the push itself is unconditional; see the push site). Counted down beside
+  // cargoFlash/hpReliefFlash for the same Capture.hudVisible-independence reason. Declared in BOTH
+  // this literal and resetRun() per the standing CS016 P3 rule — a startGame()-only field is missed
+  // by every resumed run.
+  dockPingTimer: 0,
   // CS011 P2: the on-screen caption of Dan's current line — the voice channel's VISIBLE echo. text = the
   // line text; dur = its utterance length (from buildUtterance); life = seconds left to display, set to
   // 0.10 + dur + CAPTION_LINGER by showCaption() and decayed in update()'s playing body. drawCaption()
@@ -7186,7 +7430,63 @@ const game = {
   // Paul's gate answer set the minimum bar at "we definitely see a Level 2 on the screen", and routing the
   // visual through the audio gate would put that bar at the mercy of whatever else Dan happened to be
   // saying — the exact failure Q6 was raised about. The two announcements share a string, nothing else.
-  levelBanner: { text: "", life: 0 }
+  levelBanner: { text: "", life: 0 },
+  // CS035 P3 (spec §3.3) — THE LEVEL-END PROTECTION WINDOW. Three fields, one window: it opens on the
+  // frame the last Garbage Satellite dies, spans the hold, the celebration panel, nextWave() and the
+  // "Level N" banner, and closes when the post-banner grace runs out. Declared in BOTH this literal and
+  // resetRun() per the standing CS016 P3 rule.
+  //
+  // ⛔ levelEndSafe IS NOT ship.invuln, AND THE TWO ARE NEVER MERGED. ship.invuln is HIT-STUN — it is set
+  // by damageShip(), it decays in Ship.update(), and it drives a 10Hz hard square blink in Ship.draw().
+  // Folding level-end protection into it would (a) inherit that blink, which is the wrong visual, and
+  // (b) make "the level just ended" indistinguishable from "I just got hit". Every damage gate reads
+  // BOTH, and Ship.draw() SKIPS the blink entirely while this is set (spec §3.5).
+  //
+  // ⛔ NOT RESET BY nextWave(), WHICH RUNS INSIDE THE WINDOW. See the note in nextWave().
+  //
+  // ⛔ CS036 P3 (spec §1.2, FORK-CS036-C -> C2) — IT KEEPS ITS FULL EXTENT, AND MOST OF THAT EXTENT IS
+  // NOW REDUNDANT ON PURPOSE. Since CS036 P2 the field is FROZEN from the clear through the hold, the
+  // panel and most of the "Level N+1" banner, so across all of that there is nothing moving for the four
+  // gate sites to protect the ship from — updateLevelEndFreeze() resolves no collision at all. Only the
+  // grace, the window's last step, is doing load-bearing work. That overlap was weighed and KEPT, as
+  // belt-and-braces: narrowing this flag to the grace would make the protection depend on the freeze's
+  // extent being exactly right, in a build where the freeze can be lifted early by a debug knob
+  // (levelBannerTime/Fade) and where a death on the clearing frame already leaves an orphaned arm behind.
+  // ⛔ NO GATE SITE MOVES, AND A CLEANUP PASS THAT "NOTICES" THE REDUNDANCY IS READING THIS COMMENT FOR
+  // A REASON. The one thing that DID narrow to the grace is the alpha pulse (FORK-CS036-D, Ship.draw()),
+  // which is a tell rather than a protection and had nothing to say over a stopped field.
+  levelEndSafe: false,
+  // Seconds of post-banner grace left. > 0 only during the window's last step; armed as a one-shot at the
+  // level banner's expiry crossing, and its arrival at exactly 0 is the ONE thing that clears levelEndSafe.
+  levelEndGraceT: 0,
+  // The alpha pulse's phase, in HALF-CYCLES (0..1 fades out, 1..2 fades back in) — ⛔ NOT SECONDS.
+  // levelEndGracePulseEnd shortens the period across the grace, and a seconds-based phase would jump
+  // discontinuously the moment the period moved. Same integrate-the-phase reason as game.lowHpPhase above.
+  levelEndPulseT: 0,
+  // CS036 P1 (spec §0.3, FORK-CS036-A) — THE LEVEL-END CEREMONY'S FREEZE. True while the field is held
+  // STILL for the completion announcement: a true freeze-frame, entities and collisions and the ship and
+  // the tow chain all stopped, run by updateLevelEndFreeze()'s reduced sim rather than by a per-system
+  // gate. A FOURTH field of the level-end window, and the same category as the three above — declared in
+  // BOTH this literal and resetRun() per the standing CS016 P3 rule.
+  //
+  // ⛔ NOT game.paused, for the identical reason CS030 P5's celebration-panel comment gives in update():
+  // setting that would satisfy menuActive() and drag in the whole menu chrome path — music ducking,
+  // drawMenu()'s input branch, the pause screen's semantics — and this is not a menu.
+  //
+  // ⛔ NOT RESET BY nextWave(), which runs INSIDE the freeze. See the note in nextWave().
+  //
+  // CS036 P1 owned the primitive and proved what a frozen frame may still run; CS036 P2 ARMS it, at the
+  // wave clear, and takes the input that lifts it (dismissLevelDone()).
+  levelEndFreeze: false,
+  // CS036 P2 (spec §1.3) — THE COMPLETION ANNOUNCEMENT: null, or { text, age } while "Level N Complete"
+  // is up. Seeded at the wave-clear arm beside levelEndFreeze and cleared by dismissLevelDone(), so it is
+  // the FREEZE's visible half and never outlives it. Reassigned wholesale, exactly like game.levelBanner
+  // and game.caption, and reset in resetRun() with the other four level-end fields.
+  //   `text` is seeded, not derived at draw time, for the same reason game.levelBanner's is: one string,
+  // built once, from the wave that was actually completed. `age` counts UP in seconds (the fade-in's
+  // clock) rather than down like levelBanner.life, because this announcement has no duration at all —
+  // FORK-CS036-E made it player-paced, so there is nothing for a countdown to count (spec §0.4).
+  levelDone: null
 };
 
 // ---------- CS022 P1: per-archetype world size (PLANNED-FEATURES-CS022 §4.1/§4.2/§4.3) ----------
@@ -7420,6 +7720,8 @@ function resetRun(wave, debugRun) {
   game.lowHpSiren = false; AudioSys.lowhp(false); // fresh run never carries the siren over (v3.4 P5)
   game.lowHpPhase = 0;      // CS010 P3: the pulse accumulator starts a fresh run at 0
   game.hpReliefFlash = 0;   // CS010 P3: no stale relief exhale carries into a fresh run
+  game.dockPingTimer = 0;   // CS036 P5: no stale ping cooldown carries into a fresh run (the CS016 P3
+                             // both-places rule — this is the ONLY reset site; startGame() calls this)
   // CS010 P9: Dan's latches. lowHpVoiced false (not yet at low HP); hpFullVoice TRUE (spawns full — no
   // "brand new ship" at wave start); powerVoiced all false. reset() clears any in-flight line + cooldown.
   game.lowHpVoiced = false;
@@ -7430,6 +7732,21 @@ function resetRun(wave, debugRun) {
   // nextWave() call below, which is what SETS the level-1 banner. Moving it after would blank the banner
   // of the level the player is about to start, and the bug would only show on level 1.
   game.levelBanner = { text: "", life: 0 };
+  // CS035 P3 (spec §3.3): the level-end protection window is closed on a fresh run, and THIS IS ITS ONLY
+  // RESET SITE. ⛔ Deliberately NOT in nextWave() — nextWave() runs inside an open window (see its own
+  // note). The order matters for exactly one of the four: startGame() calls nextWave() right after this
+  // returns, which seeds the level-1 banner; the banner-expiry arm reads levelEndSafe, so it MUST already
+  // be false by then or every new run would open with a free grace period.
+  //   CS036 P1 (spec §1.5 trap 2): game.levelEndFreeze joins them here, at the SAME site and for the same
+  // reason — the freeze arms at the wave clear and lifts partway through the NEXT level's banner, so it is
+  // in-flight state that must survive a wave boundary, not per-level state.
+  //   CS036 P2: game.levelDone (the freeze's visible half) joins them, at the same site and for the same
+  // reason — it is seeded at a wave clear and lives across everything the freeze spans.
+  game.levelEndSafe = false;
+  game.levelEndGraceT = 0;
+  game.levelEndPulseT = 0;
+  game.levelEndFreeze = false;
+  game.levelDone = null;
   VoiceSys.reset();
   // CS033 P2: the run-start hook, in the ONE reset both a fresh run and a resumed run share — a
   // resumed run mints a runId too, harmlessly, since Leaderboard.eligible() gates it out at submit.
@@ -7554,6 +7871,23 @@ function nextWave() {
   // reading it after the reset would only ever log 0.
   const prevLevelSecs = game.waveTime;
   game.waveTime  = 0;
+  // ⛔ CS035 P3 (spec §3.3) — WHAT THIS FUNCTION ZEROES, AND WHAT IT DELIBERATELY DOES NOT.
+  // It zeroes state that belongs to the level just finished and is meaningless at the start of a new one:
+  // game.waveTime above, and game.stats.dmgThisWave below (the perfect-wave window). Loose garbage, the
+  // tow chain, the Hunters and the powerup budgets all survive by design (CS024 P3) — this has never been
+  // a "clear the field" function.
+  //   game.levelEndSafe / levelEndGraceT / levelEndPulseT / levelEndFreeze / levelDone are the OPPOSITE
+  // of per-level state and MUST NOT BE ADDED HERE. nextWave() is called from INSIDE the level-end
+  // protection window (spec §3.1 step 4: clear -> hold -> panel -> THIS -> banner -> grace), so zeroing
+  // any of the five here would end the protection at the exact instant the "Level N" banner appears —
+  // the middle of the window, not its end. CS036 P1 (spec §1.5 trap 2) adds the fourth for the same
+  // reason one step further out: the FREEZE spans this call and is lifted partway through the banner
+  // this function seeds, so zeroing it here would unfreeze the field on the banner's very first frame.
+  // CS036 P2's game.levelDone is the fifth, and
+  // is the one case where a reset here would be merely REDUNDANT rather than wrong — dismissLevelDone()
+  // has already cleared it on the frame it calls this — which is exactly the shape a tidy-up pass adds
+  // "harmlessly" and then P3 has to unpick. They are reset in resetRun() and nowhere else. A future
+  // tidy-up pass that "notices" the omission is reading this comment for a reason.
   VoiceSys.sayLevel(game.wave); // CS011 P4 — announces Level 1 too (VoiceSys.reset() ran just above in startGame)
   // CS025 P5 (gate Q6) — the VISUAL half of the level announcement, and the half that cannot be lost.
   // Same string sayLevel() speaks, but set unconditionally: no AudioSys.ctx guard (this is a render field,
@@ -7880,6 +8214,15 @@ function maxBullets() {
   return MAX_BULLETS;                                    // 4
 }
 
+// CS035 P6 (spec §5.3): guard's DROP weight, dynamic and pity-driven — a SEPARATE knob from
+// DEBUG.chainGuardIntercepts (the absorb budget a picked-up guard grants). game.stats.cargoDamageEvents
+// is the pity counter: breakChain()'s sever path increments it, a guard drop resets it to 0. Clamped
+// at chainGuardDropMax, same "climbs with pressure, caps out" shape as no other knob in this build.
+function guardDropWeight() {
+  return Math.min(DEBUG.chainGuardDropMax,
+    DEBUG.chainGuardDropBase + DEBUG.chainGuardDropPity * game.stats.cargoDamageEvents);
+}
+
 // v3.6 P3: unconditionally roll a random weapon/utility powerup and launch it on the given
 // vector. No chance gate here — the three emitters (destroySaucer, destroyHunter's large core,
 // the recycle hub) each decide WHEN to call this; this only decides WHAT drops. Health is NOT in
@@ -7890,13 +8233,19 @@ function dropPowerup(x, y, vx = 0, vy = 0) {
   // CS017 P6: "guard" is CONDITIONAL — it only enters the roll while the player is towing at least
   // DEBUG.chainGuardMinTow nodes (dropping a chain guard at an empty chain is a wasted pickup). An
   // ineligible key is skipped in BOTH the total and the walk, so the surviving weights RENORMALISE
-  // rather than leaving a dead slot that would silently drop nothing. Below the threshold this reduces
-  // to exactly the pre-P6 table (total 10, same walk order, one Math.random() call) — byte-identical.
+  // rather than leaving a dead slot that would silently drop nothing.
+  // CS035 P6 (spec §5.3): guard's weight is no longer the flat table entry — weightOf(k) substitutes
+  // guardDropWeight() for it, in BOTH the total and the walk, composing with (not replacing) the
+  // eligible() gate above. Every non-guard key still reads POWERUP_DROP_WEIGHTS[k] unchanged.
   const eligible = k => k !== "guard" || game.chain.length >= DEBUG.chainGuardMinTow;
+  const weightOf = k => k === "guard" ? guardDropWeight() : POWERUP_DROP_WEIGHTS[k];
   let total = 0;
-  for (const k in POWERUP_DROP_WEIGHTS) if (eligible(k)) total += POWERUP_DROP_WEIGHTS[k];
+  for (const k in POWERUP_DROP_WEIGHTS) if (eligible(k)) total += weightOf(k);
   let r = Math.random() * total, type;
-  for (const k in POWERUP_DROP_WEIGHTS) { if (!eligible(k)) continue; r -= POWERUP_DROP_WEIGHTS[k]; if (r < 0) { type = k; break; } }
+  for (const k in POWERUP_DROP_WEIGHTS) { if (!eligible(k)) continue; r -= weightOf(k); if (r < 0) { type = k; break; } }
+  // CS035 P6 (spec §5.3, FORK-T): the pity counter resets the instant a guard is SELECTED to drop,
+  // before the Powerup is pushed — not on pickup. An uncollected guard still consumed the pity.
+  if (type === "guard") game.stats.cargoDamageEvents = 0;
   game.powerups.push(new Powerup(x, y, type, vx, vy));
 }
 
@@ -7916,6 +8265,10 @@ function spawnHealthPowerup() {
 // the gate would ALWAYS exclude guard; FORK-CS018-C bypasses it deliberately. The set derives from
 // POWERUP_DROP_WEIGHTS' keys (the drop table) so a future droppable type joins automatically — it is
 // NOT POWERUP_DROP_TYPES, the timed-effect list, which excludes Scoop (see the constants block).
+// CS035 P6 (spec §5.4): "guard" LEAVES the guaranteed set — a chain-armour freebie on every 24-haul is
+// the loop being broken. setTypes.length drops 6 -> 5 and the SWEEP_POWERUP_CAP reservation below
+// follows automatically, no manual arithmetic. ⛔ The per-piece sweep pool (PART 2) re-adds "guard"
+// explicitly, flat and ungated — it is the only thing keeping chain armour reachable during a sweep.
 // PART 2, the sweep — SNAPSHOT SEMANTICS (§7.3.1, the changeset's flagged most-likely bug): every
 // hunter piece alive AT THE TRIGGER INSTANT takes exactly one hit and pays exactly one powerup;
 // fragments created BY the sweep do neither, because they are not in the snapshot. The snapshot is an
@@ -7929,23 +8282,26 @@ function spawnHealthPowerup() {
 // farming incentive and no cooldown. SILENT this phase — the dock_24 Dan line is P10's (voice-lab-
 // gated); no new floater either (the Maxed Out "MAX HAUL" at the same instant already marks it).
 function superMegaDelivery() {
-  const setTypes = Object.keys(POWERUP_DROP_WEIGHTS);  // rapid, triple, scoop, magnet, engine, guard
+  const setTypes = Object.keys(POWERUP_DROP_WEIGHTS).filter(k => k !== "guard");  // rapid, triple, scoop, magnet, engine
   for (const type of setTypes) {
     const a = rand(0, TAU);  // fresh random vector per powerup — the reward tiers' launch idiom
     game.powerups.push(new Powerup(game.dock.x, game.dock.y, type,
-      Math.cos(a) * DOCK_POWERUP_SPEED, Math.sin(a) * DOCK_POWERUP_SPEED));
+      Math.cos(a) * DEBUG.dockPowerupSpeed, Math.sin(a) * DEBUG.dockPowerupSpeed));
   }
 
   const snap = game.hunters.filter(h => !h.dead);  // THE SNAPSHOT — iterate this, never game.hunters
-  // SWEEP_POWERUP_CAP bookkeeping: the ceiling counts the guaranteed set plus every per-piece payout.
-  // A swept LARGE pays its one powerup from INSIDE destroyHunter (the v3.6 P3 large-core drop) — which
-  // is also why the sweep spawns nothing extra for size 3 (FLAG-g: two powerups for one piece would
-  // make the ceiling a lie). Those interior drops can't be stopped once destroyHunter is called, so
-  // their count is RESERVED out of the budget up front and the medium/small payouts spend what's left.
+  // DEBUG.sweepPowerupCap bookkeeping: the ceiling counts the guaranteed set plus every per-piece
+  // payout. A swept LARGE pays its one powerup from INSIDE destroyHunter (the v3.6 P3 large-core drop)
+  // — which is also why the sweep spawns nothing extra for size 3 (FLAG-g: two powerups for one piece
+  // would make the ceiling a lie). Those interior drops can't be stopped once destroyHunter is called,
+  // so their count is RESERVED out of the budget up front and the medium/small payouts spend what's left.
   // Under largeHunterCap() (CS024 P6f; the level-table cap it used to read topped out at 12, and this one
   // plateaus at 6) the reservation never exhausts the budget in any reachable state.
-  const pool = setTypes.concat("health");  // sweep rolls ADD Health (ambient-only everywhere else)
-  let budget = SWEEP_POWERUP_CAP - setTypes.length - snap.filter(h => h.size === 3).length;
+  // CS035 P6 (spec §5.4): "guard" is filtered OUT of setTypes above, so the per-piece pool must re-add
+  // it explicitly to stay at 7 — flat and ungated (no guardDropWeight(), no chainGuardMinTow): the
+  // chain is empty at this instant, the same reason the guaranteed set bypassed the gate pre-P6.
+  const pool = setTypes.concat("guard", "health");  // sweep rolls ADD guard back + Health (ambient-only elsewhere)
+  let budget = DEBUG.sweepPowerupCap - setTypes.length - snap.filter(h => h.size === 3).length;
   for (const h of snap) {
     destroyHunter(h, true);      // one hit, resolved exactly as a player shot: score + achievement
                                  // counters credited (awardScore gates both), normal split + scatter
@@ -9332,6 +9688,9 @@ function breakChain(i, src = null) { // node i destroyed; everything aft breaks 
     if (src) src.guardT = DEBUG.chainGuardCooldown;
     return; // no node severed, deliveryCount untouched — the load is byte-identical
   }
+  // CS035 P6 (spec §5.3): the sever path only — a guarded absorb returned above and never reaches
+  // here; scatterChain() (ship death) is its own terminal event and does not increment this.
+  game.stats.cargoDamageEvents++;
   boom(hit.x, hit.y, 1, COLOR.garbage);
   for (let j = i + 1; j < chain.length; j++) {
     game.garbage.push(Garbage.fromNode(chain[j]));
@@ -9484,11 +9843,123 @@ function updateDeath(dt) {
   }
 }
 
+// CS036 P1 — the level banner's per-frame tick, lifted VERBATIM out of update()'s playing body so the
+// level-end freeze can run the same one. ⛔ IT HAS EXACTLY TWO CALLERS AND MUST NEVER RUN TWICE IN A
+// FRAME: update()'s playing body (unfrozen) and updateLevelEndFreeze() (frozen). What keeps that true is
+// that the freeze branch RETURNS — a frozen frame never reaches the playing body — so a third caller, or
+// an if/else that still falls through, is what would break it.
+//
+// CS025 P5: in the PLAYING body, so it holds through a pause and resumes rather than expiring behind the
+// menu — the same treatment the caption gets, for the same reason. drawLevelBanner() gates on life > 0.
+// Allowed to run negative; nothing reads it below zero.
+// CS035 P3 (spec §3.4): the banner's expiry ARMS the level-end grace — the window's last step. A ONE-SHOT
+// ON THE CROSSING, not a `life <= 0` test: life is allowed to run negative and stays there for the rest
+// of the level, so a plain test would re-arm the grace on every subsequent frame and the protection would
+// never end.
+//   ⛔ THE `game.levelEndSafe` CLAUSE IS LOAD-BEARING, NOT DEFENSIVE. startGame() calls nextWave() for
+// wave 1, which seeds a banner with no level-end window behind it; without this clause every new run
+// would open with DEBUG.levelEndGrace seconds of free invincibility.
+function tickLevelBanner(dt) {
+  const bannerWasLive = game.levelBanner.life > 0;
+  game.levelBanner.life -= dt;
+  if (bannerWasLive && game.levelBanner.life <= 0 && game.levelEndSafe) {
+    game.levelEndGraceT = DEBUG.levelEndGrace;
+  }
+}
+
+// CS036 P1 (spec §0.3) — THE LEVEL-END FREEZE'S REDUCED SIM, modelled on updateDeath() above. The field
+// is a freeze-frame: no ship, no entity updates, no chain relaxation, no spawns, no collisions, no
+// cleanup filters, no wave-clear. Five things happen instead, and each is here for a stated reason.
+//
+//   1. ⛔ AudioSys.thrust(false) — both existing early-return paths call it and so must this one. A
+//      player thrusting on the frame that cleared the wave would otherwise get a stuck engine loop
+//      droning over a silent, motionless field, because Ship.update() (which owns the only
+//      thrust(true)/thrust(false) edge) is exactly what this branch stops running.
+//   2. ⛔ tickLevelBanner(dt) — WITHOUT THIS THE FREEZE IS A HARD HANG (spec §0.3). The unfreeze is a
+//      read on game.levelBanner.life (P3), and the banner only ages in update()'s playing body, which
+//      this branch replaces. So the tick runs in BOTH paths, from the one function, never twice.
+//   3. ⛔ VoiceSys.update() — the critical-line queue drain. Parked lines live on the AUDIO clock and
+//      have no TTL by design (CLAUDE.md), so a queue frozen for the length of a player-paced hold would
+//      simply stop speaking. Last here, as it is last in the playing body.
+//   4. CS036 P2: game.levelDone.age — the completion announcement's fade-in clock, and the ONLY clock
+//      this build advances that is not also advanced by the playing body. It belongs here rather than
+//      there because the announcement exists only inside the freeze: it is seeded at the wave-clear arm
+//      (at the END of the last live frame, so it correctly ages 0 on the frame it appears) and cleared
+//      by dismissLevelDone() on the frame the player confirms. The `if` is not defensive padding — CS036
+//      P3 extends the freeze PAST that clear, so frozen frames with no announcement up are the norm.
+//      Those are the TAIL, and the `else` below is what ends them.
+//   5. ⛔ CS036 P3: game.caption.life — P1 RAISED THIS AND P2 HANDED THE CALL HERE ON PURPOSE ("P3 owns
+//      the call, and has the better view"). The answer is YES, the caption clock runs. This branch stops
+//      the SIM and deliberately keeps the ANNOUNCEMENT CHANNEL running — the banner countdown at 2 and
+//      the voice drain at 3 are both that channel — and a caption is that channel's visual half, not the
+//      field's. Two facts made it decidable from here and not from P2: nextWave() now fires INSIDE the
+//      freeze, so VoiceSys.sayLevel() raises a caption at the head of the TAIL on every single level
+//      transition, and the level banner it is the twin of (same call, same string) is ticking down right
+//      beside it. A stopped caption clock would hold that line at full alpha for the whole tail while its
+//      own audio, which runs on the AUDIO clock and never froze, finished seconds earlier — the "one
+//      gate, two outputs" rule's exact failure mode.
+//      ⛔ THIS IS NOT THE PAUSE'S RULE AND DOES NOT TOUCH IT. game.paused and the celebration panel both
+//      still hold the caption where it stands (CS011 P2's "resumes rather than expiring behind the
+//      menu"), because those states run no announcement channel at all — they run nothing. Only this
+//      branch ticks it, and it is the only one of the three that has anything to say while it is up.
+//
+// ⛔ WHAT IS DELIBERATELY LEFT STOPPED, AND WHY IT IS NOT AN OMISSION: Achievements.evaluate() and the
+// heartbeat. The celebration panel's own freeze already stops both, and the wave-clear branch's `return`
+// comment states the reason in terms — an unlock raised by THIS clear would toast on top of the panel
+// (drawToasts() draws last) and still not appear IN it, since evaluate() runs after that flush either
+// way. The completion hold is the same seam one step earlier, so running them here would change
+// achievement timing that has been stable since CS030 for no gain. Leave them stopped.
+//
+// ⛔ ARMED BY CS036 P2 (update()'s wave-clear latch sets game.levelEndFreeze), ENDED HERE BY CS036 P3
+// (spec §1.2, FORK-CS036-B). The freeze now SURVIVES the player's confirm and the whole of nextWave():
+// dismissLevelDone() hands off to the celebration panel or straight to the new level, and the field
+// stays stopped under either until the "Level N+1" label STARTS FADING OUT, at
+// game.levelBanner.life <= DEBUG.levelBannerFade (1.7 s into a 2.2 s banner at the shipped knobs).
+// ⛔ STILL NO TIMER (FORK-CS036-E): the hold is ended by input and the tail by the label's own render
+// knobs — neither half counts anything down of its own.
+//
+//   ⛔ THE HOLD AND THE TAIL ARE MUTUALLY EXCLUSIVE, WHICH IS WHY THEY ARE ONE if/else RATHER THAN TWO
+// ifs. game.levelDone is non-null for exactly the hold — seeded at the arm, nulled on dismissLevelDone()'s
+// first line, which is also the call that reaches nextWave() — so `else` IS the tail. Testing the banner
+// during the HOLD would unfreeze on the announcement's first frame instead: the banner standing then is
+// the level just FINISHED, expired seconds ago and running negative, which is <= any fade.
+//
+//   ⛔ BOTH DEGENERATE KNOB SETTINGS DEGRADE TO "UNFREEZE IMMEDIATELY", and the plain `<=` is what does
+// it — no special case, and no clamping (spec §1.5 trap 1). levelBannerTime is 0-8 s and levelBannerFade
+// is 0-3 s, both draggable from the debug panel mid-run: with fade >= time nextWave() seeds a banner
+// already inside its own fade-out, and with time === 0 there is no banner at all. In either case the
+// first tail frame's life is already <= fade and the field unfreezes on it, one frame after the confirm,
+// which is before anything is drawn. ⛔ A CROSSING ONE-SHOT — the idiom tickLevelBanner() uses three
+// lines up, and the obvious thing to reach for here — WOULD HANG ON BOTH: a banner seeded below the
+// threshold never crosses it. Same spirit as drawLevelBanner()'s own Math.max(0, ...) guard, which
+// exists for this exact pair of knobs.
+function updateLevelEndFreeze(dt) {
+  AudioSys.thrust(false);
+  game.caption.life -= dt;
+  tickLevelBanner(dt);
+  if (game.levelDone) game.levelDone.age += dt;                                  // the HOLD
+  else if (game.levelBanner.life <= DEBUG.levelBannerFade) game.levelEndFreeze = false;   // the TAIL
+  VoiceSys.update();
+}
+
 function update(dt) {
   // v3.6 P5: the death spectacle runs its own reduced sim. This branch sits BEFORE the general
   // early-return so "dying" isn't swallowed by the `state !== "playing"` gate below.
   if (game.state === "dying" && !game.paused) {
     updateDeath(dt);
+    return;
+  }
+  // CS036 P1 (spec §0.3): the level-end freeze runs its own reduced sim too, and sits HERE for the same
+  // reason the "dying" branch above does — a naive extra term on the general early-return below would
+  // stall the level banner (a hard hang) and the voice queue along with everything it is meant to stop.
+  // ⛔ THE THREE NEGATIVE TERMS ARE NOT DEFENSIVE PADDING. They are what makes this branch a strict
+  // REPLACEMENT for an ordinary playing frame and nothing more: `state === "playing"` keeps a stale flag
+  // from freezing a gameover screen, `!game.paused` keeps the pause menu winning over the freeze exactly
+  // as it wins over the death spectacle, and `!game.celebration` leaves the celebration panel's own
+  // shipped full stop (which runs neither the banner tick nor the voice drain) byte-for-byte untouched —
+  // the panel opens INSIDE the freeze, and CS036 changes nothing about it (spec §1.6).
+  if (game.levelEndFreeze && game.state === "playing" && !game.paused && !game.celebration) {
+    updateLevelEndFreeze(dt);
     return;
   }
   // CS030 P5 (§4.4): ⛔ THE CELEBRATION PANEL FREEZES THE FIELD. The term that earns its keep is the
@@ -9522,6 +9993,45 @@ function update(dt) {
   // Capture.hudVisible reason as hudHull/cargoFlash above: a decay that only ran while drawn would freeze
   // while the HUD is hidden with H and pop back on re-show.
   if (game.hpReliefFlash > 0) game.hpReliefFlash = Math.max(0, game.hpReliefFlash - dt);
+  // CS036 P5 (spec §3.1): the dock lockout push's ping cooldown — lives here for the same
+  // Capture.hudVisible-independence reason as cargoFlash/hpReliefFlash above, even though this one is
+  // audio, not HUD: it must decay whether or not anything is drawn.
+  if (game.dockPingTimer > 0) game.dockPingTimer = Math.max(0, game.dockPingTimer - dt);
+  // CS035 P3 (spec §3.4/§3.5) — the level-end protection window's per-frame half: the grace countdown that
+  // CLOSES the window, and the phase accumulator that drives Ship.draw()'s alpha pulse.
+  //   PLACEMENT IS LOAD-BEARING IN ONE DIRECTION: this must stay ABOVE the level-banner tick further down,
+  // which is what ARMS the grace. Arming and then ticking in the same frame would eat a frame of grace on
+  // every crossing. It sits with the cargoFlash/hpReliefFlash decays for the same Capture.hudVisible
+  // reason they do — nothing here may depend on whether anything was drawn.
+  //   Reaching exactly 0 is the window's ONE close. Math.max pins the landing so the `=== 0` test cannot
+  // be stepped over by a large dt, exactly as the two decays above do.
+  if (game.levelEndGraceT > 0) {
+    game.levelEndGraceT = Math.max(0, game.levelEndGraceT - dt);
+    if (game.levelEndGraceT === 0) game.levelEndSafe = false;
+  }
+  // ⛔ THE PHASE ACCUMULATES IN HALF-CYCLES, NOT SECONDS. `oneWay` is the 100% -> 20% transition time, and
+  // it CHANGES mid-window: across the grace it ramps from levelEndFade to levelEndGracePulseEnd (spec's
+  // M2 — the protection running out is told by the thing already moving simply moving faster, with no
+  // countdown text and no second channel). Dividing dt by the LIVE one-way time keeps the accumulator
+  // continuous through any period change, including a mid-window slider drag; a `phase = t / period` form
+  // would snap the moment either knob moved. Same integrate-the-phase reason as game.lowHpPhase above.
+  //   Deliberately NOT wrapped with a modulo here: Ship.draw() takes `% 2` at the point of use, and 60 fps
+  // of the shortest period still needs ~10^13 seconds to lose a bit of precision.
+  //   ⛔ CS036 P3 (FORK-CS036-D -> D1) — THE CONDITION IS THE GRACE, NOT game.levelEndSafe. The pulse says
+  // "you cannot be hit right now", which is meaningless over the frozen field the rest of the window is
+  // spent on: from the clear to the banner's fade-out nothing moves, and the stopped field plus the
+  // announcement over it are already telling the player where they are. The grace is the one step that is
+  // live gameplay with damage off, so it is the only step the tell belongs to. ⛔ BOTH KNOBS ARE RETAINED
+  // AND STILL DO EXACTLY WHAT THEY DID — levelEndFade is the resting one-way time the ramp starts from and
+  // levelEndGracePulseEnd the one it ends at; the ramp simply now spans the whole of the pulse's life
+  // rather than its tail. Ship.draw() reads the SAME condition, and the two must move together.
+  //   The `graceFrac` ternary went with it: its `: 0` branch was the resting phase before the grace armed,
+  // and there is no such phase any more — inside this block the grace is always live, by construction.
+  if (game.levelEndGraceT > 0) {
+    const graceFrac = 1 - game.levelEndGraceT / Math.max(0.0001, DEBUG.levelEndGrace);
+    const oneWay = DEBUG.levelEndFade + (DEBUG.levelEndGracePulseEnd - DEBUG.levelEndFade) * graceFrac;
+    game.levelEndPulseT += dt / Math.max(0.0001, oneWay);
+  }
   // Camera tracks the ship's world position every frame (world wraps, so no clamping)
   game.camera.x = game.ship.x;
   game.camera.y = game.ship.y;
@@ -9587,10 +10097,10 @@ function update(dt) {
   game.particles.forEach(p => p.update(dt));
   game.floaters.forEach(f => f.update(dt));
   game.caption.life -= dt; // CS011 P2: age Dan's on-screen caption (drawCaption gates on life > 0)
-  // CS025 P5: age the level banner alongside it. In the PLAYING body, so it holds through a pause and
-  // resumes rather than expiring behind the menu — the same treatment the caption gets, for the same
-  // reason. drawLevelBanner() gates on life > 0. Allowed to run negative; nothing reads it below zero.
-  game.levelBanner.life -= dt;
+  // CS025 P5: age the level banner alongside it. CS036 P1 moved the body out to tickLevelBanner() so the
+  // freeze can call the SAME tick — this call site keeps its exact position, below the grace countdown
+  // that arming must not race (see that block) and above the dock update.
+  tickLevelBanner(dt);
   if (game.dock) game.dock.update(dt);
 
   // CS024 P1: CS023 P4's single `updateDebrisDrift(dt)` call STOOD HERE — after every entity's update(dt)
@@ -9643,7 +10153,24 @@ function update(dt) {
   // as the single `magnet` was: the loop itself spends magnet budget, so a per-piece re-read would let
   // the pull switch off partway through the array and make the frame's behaviour depend on array order.
   const magnet = powerActive("magnet");
-  const pulling = magnetPulling();
+  // CS035 P2 (spec §2.1/§2.5): THE DOCK LOCKOUT TEST — the ship inside the dock's NEIGHBORHOOD RING
+  // (dock.radius + DOCK_NEIGHBORHOOD_PAD), not the +10 offload radius and not dock.radius. This is the
+  // same expression the capture gate below used to compute inline; it MOVED up here, it was not added.
+  // Hoisted above the loop with `magnet`/`pulling` because it is a property of the SHIP, not of a
+  // piece — per-piece it would be the same answer N times a frame. Three consumers: the capture gate
+  // (which it shuts), the push (which it arms), and `pulling` (which it suppresses). Its fourth, the
+  // CS020 towed/incidental tag, is GONE — see the tombstone in the dock-offload block below.
+  const dockPad = game.dock ? game.dock.radius + DOCK_NEIGHBORHOOD_PAD : 0;
+  const inRing = !!game.dock && dist2(game.ship, game.dock) < dockPad * dockPad;
+  // CS035 P2 (spec §2.5, FORK-G): the ring suppression rides `pulling`, the SUPPRESSIBLE name — never
+  // `magnet`, the raw one the two spend sites read (that split is the block directly above, and this
+  // phase does not get to relax it). Without this a Magnet running at the dock drags every loose piece
+  // within MAGNET_RANGE onto the ship to be pushed away, pulled back, and pushed away again — a
+  // permanent churn at the exact spot the player is trying to read a score off. pickR follows
+  // `pulling`, so the widened circle collapses to GARBAGE_PICKUP in here too: correct and intended,
+  // the circle is moot when the gate above it is shut, and CS025's "the circle comes back WITH the
+  // pull" rule stays in step.
+  const pulling = magnetPulling() && !inRing;
   const pickR = pulling ? GARBAGE_PICKUP * MAGNET_PICKUP_MULT : GARBAGE_PICKUP;
   for (const g of game.garbage) {
     g.update(dt);
@@ -9665,25 +10192,59 @@ function update(dt) {
     // Capture region = the base GARBAGE_PICKUP circle OR the Scoop mouth (v3.3 P3). MAGNET_PICKUP_MULT
     // multiplies the CIRCLE only, and the box is independent, so there's no double-counting; at
     // scoopLevel 0 inScoopBox is always false, so this is byte-identical to the pre-scoop pickup.
-    if (game.chain.length < game.cargoMax &&
-        (dist2(g, game.ship) < pickR * pickR || inScoopBox(g))) {
+    // CS035 P2: given a NAME because the lockout's push and the capture gate ask the identical
+    // question — the push is exactly "a piece that would have been captured, while the gate is shut".
+    const inCapture = dist2(g, game.ship) < pickR * pickR || inScoopBox(g);
+    // CS035 P2 (spec §2.3, FORK-E): THE PUSH. Inside the ring nothing can be hooked, so a piece that
+    // reaches the ship or the scoop mouth is shoved radially outward rather than loitering on the hull
+    // to be re-tested every frame (and, coalescence being a separate system that keeps running, fusing
+    // into a Hunter at the player's own position while they offload).
+    // ⛔ VELOCITY IS SET, NEVER ADDED. A piece pinned between the ship and the dock is inside the
+    // region on consecutive frames; adding would let it accumulate speed frame over frame.
+    // ⛔ NOT debrisBounce(). That is a mass-aware two-body ELASTIC solver written for satellites, and
+    // its own dispatch comment warns against handing it bodies outside its contract: a canister has
+    // `mass` but no `size`, and the ship is not in its contract at all.
+    // Deliberately NOT gated on chain length — §2.1's rule is "Debris that reaches the ship or the
+    // scoop mouth is pushed away", at every chain length including full and including zero.
+    // THE SHIP IS COMPLETELY UNAFFECTED: no recoil, no velocity change, no damage, no hit-stun.
+    // shieldPing() is the shipped "a contact was deflected" tell, reused as-is — NO new audio method.
+    if (inRing && inCapture) {
+      let [ux, uy] = shortDelta(game.ship.x, game.ship.y, g.x, g.y);    // ship -> piece (wrap-aware)
+      let d = Math.hypot(ux, uy);
+      // A piece resting EXACTLY on the ship's centre has no direction to be pushed along, and the
+      // house `|| 0.0001` guard would hand it a velocity of zero — pinned on the hull, re-tested every
+      // frame, with coalescence still running around it. Fall back to the ship's own facing: the piece
+      // is ON the hull, so every direction is outward, and this one is always defined.
+      if (d < 1e-6) { ux = Math.cos(game.ship.angle); uy = Math.sin(game.ship.angle); d = 1; }
+      g.vx = (ux / d) * DEBUG.dockBounceSpeed;
+      g.vy = (uy / d) * DEBUG.dockBounceSpeed;
+      // CS036 P5 (spec §3.1): an AUDIO rate limit only — the push above runs unconditionally, every
+      // piece, every frame. Several pieces landing on the hull in the same frame used to fire one ping
+      // each, stacking into a stutter; now the loop still pings the FIRST one it reaches this frame,
+      // arms the cooldown, and every other piece this frame (and every push until the cooldown drains)
+      // pushes silently. At DEBUG.dockPingCooldown === 0 the timer never arms above 0, so every push
+      // pings — the shipped, pre-knob behaviour.
+      if (game.dockPingTimer === 0) {
+        AudioSys.shieldPing();
+        game.dockPingTimer = DEBUG.dockPingCooldown;
+      }
+    }
+    if (!inRing && game.chain.length < game.cargoMax && inCapture) {
       // CS024 P3 (spec §1.2/§4.2): CS017 P5's ONE-SHOT BONUS PAYOUT STOOD HERE — an
       // `if (g.bonus) { g.bonus = false; addScore(BONUS_CANISTER_SCORE); ...float... }` above the
       // single/clump branch, whose flag-clear was what made "paid once per clump" true across a partial
       // scoop. Removed with the canister; the capture gate below is otherwise untouched.
-      // CS020: a node is TOWED if it was hooked OUTSIDE the dock's neighborhood, and an INCIDENTAL if
-      // it was hooked inside it. Computed HERE — once, at the moment of capture, above the single/clump
-      // branch so ONE expression covers both push paths (the same placement idiom as the bonus-canister
-      // award directly above). Tagging at capture rather than counting pops at the dock is load-bearing:
-      // the chain is LIFO and both push sites append to the tail the offload pops from, so a piece
-      // hooked while parked JUMPS THE QUEUE and is delivered first — any count-based scheme would spend
-      // the escalation on the in-ring pickups and demote the genuinely towed load. See GDD 2.10.
-      const pad = game.dock ? game.dock.radius + DOCK_NEIGHBORHOOD_PAD : 0;
-      const inRing = !!game.dock && dist2(game.ship, game.dock) < pad * pad;
-      // CS020 P1b: gathering again starts a NEW effort. An INCIDENTAL never does this —
-      // it is neutral to the counter in both directions (FORK-CS020-B).
+      // CS035 P2 (spec §2.4): CS020's TOWED/INCIDENTAL TAG STOOD HERE — a `const pad`/`const inRing`
+      // pair computed at the moment of capture, feeding `towed: !inRing` onto both push sites below.
+      // The ring test itself survives (hoisted above the loop, where the lockout arms off it); only the
+      // tag is gone. Reaching this line now MEANS the ship was outside the ring, so every node this
+      // block creates is a towed one by construction — there is nothing left to tag.
+      // CS020 P1b: gathering again starts a NEW effort.
       // THE `!inRing` GUARD IS LOAD-BEARING: resetting on EVERY hook would mean a magnet grab at the
-      // dock kills a player's own run mid-offload — the exact unfairness this phase exists to remove.
+      // dock kills a player's own run mid-offload — the exact unfairness CS020 P1b exists to remove.
+      // ⛔ CS035 P2 KEEPS IT, and it is not dead code to be tidied even though the gate above now
+      // carries the same `!inRing`: it states the reset's OWN precondition at the reset, which is what
+      // survives if the lockout is ever narrowed to a smaller radius than the ring.
       // This is also what BOUNDS the counter, and the bound is structural rather than policed:
       // between any two resets only nodes already in the chain can be counted, and the pickup gate
       // above bounds the chain at game.cargoMax, therefore deliveryCount <= cargoMax. That is what
@@ -9700,8 +10261,8 @@ function update(dt) {
         g.dead = true;
         game.chain.push({
           x: g.x, y: g.y, px: g.x, py: g.y,
-          spin: g.spin, spinRate: g.spinRate, mass: g.mass,  // carry towing weight onto the node (F5)
-          towed: !inRing                                     // CS020: earns the delivery combo (see above)
+          spin: g.spin, spinRate: g.spinRate, mass: g.mass   // carry towing weight onto the node (F5)
+          // CS035 P2 (§2.4): `towed: !inRing` STOOD HERE. Every node is towed now — see the gate above.
         });
         AudioSys.pickup();
         // Count-based Magnet expiry (B-5): spend one budget per canister HOOKED — counted at the hook,
@@ -9722,9 +10283,8 @@ function update(dt) {
         for (let k = 0; k < take; k++) {
           game.chain.push({
             x: g.x, y: g.y, px: g.x, py: g.y,
-            spin: g.spin, spinRate: g.spinRate, mass: pMass,
-            towed: !inRing         // CS020: one scoop is one capture — every `take` node gets the
-                                   // SAME tag, from the expression computed once above the branch
+            spin: g.spin, spinRate: g.spinRate, mass: pMass
+            // CS035 P2 (§2.4): the clump path's own `towed: !inRing` STOOD HERE, same as the single's.
           });
         }
         AudioSys.pickup();
@@ -9807,8 +10367,10 @@ function update(dt) {
     // of the offload branch, or it would not run while the ship is actively delivering. Re-arming
     // happens at the RING (dock.radius + DOCK_NEIGHBORHOOD_PAD), not the +10 offload radius — once
     // back inside the neighborhood the run is safe indefinitely and the player can take their time
-    // closing the last 30px. Loitering there is harmless: pickups in here are incidentals, so nothing
-    // advances. Ship-dead is excluded from the DECAY arm so a corpse's run can never be timed out
+    // closing the last 30px. Loitering there is harmless — through CS034 because pickups in here were
+    // INCIDENTALS and so advanced nothing, and since CS035 P2 for the stronger reason that there are no
+    // pickups in here at all: the lockout uses this same ring, so the reset simply cannot be reached
+    // from inside it. Ship-dead is excluded from the DECAY arm so a corpse's run can never be timed out
     // mid-death (scatterChain has already zeroed the counter anyway, which is why the dead ship
     // falling into the re-arm branch is a harmless no-op rather than a second rule).
     // Replaces the old distance-based reset that lived in the offload
@@ -9827,116 +10389,111 @@ function update(dt) {
     if (nearDock && game.chain.length > 0) {
       game.offloadTimer -= dt;
       if (game.offloadTimer <= 0) {
-        const node = game.chain.pop(); // canisters peel off from the tail
-        // CS020: TOWED (hooked outside the dock neighborhood, the work of an actual haul) vs INCIDENTAL
-        // (hooked while already parked in it). `!== false` is load-bearing, not style: a node with no
-        // `towed` field at all — which is every chain node any older test seeds by hand — defaults to
-        // TOWED, so absence never silently demotes a delivery. Only an explicit false demotes.
-        const towed = node.towed !== false;   // absent => towed
-        // CS029 P4 (§6.1): the ONE shared origin expression for both delivery branches below — the
-        // dock is static for the whole visit (Dock.update() only advances `spin`), which is the fixed
-        // point the gate asked for. Computed once here so the two branches can't drift apart.
+        game.chain.pop();   // canisters peel off from the tail
+        // CS035 P2 (spec §2.4): CS020's TOWED/INCIDENTAL SPLIT STOOD HERE — `const towed = node.towed
+        // !== false;` and an `if (towed) { ... } else { ... }` wrapped around everything below, whose
+        // else branch paid a flat DOCK_BASE_SCORE, pushed its own size-12 floater and rang
+        // AudioSys.deliver(1). §2 made the incidental category EMPTY BY CONSTRUCTION — the dock lockout
+        // at the pickup gate means no node can be hooked inside the ring at all — so that branch became
+        // unreachable, and it and the tag are both gone. The `!== false` idiom ("absence defaults to
+        // TOWED", written so a hand-seeded chain node with no such field was never silently demoted)
+        // went with it: with no tag anywhere, absence is the only case there is.
+        // ⛔ THE POP ITSELF IS UNCHANGED and still peels from the TAIL. The LIFO order is exactly what
+        // let an incidental jump the queue and land in that dead branch (§0.2 — the real mechanism,
+        // never a counter reset); with none left to jump it, a visit is one unbroken escalating run.
+        // `node` lost its only reader with the tag, so the binding went too — the pop is called for
+        // its side effect on game.chain, which is all it was ever needed for here.
+        // CS029 P4 (§6.1): the delivery ticker's origin — the dock is static for the whole visit
+        // (Dock.update() only advances `spin`), which is the fixed point that gate asked for. It was
+        // computed here so the two delivery branches could not drift apart; CS035 P2 left it in place,
+        // one consumer down, because it still names the anchor once at the top of the pop handler.
         const deliveryAnchorX = game.dock.x, deliveryAnchorY = game.dock.y - DOCK_RADIUS * DELIVERY_FLOAT_ANCHOR_FRAC;
-        if (towed) {
-          game.deliveryCount++;
-          const pts = DOCK_BASE_SCORE + DOCK_BONUS_STEP * (game.deliveryCount - 1);
-          addScore(pts);
-          // Achievement stats (F9): per-game delivered count (Scrap Runner) + best combo this visit
-          // (Combo Collector); a first-canister-within-60s flag (Speed Recycler); a full 12-in-one-visit
-          // milestone (Heavy Hauler weekly + The Long Haul lifetime); and lifetime delivered/score.
-          game.stats.delivered++;
-          game.stats.bestCombo = Math.max(game.stats.bestCombo, game.deliveryCount);
-          // CS018 P8 (PLANNED-FEATURES-CS018.md §4.3, replaces the v3.6 P3 single ===10 emitter):
-          // four independent "passes through N exactly once per visit" latches — same idiom as the
-          // deliveryCount===12 Heavy Hauler / ===CARGO_CAP_MAX Maxed Out latches below — each awarding
-          // ONE powerup. Cumulatively: 1 for 8-11, 2 for 12-15, 3 for 16-19, 4 for 20-23 delivered.
-          // Each launches from the dock's own position on a fresh random vector, exactly as the old
-          // ===10 emitter did. The "SALVAGE BONUS" floater fires only on the first award (8) so the
-          // dock doesn't repeat identical text four times in one visit.
-          if (game.deliveryCount === 8 || game.deliveryCount === 12 ||
-              game.deliveryCount === 16 || game.deliveryCount === 20) {
-            const a = rand(0, TAU);
-            dropPowerup(game.dock.x, game.dock.y, Math.cos(a) * DOCK_POWERUP_SPEED, Math.sin(a) * DOCK_POWERUP_SPEED);
-            if (game.deliveryCount === 8) {
-              game.floaters.push(new FloatText("SALVAGE BONUS", game.dock.x, game.dock.y - 22, COLOR.dock));
-            }
-          }
-          // Salvage King (lifetime MAX): best canisters delivered in one game. game.stats.delivered only
-          // climbs within a run, so Math.max here tracks the per-game best and keeps the all-time record.
-          Achievements.lifetime.bestDeliveredGame = Math.max(Achievements.lifetime.bestDeliveredGame, game.stats.delivered);
-          game.stats.pacifistStreak++;
-          game.stats.pacifistBest = Math.max(game.stats.pacifistBest, game.stats.pacifistStreak);
-          // Zen Master (lifetime, per-EVENT): each haul whose no-fire delivery streak REACHES 5 counts once.
-          // pacifistStreak passes through 5 exactly once per haul (firing resets it to 0), so === 5 latches
-          // once; a longer haul (6,7,…) doesn't re-fire, and a fresh 5-streak after firing is a new event.
-          if (game.stats.pacifistStreak === 5) Achievements.lifetime.pacifistTowEvents++;
-          if (game.stats.delivered === 1 && game.stats.gameTime <= 60) game.stats.speedRecycler = true;
-          // Heavy Hauler (weekly) + The Long Haul (lifetime fullChains) + Freight Baron (lifetime, per-EVENT):
-          // a FIXED >=12-in-one-visit milestone, deliberately decoupled from the growing game.cargoMax
-          // (FLAG A-5-a / B-8-b) — deliveryCount passes through 12 exactly once per qualifying visit, so all
-          // three latch once per visit.
-          if (game.deliveryCount === 12) { game.stats.fullChainVisit = true; Achievements.lifetime.fullChains++; Achievements.lifetime.heavyHaulerEvents++; }
-          // Maxed Out (lifetime, CS012 P3): deliveryCount passes through CARGO_CAP_MAX exactly once per
-          // qualifying visit (same "passes through" latch idiom as the ===12 check above). Celebration
-          // (floater + gold ring pulse) fires at this same instant — no voice line (deferred, FORK-CS012-B b).
-          if (game.deliveryCount === CARGO_CAP_MAX) {
-            game.stats.maxChainVisit = true;
-            game.floaters.push(new FloatText("MAX HAUL", game.dock.x, game.dock.y - 22, COLOR.ach, 24));
-            game.cargoFlash = HUD_CAP_FLASH;
-          }
-          // CS018 P9: a full-cap 24-piece visit ALSO triggers the SUPER MEGA DELIVERY — guaranteed
-          // six-type set + the snapshot hunter sweep + the coalescence pause (see superMegaDelivery()).
-          // Same "passes through CARGO_CAP_MAX exactly once per visit" latch as Maxed Out above, kept
-          // as its OWN block: Maxed Out is an achievement latch, this is a game event — and P10 hooks
-          // the dock_24 voice line HERE, not into VoiceSys.dockDelivery's tier chain. SILENT this phase.
-          if (game.deliveryCount === CARGO_CAP_MAX) superMegaDelivery();
-          Achievements.lifetime.delivered++;
-          Achievements.lifetime.deliveryScore += pts;
-          // CS026 P4 (spec §3.3a/§3.4): rise/life read from the DELIVERY registry knobs. CS029 P4
-          // (model C, gate G1/§6.3): the towed branch no longer spawns a new floater per canister — one
-          // ticker lives for the whole visit, pinned at the dock anchor, its text rewritten to the
-          // running visit total as each canister lands. It is released (unpinned, becomes an ordinary
-          // rising/fading floater) at the visit's last canister, below. The running total is carried on
-          // the ticker itself — there is nowhere else that needs it.
-          if (!game.deliveryTicker) {
-            game.deliveryTicker = new FloatText("+" + pts, deliveryAnchorX, deliveryAnchorY,
-              COLOR.dock, 16, DEBUG.deliveryFloatRise, DEBUG.deliveryFloatLife);
-            game.deliveryTicker.pinned = true;
-            game.deliveryTicker.total = pts;
-            game.floaters.push(game.deliveryTicker);
-          } else {
-            game.deliveryTicker.total += pts;
-            game.deliveryTicker.text = "+" + game.deliveryTicker.total;
-          }
-          AudioSys.deliver(game.deliveryCount);
-          // CS010 P9 (FORK-5 = b): Dan sizes up the haul on the pop that EMPTIES the chain — the offload
-          // block only runs while chain.length > 0, so the emptying pop happens exactly once (THE GATE IS
-          // THE LATCH, no flag needed) and deliveryCount is intact at this instant. 1–4 pieces says nothing.
-          // breakChain()/scatterChain() also zero deliveryCount but never reach here, so they stay silent.
-          if (game.chain.length === 0) {
-            VoiceSys.dockDelivery(game.deliveryCount);
-            releaseDeliveryTicker(); // §6.3: released as an ordinary floater at the last canister
-          }
+        game.deliveryCount++;
+        const pts = DOCK_BASE_SCORE + DOCK_BONUS_STEP * (game.deliveryCount - 1);
+        addScore(pts);
+        // Achievement stats (F9): per-game delivered count (Scrap Runner) + best combo this visit
+        // (Combo Collector); a first-canister-within-60s flag (Speed Recycler); a full 12-in-one-visit
+        // milestone (Heavy Hauler weekly + The Long Haul lifetime); and lifetime delivered/score.
+        game.stats.delivered++;
+        game.stats.bestCombo = Math.max(game.stats.bestCombo, game.deliveryCount);
+        // CS018 P8 (PLANNED-FEATURES-CS018.md §4.3, replaces the v3.6 P3 single ===10 emitter):
+        // four independent "passes through N exactly once per visit" latches — same idiom as the
+        // deliveryCount===12 Heavy Hauler / ===CARGO_CAP_MAX Maxed Out latches below — each awarding
+        // ONE powerup. Cumulatively: 1 for 8-11, 2 for 12-15, 3 for 16-19, 4 for 20-23 delivered.
+        // Each launches from the dock's own position on a fresh random vector, exactly as the old
+        // ===10 emitter did.
+        // CS035 P1 (§1.3): the "SALVAGE BONUS" floater that used to fire on the first award (8) is
+        // deleted — the lab measured -15.7px ink overlap against the re-tuned delivery ticker. The
+        // reward-tier powerup award itself is untouched.
+        if (game.deliveryCount === 8 || game.deliveryCount === 12 ||
+            game.deliveryCount === 16 || game.deliveryCount === 20) {
+          const a = rand(0, TAU);
+          dropPowerup(game.dock.x, game.dock.y, Math.cos(a) * DEBUG.dockPowerupSpeed, Math.sin(a) * DEBUG.dockPowerupSpeed);
+        }
+        // Salvage King (lifetime MAX): best canisters delivered in one game. game.stats.delivered only
+        // climbs within a run, so Math.max here tracks the per-game best and keeps the all-time record.
+        Achievements.lifetime.bestDeliveredGame = Math.max(Achievements.lifetime.bestDeliveredGame, game.stats.delivered);
+        game.stats.pacifistStreak++;
+        game.stats.pacifistBest = Math.max(game.stats.pacifistBest, game.stats.pacifistStreak);
+        // Zen Master (lifetime, per-EVENT): each haul whose no-fire delivery streak REACHES 5 counts once.
+        // pacifistStreak passes through 5 exactly once per haul (firing resets it to 0), so === 5 latches
+        // once; a longer haul (6,7,…) doesn't re-fire, and a fresh 5-streak after firing is a new event.
+        if (game.stats.pacifistStreak === 5) Achievements.lifetime.pacifistTowEvents++;
+        if (game.stats.delivered === 1 && game.stats.gameTime <= 60) game.stats.speedRecycler = true;
+        // Heavy Hauler (weekly) + The Long Haul (lifetime fullChains) + Freight Baron (lifetime, per-EVENT):
+        // a FIXED >=12-in-one-visit milestone, deliberately decoupled from the growing game.cargoMax
+        // (FLAG A-5-a / B-8-b) — deliveryCount passes through 12 exactly once per qualifying visit, so all
+        // three latch once per visit.
+        if (game.deliveryCount === 12) { game.stats.fullChainVisit = true; Achievements.lifetime.fullChains++; Achievements.lifetime.heavyHaulerEvents++; }
+        // Maxed Out (lifetime, CS012 P3): deliveryCount passes through CARGO_CAP_MAX exactly once per
+        // qualifying visit (same "passes through" latch idiom as the ===12 check above). Celebration
+        // (floater + gold ring pulse) fires at this same instant — no voice line (deferred, FORK-CS012-B b).
+        if (game.deliveryCount === CARGO_CAP_MAX) {
+          game.stats.maxChainVisit = true;
+          // CS035 P1 (§1.3): the "MAX HAUL" floater is deleted — same -15.7px ink overlap against
+          // the re-tuned delivery ticker as SALVAGE BONUS above. The HUD cargo flash below, the
+          // ticker itself, and the dock_24 voice line now carry the moment (FLAG-CS035-a).
+          game.cargoFlash = HUD_CAP_FLASH;
+        }
+        // CS018 P9: a full-cap 24-piece visit ALSO triggers the SUPER MEGA DELIVERY — guaranteed
+        // six-type set + the snapshot hunter sweep + the coalescence pause (see superMegaDelivery()).
+        // Same "passes through CARGO_CAP_MAX exactly once per visit" latch as Maxed Out above, kept
+        // as its OWN block: Maxed Out is an achievement latch, this is a game event — and P10 hooks
+        // the dock_24 voice line HERE, not into VoiceSys.dockDelivery's tier chain. SILENT this phase.
+        if (game.deliveryCount === CARGO_CAP_MAX) superMegaDelivery();
+        Achievements.lifetime.delivered++;
+        Achievements.lifetime.deliveryScore += pts;
+        // CS026 P4 (spec §3.3a/§3.4): rise read from the DELIVERY registry knobs. CS029 P4
+        // (model C, gate G1/§6.3): the towed branch no longer spawns a new floater per canister — one
+        // ticker lives for the whole visit, pinned at the dock anchor, its text rewritten to the
+        // running visit total as each canister lands. It is released (unpinned, becomes an ordinary
+        // rising/fading floater) at the visit's last canister, below. The running total is carried on
+        // the ticker itself — there is nowhere else that needs it.
+        // CS034 P8 (spec §3.5): size grows per piece (deliveryFloatSize/SizeStep/SizeMax) and life
+        // splits into a hold (full opacity after release) plus a fade (the linear falloff) — the
+        // old single-life knob is retired.
+        if (!game.deliveryTicker) {
+          game.deliveryTicker = new FloatText("+" + pts, deliveryAnchorX, deliveryAnchorY,
+            COLOR.dock, DEBUG.deliveryFloatSize, DEBUG.deliveryFloatRise,
+            DEBUG.deliveryFloatHold + DEBUG.deliveryFloatFade, DEBUG.deliveryFloatFade);
+          game.deliveryTicker.pinned = true;
+          game.deliveryTicker.total = pts;
+          game.floaters.push(game.deliveryTicker);
         } else {
-          // CS020: an incidental. It recycles and it PAYS — a canister is a canister — but it is not part
-          // of the haul, so it earns no combo and touches nothing else: not game.deliveryCount, not the
-          // delivery stats, not the lifetime counters, and therefore none of the deliveryCount-keyed
-          // latches downstream (the 8/12/16/20 reward tiers, Heavy Hauler, Maxed Out, the Super Mega
-          // Delivery). Fixing it AT THE COUNTER is what keeps those correct without a second guard.
-          // AudioSys.deliver(1) deliberately, not the combo pitch: audible, but flat.
-          // CS026 P4 (spec §3.5/FORK-CS026-G): QUIETED, not folded in — same text, but COLOR.dim + size
-          // 12 so it never reads as, or shares a tally with, the towed branch's floater. Same rise/life
-          // knobs so a Magnet-parked run of incidentals separates too, not just towed hauls.
-          // CS026 P6 (gate Q5) / CS029 P4 (§6.1): born at the dock anchor, like the towed branch — ONE
-          // shared origin for both, so a Magnet-fed run of incidentals reads in the same place as a real
-          // haul. §6.3: this branch stays an ORDINARY floater and must never be folded into the model-C
-          // ticker — CS020 separated the two on purpose so an incidental never shares a tally with a
-          // towed canister. The quieting is untouched: it was never the position that distinguished
-          // them, it is the colour and size.
-          addScore(DOCK_BASE_SCORE);
-          game.floaters.push(new FloatText("+" + DOCK_BASE_SCORE, deliveryAnchorX, deliveryAnchorY,
-            COLOR.dim, 12, DEBUG.deliveryFloatRise, DEBUG.deliveryFloatLife));
-          AudioSys.deliver(1);
+          game.deliveryTicker.total += pts;
+          game.deliveryTicker.text = "+" + game.deliveryTicker.total;
+          // CS034 P8 (spec §3.5): size grows one step per piece, clamped at the ceiling.
+          game.deliveryTicker.size = Math.min(DEBUG.deliveryFloatSizeMax,
+            DEBUG.deliveryFloatSize + DEBUG.deliveryFloatSizeStep * (game.deliveryCount - 1));
+        }
+        AudioSys.deliver(game.deliveryCount);
+        // CS010 P9 (FORK-5 = b): Dan sizes up the haul on the pop that EMPTIES the chain — the offload
+        // block only runs while chain.length > 0, so the emptying pop happens exactly once (THE GATE IS
+        // THE LATCH, no flag needed) and deliveryCount is intact at this instant. 1–4 pieces says nothing.
+        // breakChain()/scatterChain() also zero deliveryCount but never reach here, so they stay silent.
+        if (game.chain.length === 0) {
+          VoiceSys.dockDelivery(game.deliveryCount);
+          releaseDeliveryTicker(); // §6.3: released as an ordinary floater at the last canister
         }
         game.offloadTimer = DOCK_OFFLOAD_INTERVAL;
       }
@@ -10012,7 +10569,12 @@ function update(dt) {
       }
     } else {
       // hostile bullet vs player
-      if (!game.ship.dead && game.ship.invuln <= 0) {
+      // CS035 P3 (spec §3.6, site 1): + the level-end protection window. It reads ALONGSIDE ship.invuln,
+      // never instead of it — hit-stun and level-end protection are separate states (see game.levelEndSafe).
+      // ⛔ shieldDeflect / shieldBounce and the shield's own SHIELD_HIT_COST are untouched by this phase:
+      // a player holding shield through the window sees no change, because this outer gate simply never
+      // reaches them. Same for game.stats.dmgThisWave and the Perfect Wave latch.
+      if (!game.ship.dead && game.ship.invuln <= 0 && !game.levelEndSafe) {
         const r = game.ship.shieldOn ? SHIELD_RADIUS : SHIP_RADIUS;
         if (dist2(b, game.ship) < r * r) {
           b.dead = true;
@@ -10024,10 +10586,29 @@ function update(dt) {
         }
       }
       // hostile bullet vs tow chain
-      if (!b.dead && game.chain.length) {
+      // CS035 P3 (spec §3.6, site 4; FORK-K → yes): the tow chain is inside the window too, or "safe" is a
+      // lie — the player keeps full control through the hold and the grace, and a load lost to a saucer
+      // shot during protection would read as exactly the bug this window exists to remove.
+      // ⛔ GUARDED, NOT ABSORBED. This must not reach breakChain() AT ALL while the window is open:
+      // breakChain() is the chain-guard choke point, so routing there would spend a guard charge and speak
+      // the chain_guard line for protection the player did not earn. The bullet is left alive and un-dead
+      // too, so it simply flies on through.
+      if (!b.dead && game.chain.length && !game.levelEndSafe) {
         for (let i = 0; i < game.chain.length; i++) {
           if (dist2(b, game.chain[i]) < 9 * 9) {
             b.dead = true; breakChain(i, b); break;   // CS019 P1: src passed for symmetry; a dead bullet never re-presents
+          }
+        }
+      }
+      // hostile bullet vs a volatile large Hunter (CS035 P5, spec §4.4 site 2 / §0.3)
+      // New wiring — this branch previously never tested game.hunters at all. A SIBLING of the tow-chain
+      // block above, not an extension of it: deliberately NOT gated on !game.levelEndSafe, so a UFO shot
+      // still pops a volatile large during the level-end window. Non-volatile larges, mediums and smalls
+      // are untouched — h.volatile() is size===3 && aged past DEBUG.hunterVolatileAge (see HunterSatellite).
+      if (!b.dead) {
+        for (const h of game.hunters) {
+          if (!h.dead && h.volatile() && dist2(b, h) < (h.radius + 3) * (h.radius + 3)) {
+            b.dead = true; destroyHunter(h, false); break;
           }
         }
       }
@@ -10035,7 +10616,14 @@ function update(dt) {
   }
 
   // --- Collisions: hazards vs ship ---
-  if (!game.ship.dead && game.ship.invuln <= 0) {
+  // CS035 P3 (spec §3.6, sites 2 AND 3): + the level-end protection window. The spec's table lists the
+  // Hunter knockback / i-frame block separately from "hazards vs ship"; in the shipped build they are ONE
+  // `if` — the Hunter arm (damageShip + the CS023 P3 mutual kill) lives inside this block, and the comment
+  // at that arm already names this gate as its rate limiter. One guard covers both rows.
+  // ⛔ Closing this gate closes the saucer-body arm below it too, which is intended: everything that can
+  // damage the hull is off for the window. The shielded arms (shieldDeflect, the deflect counters,
+  // SHIELD_HIT_COST) are untouched — unreachable for the window's duration, not modified.
+  if (!game.ship.dead && game.ship.invuln <= 0 && !game.levelEndSafe) {
     const hazards = [...game.debris, ...game.hunters];
     for (const h of hazards) {
       if (h.dead) continue;
@@ -10099,7 +10687,12 @@ function update(dt) {
 
   // --- Hazards vs tow chain: a hit destroys that canister and cuts loose
   //     everything behind it (falls back to free garbage) ---
-  if (game.chain.length) {
+  // CS035 P3 (spec §3.6, site 5; FORK-K → yes): the chain's other hostile source, guarded on the whole
+  // scan for the same reason as the bullet block above — ⛔ GUARDED, NOT ABSORBED. Not one frame of this
+  // may reach breakChain() while the window is open, or the level-end protection would quietly spend the
+  // player's chain-guard charges and speak chain_guard at them. The h.guardT stamps set by earlier real
+  // absorptions are left exactly as they are; they simply age out unread.
+  if (game.chain.length && !game.levelEndSafe) {
     const chainHazards = [...game.debris, ...game.hunters];
     chainScan:
     for (let i = 0; i < game.chain.length; i++) {
@@ -10158,6 +10751,26 @@ function update(dt) {
     }
   }
 
+  // --- Collisions: Hunter vs Hunter (CS035 P5, spec §4.4 site 1 / §0.4) ---
+  // New wiring — game.hunters is a separate array from game.debris and previously appeared in no
+  // collision pass, elastic or damaging. Same pair-walk idiom and same position in the collision order
+  // as the debris-vs-debris pass directly above: `dead` checked explicitly on both sides, runs before the
+  // end-of-frame dead-filter. BOTH bodies must be volatile larges (h.volatile(): size===3, aged past
+  // DEBUG.hunterVolatileAge) for either to die; a volatile large touching a medium/small does nothing to
+  // either — no bounce, no damage, unlike debrisBounce's elastic exchange. Both die via
+  // destroyHunter(h, false): mutual detonation is not the player's kill, so no score or achievement
+  // counters move (the split still runs 3-way — destroyHunter() is not levered).
+  for (let i = 0; i < game.hunters.length; i++) {
+    const a = game.hunters[i];
+    if (a.dead || !a.volatile()) continue;
+    for (let j = i + 1; j < game.hunters.length; j++) {
+      const b = game.hunters[j];
+      if (b.dead || !b.volatile()) continue;
+      const r = a.radius + b.radius;
+      if (dist2(a, b) < r * r) { destroyHunter(a, false); destroyHunter(b, false); break; }
+    }
+  }
+
   // --- Collisions: UFO vs debris (CS023 P3, spec §1.1/§4.6) ---
   // A saucer that flies into a satellite destroys the saucer, no score (C13/FORK-CS023-E) — and the
   // satellite bounces off it, disarmed, if it was free; a rail-borne satellite is untouched, exactly the
@@ -10172,6 +10785,16 @@ function update(dt) {
       if (a.dead) continue;
       const r = s.radius + a.radius;
       if (dist2(s, a) < r * r) { destroySaucer(s, false); debrisBounce(a, s); break; }
+    }
+    if (s.dead) continue;
+    // CS035 P5 (spec §4.4 site 3): a Hunter arm alongside the debris arm above, volatile larges only.
+    // Unlike the debris arm, BOTH bodies die here — no debrisBounce, the saucer isn't left standing.
+    // Same "no score for either" shape as the saucer-vs-satellite case: destroySaucer(s, false),
+    // destroyHunter(h, false). Mediums/smalls and non-volatile larges pass through a saucer untouched.
+    for (const h of game.hunters) {
+      if (h.dead || !h.volatile()) continue;
+      const r = s.radius + h.radius;
+      if (dist2(s, h) < r * r) { destroySaucer(s, false); destroyHunter(h, false); break; }
     }
   }
 
@@ -10206,48 +10829,51 @@ function update(dt) {
   // --- Wave clear --- CS015 P3: clears on debris-empty alone; Hunters and loose garbage
   // carry over by design (not wiped by nextWave()) and can accumulate if neglected.
   if (game.debris.length === 0) {
-    game.waveClearTimer += dt;
-    if (game.waveClearTimer > 2.5) {
-      game.waveClearTimer = 0;
+    // CS035 P3 (spec §3.4) — THE LEVEL-END PROTECTION WINDOW OPENS HERE, on the frame the last Garbage
+    // Satellite dies, not when the hold expires: the wave-clear condition reads game.debris ONLY, so
+    // Hunters and saucers are still live and still hunting throughout everything below (§0.5).
+    //   The `=== 0` test is the "passes through exactly once" latch idiom the dock block already uses in
+    // four places — the else branch below zeroes waveClearTimer on every frame Debris exists, so this
+    // re-arms on every clear and fires once per clear. levelEndPulseT restarts with it so the pulse
+    // always opens at full brightness rather than wherever the previous window left it.
+    //   CS036 P2 (spec §1.1 steps 1-2, FORK-CS036-A/E) — THE CEREMONY ARMS ON THAT SAME LATCH, and the
+    // whole of what used to sit below it (a levelEndHold-long wait, then the panel-or-nextWave() fork) is
+    // gone: the fork moved to dismissLevelDone(), which the player reaches by pressing confirm. From the
+    // NEXT frame on, updateLevelEndFreeze() replaces the whole of this function until they do.
+    //   ⛔ THE ARM IS AT THE END OF A NORMAL FRAME, NOT INSTEAD OF ONE. This frame keeps running to its
+    // own end (Achievements.evaluate(), the heartbeat, the voice drain all still fire below), exactly as
+    // it did before; the freeze starts one frame later. That is what makes the clear's own unlocks bank
+    // before anything freezes.
+    //   ⛔ resetMenuNav(), exactly as the celebration panel's open does and for the reason its own comment
+    // gives: the player is mid-flight and may well be holding the stick when the field stops. Nothing the
+    // announcement itself reads is directional (its two input branches take confirm/back only) and the
+    // panel re-arms the latch at its own open, so this is belt-and-braces — deliberately, because the
+    // alternative is a phantom first move landing in whichever screen takes input next.
+    if (game.waveClearTimer === 0) {
+      game.levelEndSafe = true; game.levelEndPulseT = 0;
+      game.levelEndFreeze = true;
+      game.levelDone = { text: "Level " + game.wave + " Complete", age: 0 };
+      resetMenuNav();
       // Achievements (F9): a wave completed with zero damage taken -> Perfect Wave (lifetime, 10×)
       // and, if it was wave 3, No Scratches (weekly). game.wave is still the completed wave here
       // (nextWave increments it), so read it before advancing.
+      //   ⛔ CS036 P2 MOVED THIS BLOCK HERE (spec §1.5 trap 3) from the retired levelEndHold crossing, a
+      // few seconds later in the same window. It is behaviourally identical and that is provable rather
+      // than hopeful: levelEndSafe is set on the line above, so damageShip() cannot touch the ship
+      // between the two points and game.stats.dmgThisWave cannot change; game.wave is still the
+      // COMPLETED wave at both, since nextWave() is deferred past both. It is a real move all the same,
+      // and it is said out loud here so a future reader does not read it as always having lived at the
+      // latch. It fires ONCE PER CLEAR because the latch does — see the `=== 0` idiom above.
       if (game.stats.dmgThisWave === 0) {
         Achievements.lifetime.perfectWaves++;
         if (game.wave === 3) game.stats.noScratchWave3 = true;
         // Flawless Run (weekly, P8 / FLAG A-6-b): a damage-free clear of wave 8 or later — a real feat
         // once the Hunter family + saucers + Debris density are all mid-ramp. game.wave is still the
-        // completed wave here (nextWave increments it below).
+        // completed wave here (nextWave increments it, later, from dismissLevelDone()).
         if (game.wave >= 8) game.stats.flawlessLateWave = true;
       }
-      // CS030 P5 (§4.4, FORK-CS030-A = both): the celebration panel at LEVEL END. Everything banked
-      // since the last flush is shown BEFORE the next wave starts, so nextWave() — and with it
-      // game.levelBanner AND VoiceSys.sayLevel(), which both fire from inside it — is DEFERRED to
-      // dismissCelebration(). "Level 8" announces after the celebration, never underneath it.
-      // ⛔ THE `return` IS THE DEFERRAL. Do not "tidy" it into an if/else that still falls through.
-      // It also drops this frame's remaining passes (Achievements.evaluate(), the heartbeat, the
-      // voice drain) — deliberate, and they resume on the first unfrozen frame after dismissal: an
-      // unlock raised by THIS clear would otherwise toast on top of the panel (drawToasts() draws
-      // last) and still not appear IN it, since evaluate() runs after this flush either way (§0.4).
-      // ⛔ `game.state === "playing"` IS NOT REDUNDANT. killShip() flips the state to "dying" MID-FRAME
-      // and update() runs on to here regardless, so the player dying on the exact frame the timer
-      // crosses could otherwise open a level-end panel over the death spectacle — and its dismissal
-      // would then fire nextWave() at GAME OVER. On that frame this falls through to the plain
-      // nextWave() below, exactly as the pre-CS030 build does.
-      // waveClearTimer was zeroed at the top of this branch and update() freezes on game.celebration
-      // from the very next frame, so the branch cannot be re-entered to fire a second panel on one
-      // clear. resetMenuNav()/AudioSys.achievement() mirror the game-over seam's open (in
-      // updateDeath()) exactly — the nav latch matters MORE here, where the player is mid-flight and
-      // may well be holding the stick when the panel arrives.
-      if (game.state === "playing" && game.pendingAch.length) {
-        game.celebration = { items: game.pendingAch, scroll: 0, resume: "wave" };
-        game.pendingAch = [];
-        resetMenuNav();
-        AudioSys.achievement();
-        return;
-      }
-      nextWave();
     }
+    game.waveClearTimer += dt;
   } else {
     game.waveClearTimer = 0;
   }
@@ -10324,6 +10950,95 @@ function drawLevelBanner() {
     drawText(game.levelBanner.text, VIEW_W/2, VIEW_H/2 + DEBUG.levelBannerY, DEBUG.levelBannerSize, COLOR.text, "center");
     ctx.globalAlpha = 1;
   }
+}
+
+// ---------- CS036 P2: the level-end COMPLETION ANNOUNCEMENT (spec §1.3/§1.4) ----------
+// "Level N Complete", held on a frozen field until the player presses on. The three functions below are
+// the whole of it — one predicate, one verb, one renderer — and they sit together for the reason
+// celebrationScroll()/dismissCelebration()/drawCelebration() do: two input handlers and one draw() call
+// site read them, so none of the three may grow a private copy of any part.
+//
+// ⛔ ONE PREDICATE, THREE READERS. drawLevelDone() and BOTH input branches ask this and nothing else, so
+// "is the announcement up?" cannot be answered differently by the renderer and the keyboard. The three
+// terms are drawCaption()'s and drawLevelBanner()'s, exactly — this is in-play chrome, never over a
+// menu, a gameover or the title.
+//   ⛔ THE `game.state === "playing"` TERM IS LOAD-BEARING, not copied furniture. killShip() flips the
+// state to "dying" MID-FRAME and update() runs on to the wave-clear branch regardless, so a player who
+// dies on the very frame the last Garbage Satellite dies arms this announcement while already dying. The
+// freeze itself already refuses to run in that state (see update()'s branch), and this is what stops the
+// orphaned announcement from ALSO drawing over the death spectacle or eating the gameover screen's
+// confirm — which, without the term, would call nextWave() at game over. The orphan is cleared by
+// resetRun() at the next run, exactly as game.levelEndSafe's own arm on that frame is.
+//   No `!game.celebration` term, deliberately: the two can never both be live, because the only thing
+// that opens the panel is dismissLevelDone(), which nulls this first.
+function levelDoneActive() {
+  return game.state === "playing" && !game.paused && !!game.levelDone;
+}
+
+// The announcement's ONE verb, and the dismissCelebration() analogue: BOTH input handlers call THIS, so
+// the fork below cannot drift between them (the CS030 P4 both-handlers rule, made structural).
+//
+// ⛔ THE FORK IS NOT NEW CODE. It is CS030 P5's wave-clear fork (§4.4, FORK-CS030-A = both), moved here
+// whole by CS036 P2 together with its reasoning, because the levelEndHold crossing that used to run it
+// is retired: the player's confirm is what reaches it now. Everything it says still holds at this site
+// bar one clause, which the move made obsolete rather than false — the old site's `return` also DROPPED
+// the rest of that update() frame (Achievements.evaluate(), the heartbeat, the voice drain), which was
+// half of why an unlock raised by this clear could not toast on top of the panel. This is not inside
+// update() at all, and the frozen frames that precede it already run neither of the first two (see
+// updateLevelEndFreeze()), so that outcome is now structural rather than incidental:
+//   ⛔ THE `return` IS THE DEFERRAL. Do not "tidy" it into an if/else that still falls through.
+// nextWave() — and with it game.levelBanner AND VoiceSys.sayLevel(), which both fire from inside it —
+// waits for dismissCelebration(). "Level 8" announces after the celebration, never underneath it.
+//   ⛔ `game.state === "playing"` came with the block and stays. At THIS site levelDoneActive() has
+// already established it (both handlers gate on it), so it is belt-and-braces rather than the sole
+// guard it was in update() — kept because the fork moved verbatim, and because it is the one line
+// standing between a stray future caller and a nextWave() at game over.
+//   The re-entry that the old site's "waveClearTimer was zeroed / update() freezes on game.celebration"
+// note ruled out is ruled out differently here, and just as completely: game.levelDone is nulled on the
+// first line, so the second confirm of a double-tap finds levelDoneActive() false and never arrives.
+//   ⛔ IT DOES NOT LIFT THE FREEZE, AND THE ABSENCE IS THE FEATURE (CS036 P3, FORK-CS036-B). P2 cleared
+// game.levelEndFreeze on the line under this one as its own answer, said so, and P3 deleted it: the
+// freeze runs on through the panel and through nextWave() below, and lifts in updateLevelEndFreeze()
+// when the "Level N+1" label starts fading out. Re-adding a clear here would end the ceremony a step
+// early and put the field back in motion under a banner nobody has read yet — which is the whole of
+// what step 4 was asking for. What this function still ends is the ANNOUNCEMENT (line one), and that is
+// all it ever needed to end.
+function dismissLevelDone() {
+  game.levelDone = null;
+  if (game.state === "playing" && game.pendingAch.length) {
+    game.celebration = { items: game.pendingAch, scroll: 0, resume: "wave" };
+    game.pendingAch = [];
+    resetMenuNav();
+    AudioSys.achievement();
+    return;
+  }
+  nextWave();
+}
+
+// The announcement itself (spec §1.3): the shipped "Level N" banner's style, exactly — same size knob,
+// same y knob, same COLOR.text, same centred drawText, same ctx.globalAlpha fade mechanism. It is NOT a
+// panel and NOT a card, and it adds no new visual vocabulary; the prompt line under it is drawMenuHint(),
+// the shared footer look every menu already uses.
+// ⛔ A SIBLING of drawHUD() in draw(), not inside it, and NOT gated by Capture's H toggle — the rule
+// drawLevelBanner()'s own header states, for the same reason: a transient announcement is the same
+// category as the achievement toast and the game-over text.
+// ⛔ FADE IN ONLY (spec §1.3). It ramps over DEBUG.levelBannerFade — the banner's own knob, so the two
+// announcements ramp alike — and then holds at full for as long as the player leaves it there. There is
+// no fade-out because there is nothing to fade out into: the celebration panel or the "Level N+1" banner
+// replaces it on the confirming frame.
+//   The `fade > 0` test is not a style choice. levelBannerFade's slider goes down to 0, and age/0 is
+// Infinity — or NaN on the arm frame, where age is 0 too, and a NaN globalAlpha is silently ignored by
+// the canvas, which would leave the announcement drawing at whatever alpha the previous pass left set.
+// Written as a positive test for the same reason achLeader()'s guards are (CLAUDE.md, Rendering).
+function drawLevelDone() {
+  if (!levelDoneActive()) return;
+  const fade = DEBUG.levelBannerFade;
+  const a = fade > 0 ? Math.min(1, game.levelDone.age / fade) : 1;
+  const y = VIEW_H/2 + DEBUG.levelBannerY;
+  ctx.globalAlpha = a;
+  drawText(game.levelDone.text, VIEW_W/2, y, DEBUG.levelBannerSize, COLOR.text, "center");
+  drawMenuHint(LEVEL_DONE_HINT, VIEW_W/2, y + LEVEL_DONE_HINT_DY);
+  ctx.globalAlpha = 1;
 }
 
 // ---------- Pause menu / Options / Controls rendering (F8) ----------
@@ -11324,11 +12039,18 @@ function drawCelebrationRow(item, x, ry) {
 function drawCelebration() {
   const c = game.celebration;
   if (!c) return;
-  // CS034 P5 (§4): the level-end open (resume === "wave") gets its own header — derived from
-  // `resume`, never `game.state` (see dismissCelebration()'s header for why). game.wave is still
-  // the just-completed wave here (nextWave() is deferred to dismissal), so it needs no new field.
+  // CS034 P5 (§4): the level-end open (resume === "wave") reads differently from the game-over one —
+  // derived from `resume`, never `game.state` (see dismissCelebration()'s header for why). game.wave is
+  // still the just-completed wave here (nextWave() is deferred to dismissal), so it needs no new field.
+  //   ⛔ CS036 P3 (spec §1.2, FORK-CS036-F -> F2) — THE HEADER NO LONGER FORKS. CS034 P5 made the wave
+  // branch title itself "LEVEL N COMPLETE"; CS036 P2 put a full-screen "Level N Complete" announcement
+  // two seconds ahead of this panel, so the header was saying it a second time to a player who had just
+  // pressed a button to dismiss the first one. Both branches read "ACHIEVEMENTS UNLOCKED" again — the
+  // string the game-over branch always used — and this panel is back to being about the unlocks. ⛔ The
+  // `isWave` binding STAYS: the SUBTITLE below still forks on it, and that is the fork worth keeping,
+  // since "During level N you earned:" is the line that says which level these came from.
   const isWave = c.resume === "wave";
-  const { x } = menuPanel(CELEB_PANEL_W, CELEB_PANEL_H, isWave ? "LEVEL " + game.wave + " COMPLETE" : "ACHIEVEMENTS UNLOCKED");
+  const { x } = menuPanel(CELEB_PANEL_W, CELEB_PANEL_H, "ACHIEVEMENTS UNLOCKED");
   const n = c.items.length;
   const sub = isWave ? "During level " + game.wave + " you earned:"
                       : (n === 1 ? "1 NEW UNLOCK" : n + " NEW UNLOCKS");
@@ -11548,6 +12270,7 @@ function draw() {
   if (Capture.hudVisible) drawHUD();
   drawCaption(); // CS011 P2: sibling of drawHUD (NOT inside it) — captions show regardless of the H toggle
   drawLevelBanner(); // CS025 P5: likewise a sibling — the transient "Level N", drawn over the HUD, self-gated
+  drawLevelDone(); // CS036 P2: a third sibling — "Level N Complete" over the frozen field, self-gated
 
   if (game.state === "gameover") {
     drawText("GAME OVER", VIEW_W/2, VIEW_H/2 - 20, 56);
