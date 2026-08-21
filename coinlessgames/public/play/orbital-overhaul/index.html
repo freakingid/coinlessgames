@@ -400,18 +400,21 @@ const LOWHP_PARAM_RAMP       = 0.15;  // s — click-free per-frame param ramp (
 // this; cargo-gold and the powerup low-timer keep the flat HUD_PULSE_HZ (a distinct rate is how the ear
 // and eye tell a hull alarm apart from a timer running out).
 function lowhpPulseRate(t) { return LOWHP_PULSE_RATE_MIN + (LOWHP_PULSE_RATE_MAX - LOWHP_PULSE_RATE_MIN) * t; }
-// CS010 P3 §5 — the low-health CORNER GLOW + RELIEF POP knobs. The glow is a NAMED GDD §3.2
+// CS010 P3 §5 — the low-health EDGE-VIGNETTE GLOW + RELIEF POP knobs. The glow is a NAMED GDD §3.2
 // fills-exception (FORK-3 = FILL, Paul signed off; see drawHUD's block comment for the why): a
 // peripheral-vision alarm is low-frequency, large-area and EDGELESS by definition — that is what makes
 // it readable out of the corner of the eye without competing with the two red rings for focus, and it
 // costs no shadowBlur. Intensity scales with BOTH the HP-urgency t (brighter near death) and the shared
-// pulse (game.lowHpPhase), so near death it is BRIGHTER, not merely FASTER. All PLAYTEST KNOBS — sized by
-// eye in a browser (STATUS.md carries the ask: which values, and does the synced ring/glow/siren read as
-// one alarm).
-const LOWHP_GLOW_ALPHA_MIN = 0.10;  // peak corner-glow alpha at the threshold (t=0) — a soft breath
-const LOWHP_GLOW_ALPHA_MAX = 0.26;  // peak corner-glow alpha near death (t=1) — brighter, not just faster
-const LOWHP_GLOW_RADIUS     = 280;  // px reach of each corner's radial gradient (FRAME the screen, don't fill it — two corners are occupied by the HULL/CARGO rings)
-const LOWHP_GLOW_RGB        = "255,64,64";  // corner-glow color channels — mirrors COLOR.lowhp (#ff4040); kept as a triple so a radial-gradient stop can carry the pulsing alpha
+// pulse (game.lowHpPhase), so near death it is BRIGHTER, not merely FASTER.
+// CS038 P6 (GATE A, tools/lowhp-glow-lab.html): the shipped FOUR-CORNER shape left the middle of every
+// edge unlit — 720px across the top alone — which is why the alarm read as unfindable regardless of
+// alpha. GATE A A1 moved the shape to a FULL EDGE VIGNETTE (a linear gradient inward from each of the
+// four edges); ported verbatim from the lab, values ported verbatim from its dump. Worst-probe
+// glow:background contrast measured 1.19x today's at the chosen alpha (A2); the RGB mirror stands (A5).
+const LOWHP_GLOW_ALPHA_MIN = 0.20;  // peak vignette alpha at the threshold (t=0) — CS038 GATE A A2
+const LOWHP_GLOW_ALPHA_MAX = 0.40;  // peak vignette alpha near death (t=1) — CS038 GATE A A2
+const LOWHP_GLOW_RADIUS     = 280;  // vignette depth in px, inward from each edge (CS038 GATE A A3 — this constant kept its name across the shape change, per the lab's own dump)
+const LOWHP_GLOW_RGB        = "255,64,64";  // edge-vignette color channels — mirrors COLOR.lowhp (#ff4040), CS038 GATE A A5 kept the mirror; kept as a triple so a gradient stop can carry the pulsing alpha
 const LOWHP_RELIEF_FLASH    = 0.5;  // sec — the geometry-only hull-ring "exhale" when low-health CLEARS with the ship alive (§5 relief cue, FLAG-CS010-a). HUD_CAP_FLASH's neighbourhood.
 const REPAIR_MILESTONE = 10000; // score interval that grants a hull-repair bonus (was: extra life)
 const REPAIR_AMOUNT = 25;       // +HP granted at each milestone (capped at max)
@@ -463,7 +466,9 @@ const SCORES_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 // CS035 P7: "1.0.0.34" -> "1.0.0.35". Still tracking the changeset number.
 // CS036 P7: "1.0.0.35" -> "1.0.0.36". Still tracking the changeset number.
 // CS037 P8: "1.0.0.36" -> "1.0.0.37". Still tracking the changeset number.
-const GAME_VERSION = "1.0.0.37";
+// CS038 P7: "1.0.0.37" -> "1.0.0.38". Still tracking the changeset number.
+// CS039 P4: "1.0.0.38" -> "1.0.0.39". Still tracking the changeset number.
+const GAME_VERSION = "1.0.0.39";
 const VERSION_STAMP_INSET_X = 16; // px in from the right edge of the viewport (title screen only)
 const VERSION_STAMP_INSET_Y = 16; // px in from the bottom edge of the viewport (title screen only)
 
@@ -2422,6 +2427,35 @@ const VOICE_CRITICAL = { health_low: true, health_relief: true, cargo_full: true
 // test-cs025-p4.js §F pins the relationship rather than either literal, so moving one alone fails.
 const VOICE_QUEUE_MAX = 5;
 
+// CS038 P4 — PER-EVENT REPEAT SUPPRESSION. A THIRD question, and so deliberately a THIRD mechanism:
+// priority answers "may this line INTERRUPT?", criticality answers "may this line WAIT?", and this one
+// answers "has this event JUST SPOKEN?". An event inside its window is DROPPED at the TOP of the gate —
+// including a critical one, which does NOT park: parking would replay the identical line seconds later
+// and defeat the entire item. VOICE_PRIORITY and VOICE_CRITICAL are untouched by this; repetition is
+// neither a promotion nor a demotion in either. PLAYTEST KNOBS, plain constants and NOT registry rows
+// (CS038 §4 takes presentation rows off the debug panel; CAPTION_* is the standing precedent).
+//   ⛔ THE WINDOW RUNS ON AudioSys.now() — the same clock busyUntil uses, never game time. VoiceSys.update()'s
+//     header states why the two must not be mixed. A long pause therefore lets a window LAPSE, which is
+//     correct: re-saying "Truck is full" after five minutes is not a repeat.
+//   ⛔ THIS IS ENTRY-GATE SUPPRESSION, NOT A TTL, AND MUST NOT GROW INTO ONE. It expires nothing that is
+//     already queued; VOICE_STILL_TRUE remains the only thing that discards a parked line.
+// Why this mechanism is the load-bearing half of the pair: only five events have alternatives at all
+// (health_low / health_relief / health_full 3, chain_broken 4, chain_guard 3). cargo_full and chain_lost
+// have exactly ONE line each, so say()'s no-repeat picker cannot help the two that annoy most — and
+// CS037 P5 made both of those fire far more often (any HP-dealing hit now releases the WHOLE tow, so
+// chain_lost fires where chain_broken used to, and the forced refill re-fires cargo_full).
+const VOICE_REPEAT_GAP = 12;            // s — the default window: ordinary chatter
+const VOICE_REPEAT_GAP_CRITICAL = 20;   // s — the longer window, for VOICE_CRITICAL events
+// ⛔ `level` IS EXEMPT, and this table exists for it. The window keys on EVENT, but a `level` firing carries
+// DATA — each one names a different number, so consecutive levels are not a repeat, and suppressing
+// "Level 6" because "Level 5" spoke nine seconds ago would break CS025 P5's unmissable-level requirement
+// outright. Nothing else has this property: the dock_* tiers carry data too, but a second dock_10 genuinely
+// IS a repeat of the same line and stays subject to the window.
+const VOICE_REPEAT_EXEMPT = { level: true };
+// One rule, one place. Criticality is REUSED here as the "this one matters, so space it further apart"
+// axis — it is not extended, re-tabled, or merged with anything.
+function voiceRepeatGap(event) { return VOICE_CRITICAL[event] ? VOICE_REPEAT_GAP_CRITICAL : VOICE_REPEAT_GAP; }
+
 // CS025 P4 — re-validation at DRAIN time: each predicate is its own trigger's condition RESTATED, so a
 // queued line speaks only while the thing it describes is still true, and is otherwise discarded
 // SILENTLY rather than spoken late. This is what answers the old drop-not-queue rule's real concern
@@ -2490,6 +2524,31 @@ const LEVEL_BANNER_TIME = 2.2, LEVEL_BANNER_FADE = 0.5, LEVEL_BANNER_SIZE = 72, 
 //          72px line with air to spare, and stays clear up to the size knob's 160 ceiling.
 const LEVEL_DONE_HINT = "ENTER / A  continue", LEVEL_DONE_HINT_DY = 44;
 
+// CS038 P5 (spec §4, FORK-CS038-G) — twelve presentation knobs retired off the debug registry to
+// plain constants, same LOOK-CALL convention as CAPTION_LINGER/LEVEL_BANNER_TIME above: pure look,
+// tuned by eye, no gameplay effect. Each lands at exactly its old registry `def`; the provenance
+// that used to sit on the registry row moves here with it.
+//   CELEB_SCROLL_STEP / CELEB_EMBLEM_SIZE — CS030 P3 (spec §4.5): the celebration panel's own
+//     scroll step (independently tunable from ACH_SCROLL_STEP — the panel's row height differs
+//     from the Achievements viewer's) and drawEmblem()'s radius (sized in tools/emblem-lab.html
+//     at r=32, shipped there).
+const CELEB_SCROLL_STEP = 60, CELEB_EMBLEM_SIZE = 32;
+
+//   DELIVERY_FLOAT_RISE / _SIZE / _SIZE_STEP / _SIZE_MAX / _HOLD / _FADE — the delivery ticker's
+//     rise and its size-growth-per-piece (clamped at the cap), hold and fade. RISE: CS026 P4,
+//     retuned CS026 P6 (gate Q5) and again by a CS035 P1 dock-float-lab session, landing at 150.
+//     SIZE/SIZE_STEP/SIZE_MAX/HOLD/FADE: CS034 P8 (spec §3.5, GATE A) split the old single life
+//     knob into hold+fade at first-guess numbers; a CS035 P1 (§1.1) dock-float-lab session replaced
+//     all five with the numbers below.
+const DELIVERY_FLOAT_RISE = 150, DELIVERY_FLOAT_SIZE = 16, DELIVERY_FLOAT_SIZE_STEP = 1.0, DELIVERY_FLOAT_SIZE_MAX = 48, DELIVERY_FLOAT_HOLD = 0.00, DELIVERY_FLOAT_FADE = 1.20;
+
+//   HUNTER_PULSE_MIN / _MAX / _GROW / _SHRINK — the volatile-Hunter draw-only size heartbeat
+//     (pulseScale), asymmetric by design: fast growth, slow shrink, so it reads as pumping rather
+//     than breathing. Settled CS036 P4 (spec §2): envelope widened 87/125 -> 80/150 and the shape
+//     sharpened to a hard punch-out / slow settle-back — grow 900 %/s (~0.08s sweep), shrink
+//     20 %/s (~3.5s settle). Envelope and shrink both moved once before, at CS035 P7 (gate G15/G16).
+const HUNTER_PULSE_MIN = 80, HUNTER_PULSE_MAX = 150, HUNTER_PULSE_GROW = 900, HUNTER_PULSE_SHRINK = 20;
+
 // VoiceSys — Dan's speech. A SEPARATE module alongside AudioSys/MusicSys (NOT folded into AudioSys, a
 // flat bag of one-shots): it owns a small sequencer + a radio-processing chain that feeds AudioSys.voice
 // (the volume bus). Every entry point no-ops when AudioSys.ctx is null (the headless-safe guard idiom).
@@ -2503,6 +2562,8 @@ const VoiceSys = {
                            // AudioContext's first VOICE_COOLDOWN seconds) isn't swallowed by a phantom gap.
   curPriority: -Infinity,  // priority of the line occupying the channel (for pre-emption)
   queue: [],               // CS025 P4: {event,line,p} waiting criticals — FIFO, VOICE_QUEUE_MAX deep, deduped by event
+  lastLine: {},            // CS038 P4 mech 1: event -> index of the alternative picked LAST TIME for it
+  lastSpoke: {},           // CS038 P4 mech 2: event -> AudioSys-clock time it last PASSED the gate
 
   // Build the noise bed + radio chain once the audio graph exists (first user gesture). Idempotent;
   // no-ops until AudioSys.init() has created AudioSys.voice. Mirrors MusicSys.ensureGraph().
@@ -2599,16 +2660,34 @@ const VoiceSys = {
   // the very end of the PLAYING body: it never runs while paused, during the "dying" spectacle, or on a
   // menu, so a stranded entry cannot speak, and startGame() (which calls reset()) clears it before the
   // next run can drain. Adding teardown to those sites would be dead code pretending to be a guard.
-  reset() { this._stop(); this.busyUntil = -Infinity; this.curPriority = -Infinity; this.queue.length = 0; },
+  // CS038 P4: also clears the two per-event maps. A fresh run picks its first alternative unconstrained and
+  // inherits no repeat window — both are stale by construction (one is the previous run's pick history, the
+  // other an audio-clock stamp from a run that is over).
+  reset() { this._stop(); this.busyUntil = -Infinity; this.curPriority = -Infinity; this.queue.length = 0; this.lastLine = {}; this.lastSpoke = {}; },
 
-  // Speak a random alternative for `event`, subject to §11e cooldown/priority. Returns the chosen line
-  // (or null if dropped/unavailable). Selection is a plain random pick; the gate + caption + scheduling
+  // Speak an alternative for `event`, subject to §11e cooldown/priority. Returns the chosen line
+  // (or null if dropped/unavailable). Selection is CS038 P4's no-immediate-repeat pick; the gate + caption + scheduling
   // all live in _emit, so an event maps to a line here and the channel logic is shared with any future
   // direct caller (e.g. CS011's coming sayLevel()).
   say(event) {
     const lines = VOICE_LINES[event];
     if (!lines || !lines.length) return null;
-    const line = lines[(Math.random() * lines.length) | 0];
+    // CS038 P4 (mechanism 1) — was a plain pick WITH replacement, which said the same alternative twice in
+    // a row often enough to read as a bug. Now: a UNIFORM pick over the alternatives EXCLUDING the previous
+    // one for this event — roll over the remaining n-1, then step past the hole. One branch, no re-roll
+    // loop, no shuffle bag. `prev` is deliberately null at n === 1 (there is nothing to exclude, and rolling
+    // over 0 slots then stepping past index 0 would run off the end): a one-line event is simply unaffected,
+    // which is exactly why the per-event repeat window in _emit exists.
+    // ⛔ RECORDED AT PICK TIME, not on a successful _emit — matching the design already stated below (the
+    // line is picked HERE, at trigger time, and a queued critical carries the alternative rolled when the
+    // event happened). The consequence, stated plainly: an alternative that is picked and then DROPPED by
+    // the gate still rotates. Over 3-4 alternatives that is benign, and threading the index back out
+    // through _emit buys nothing.
+    const prev = lines.length > 1 ? this.lastLine[event] : null;
+    let i = (Math.random() * (lines.length - (prev == null ? 0 : 1))) | 0;
+    if (prev != null && i >= prev) i++;
+    this.lastLine[event] = i;
+    const line = lines[i];
     // CS025 P4: the event is passed through so _emit can consult VOICE_CRITICAL. The line is picked HERE,
     // at TRIGGER time — a queued critical carries the alternative that was rolled when it happened, not
     // one re-rolled at drain time. One less thing to be inconsistent about.
@@ -2624,6 +2703,9 @@ const VoiceSys = {
   // ⛔ The `text` FORMAT is load-bearing in two places outside this function — VOICE_STILL_TRUE.level
   // compares against "Level " + game.wave, and the banner in nextWave() shows the same string. Change the
   // format here and both follow, or the predicate silently discards every queued level call.
+  // CS038 P4: does not go through say(), so the no-repeat picker never applies here (there are no
+  // alternatives to rotate); and `level` is in VOICE_REPEAT_EXEMPT, so the repeat window never applies
+  // either — consecutive announcements name different numbers and are not repeats. See that table.
   sayLevel(n) {
     return this._emit({ text: "Level " + n, phon: levelPhon(n) }, VOICE_PRIORITY.level, "level");
   },
@@ -2646,6 +2728,13 @@ const VoiceSys = {
     if (!AudioSys.ctx) return null;
     this.ensure();
     const now = AudioSys.now();
+    // CS038 P4 (mechanism 2) — an event that spoke within its own window is DROPPED. ⛔ PLACEMENT IS
+    // LOAD-BEARING: this sits at the TOP of the gate, BEFORE the busy/cooldown branches and therefore
+    // BEFORE _enqueue(), so a suppressed critical DROPS rather than PARKING. Parking it would replay the
+    // identical line seconds later, which is the whole thing this mechanism exists to stop. See
+    // VOICE_REPEAT_GAP for the clock, the exemption, and why this is not a TTL.
+    const said = event == null ? null : this.lastSpoke[event];
+    if (said != null && !VOICE_REPEAT_EXEMPT[event] && now - said < voiceRepeatGap(event)) return null;
     const critical = !!(event && VOICE_CRITICAL[event]);   // CS025 P4 — see VOICE_CRITICAL
     if (now < this.busyUntil) {              // a line is on the channel right now
       if (p <= this.curPriority) {
@@ -2664,6 +2753,12 @@ const VoiceSys = {
       // line ends with no 1.2 s tail; VOICE_COOLDOWN stays an anti-chatter rule for everything else.
       if (!critical) return null;
     }
+    // CS038 P4 (mechanism 2) — the line has PASSED the gate; stamp it. Everything below this point runs
+    // unconditionally, so this is the same instant at which curPriority/busyUntil advance, and it stamps in
+    // captions-only mode too (the two outputs share the one gate, and a captioned repeat is as annoying as
+    // a spoken one). It sits ABOVE the utterance rather than beside busyUntil so the post-gate arithmetic
+    // stays byte-identical to what test-cs025-p4.js §K pins; the two placements are equivalent.
+    if (event != null) this.lastSpoke[event] = now;
     const utt = buildUtterance(line.phon, VOICE_PARAMS);
     if (settings.captions) this.showCaption(line.text, utt.dur);
     if (voiceEnabled()) this._schedule(utt);
@@ -3530,7 +3625,15 @@ function rootItems() { return game.state === "gameover" ? MENU_ROOT_OVER : MENU_
 // by grep at all 6 remaining call sites plus the forEach renderer, no hardcoded index anywhere.
 // Options is now purely "change how the game behaves"; the title menu is "start playing, or look at
 // things".
-const MENU_OPTIONS = ["Sound / Music", "Controls", "Difficulty", "Back"];
+// CS038 P1 (spec §1.1, FORK-CS038-A -> c): "Credits" inserted before "Back", 4 rows -> 5. OPTIONS,
+// NOT THE TITLE MENU, and that is measured rather than preferred: titleMenuLayout() derives its step
+// from a fixed 132px band, which already gives today's 7 title rows a 22.0px step against 24px text
+// (FLAG-CS038-a, pre-existing and NOT fixed here); an 8th would take it to 18.9. This screen's
+// 600x420 panel steps 42px from y+118, so the 5th row's baseline lands at y+286 — 114px clear of the
+// y+400 footer, and the panel needs no resize. Still ONE parent per screen (CS016 P2's IA): Credits'
+// one parent is Options. Safe positionally-blind for the same reason CS016 P2's shrink was — every
+// consumer resolves rows by LABEL via MENU_OPTIONS.indexOf(), re-verified by grep at this insert.
+const MENU_OPTIONS = ["Sound / Music", "Controls", "Difficulty", "Credits", "Back"];
 // CS010 P4 (§9): the Sound/Music sub-screen's rows, same template as DIFFICULTY_ROWS. CS010 P9 (§11c)
 // added the Voice Volume slider — SOUND_ROWS + VOL_LABELS + VOL_CATS grow together so the parallel
 // label→category lookup stays paired. CS011 P3 added "Voice" (style picker) + "Captions" (toggle),
@@ -3539,6 +3642,62 @@ const SOUND_ROWS   = ["SFX Volume", "Music Volume", "Master Volume", "Voice Volu
 const VOL_CATS     = ["sfx", "music", "master", "voice"]; // parallel to VOL_LABELS (NOT to any MENU_OPTIONS/SOUND_ROWS position)
 const VOL_LABELS   = ["SFX Volume", "Music Volume", "Master Volume", "Voice Volume"]; // the slider rows, by label
 const VOL_STEP     = 0.1;                         // per left/right nudge on a volume slider
+
+// ---------- CS038 P1: the Credits screen's content (spec §1.3) ----------
+// ONE DATA TABLE drives the whole screen — the same "tracks/lines are DATA" idiom MUSIC_TRACKS and
+// VOICE_LINES follow — so adding a credit later is a table edit and touches nothing else. Four kinds:
+//   head — a section heading, NOT selectable        text — a plain line, NOT selectable
+//   link — a label + a url, THE ONLY selectable     gap  — vertical air, NOT selectable
+// The version line READS GAME_VERSION rather than repeating it, so a screenshot in a bug report can
+// never name a build this file isn't.
+//
+// ⛔ THE SATELLITE BLOCK IS AN INSPIRATION LIST, NOT AN ATTRIBUTION LIST, and "No assets were used."
+// is the load-bearing line in it. SAT_ART's own header, archive/PLANNED-FEATURES-v3.3.md FLAG A-7 and
+// archive/PLANNED-FEATURES-CS028.md all record the same fact: the twelve silhouettes are ORIGINAL line
+// drawings authored in code from published geometry, under an explicit prohibition on importing or
+// tracing NASA / Wikimedia / CC art, because a CC BY-SA source would infect this GPL-3.0 single file.
+// Rewording any of it into something that reads as crediting a source would assert the opposite of
+// what is true and would put the licence in question. The twelve names are SAT_ART's own, in its
+// shipped order (Hubble and James Webb shortened to fit the line; nothing reordered, nothing added).
+const CREDITS_ROWS = [
+  { kind: "head", text: "ORBITAL OVERHAUL" },
+  { kind: "text", text: "Coinless Games" },
+  { kind: "text", text: "Version " + GAME_VERSION },
+  { kind: "gap" },
+  { kind: "head", text: "MADE BY" },
+  { kind: "text", text: "Paul Kaiser" },
+  { kind: "gap" },
+  { kind: "head", text: "FIND IT AT" },
+  { kind: "link", text: "Coinless Games",   url: "https://coinlessgames.com" },
+  { kind: "link", text: "itch.io",          url: "https://coinlessgames.itch.io/orbital-overhaul" },
+  { kind: "link", text: "Source on GitHub", url: "https://github.com/freakingid/ADD-Orbital-Overhaul" },
+  { kind: "gap" },
+  { kind: "head", text: "INSPIRED BY" },
+  { kind: "link", text: "Asteroids Deluxe (Atari, 1980)", url: "https://en.wikipedia.org/wiki/Asteroids_Deluxe" },
+  { kind: "gap" },
+  { kind: "head", text: "BUILT WITH" },
+  { kind: "link", text: "Claude Code",  url: "https://www.anthropic.com/claude-code" },
+  { kind: "link", text: "MDN Web Docs", url: "https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API" },
+  { kind: "gap" },
+  { kind: "head", text: "EVERYTHING YOU HEAR IS SYNTHESISED" },
+  { kind: "text", text: "Music, sound effects and Dan's voice are all generated" },
+  { kind: "text", text: "at runtime with the Web Audio API. No recordings, no samples." },
+  { kind: "gap" },
+  { kind: "head", text: "SATELLITE SILHOUETTES" },
+  { kind: "text", text: "Drawn from scratch in code. No assets were used." },
+  { kind: "text", text: "Shapes inspired by:" },
+  { kind: "text", text: "Sputnik 1 \u00b7 Vanguard 1 \u00b7 Explorer 1 \u00b7 Telstar 1" },
+  { kind: "text", text: "Syncom / Early Bird \u00b7 Hubble \u00b7 James Webb" },
+  { kind: "text", text: "Voyager \u00b7 Pioneer 10 \u00b7 Juno \u00b7 Apollo Lunar Module \u00b7 Skylab" },
+  { kind: "gap" },
+  { kind: "head", text: "LICENSE" },
+  { kind: "text", text: "GPL-3.0. Source at the GitHub link above." },
+];
+// The one-line status openExternal() leaves behind. ⛔ WORDED CONDITIONALLY ON PURPOSE — see that
+// function's header: with "noopener" set, window.open() returns null on SUCCESS as well as when a
+// popup is blocked, so a flat "the popup was blocked" would be a lie after every working click.
+const CREDITS_LINK_MSG = "If nothing opened, your browser blocked it \u2014 the address is on screen above.";
+
 const clamp01 = v => Math.max(0, Math.min(1, v));
 
 // Player settings, persisted additively in afd_settings_v1 (the key is FROZEN — see STORAGE_KEY).
@@ -3737,44 +3896,9 @@ const DEBUG_VARS = [
   { header: "DELIVERY" },
   { id: "dockComboGrace", label: "Delivery one-effort window", unit: "ms",
     def: DOCK_COMBO_GRACE * 1000, min: 0, max: 10000, step: 100, toNative: v => v / 1000 },
-  // CS026 P4 (spec §3, archive/PLANNED-FEATURES-CS026.md §3.3a/§3.4): the delivery floaters' own rise/life,
-  // separating what DOCK_OFFLOAD_INTERVAL's 20/sec cadence used to stack into an unreadable smear.
-  // First-guess numbers — the gate is what settles them, which is why they are knobs, not constants.
-  // CS026 P6 (gate Q5): settled. "They need to travel upwards more slowly" -> rise 300 -> 160; "the
-  // score numbers need to fade more slowly" -> life 0.55 -> 1.2. Both stay inside their P4 ranges.
-  // CS029 P4 supersedes the note that used to sit here. The CS026 P6 arithmetic (rise x
-  // DOCK_OFFLOAD_INTERVAL as the only source of separation, DOCK_OFFLOAD_INTERVAL as "the lever, NOT
-  // a bigger rise") assumed model A — a single timing-spaced stream sharing one moving-then-static
-  // origin. CS029's dock-float-lab gate (§4.3/§5) picked model C, the accumulating ticker: one pinned
-  // floater per visit, text rewritten per canister, released as an ordinary floater only at the last
-  // canister. There is no delivery COLUMN under C, so there is nothing for DOCK_OFFLOAD_INTERVAL or a
-  // bigger rise to space apart — the instruction above is obsolete, not wrong for what it described.
-  // rise/life now govern exactly two things: how the released ticker rises and fades after that
-  // release. (It said "and every incidental floater" through CS034; CS035 P2 deleted the incidental
-  // category outright, so the ticker is the only delivery floater there is.)
-  // DOCK_OFFLOAD_INTERVAL stayed at 0.05 (gate G5) because C
-  // dissolves the trade it used to control, not because the trade was re-won.
-  { id: "deliveryFloatRise", label: "Delivery floater rise", unit: "px/s",
-    def: 150, min: 30, max: 600, step: 10 },
-  // CS034 P8 (spec §3.5, GATE A): the old single delivery-floater life knob is retired — its two
-  // readers (the delivery ticker's construction and the incidental floater's push) both move to the
-  // hold/fade pair below. `fade` is what FloatText's new `fade` field reads; `hold` is folded into
-  // `life` at each call site as `hold + fade`, so the floater holds full opacity for `hold` seconds
-  // after release, then fades linearly over `fade`. Size grows per piece: `deliveryFloatSize +
-  // deliveryFloatSizeStep * (deliveryCount - 1)`, clamped at `deliveryFloatSizeMax`.
-  // CS035 P1 (§1.1): `def` on all five rows replaced with a later dock-float-lab session's numbers,
-  // superseding CS034 P8's GATE A values above. `sizeStep` moving off 0.0 turns on per-piece growth
-  // for the first time — CS034 shipped the mechanism with its step at zero. min/max/step unchanged.
-  { id: "deliveryFloatSize", label: "Delivery floater size", unit: "px",
-    def: 16, min: 12, max: 64, step: 1 },
-  { id: "deliveryFloatSizeStep", label: "Delivery floater size/piece", unit: "px",
-    def: 1.0, min: 0, max: 6, step: 0.5 },
-  { id: "deliveryFloatSizeMax", label: "Delivery floater size cap", unit: "px",
-    def: 48, min: 16, max: 96, step: 1 },
-  { id: "deliveryFloatHold", label: "Delivery floater hold", unit: "s",
-    def: 0.00, min: 0, max: 3.0, step: 0.05 },
-  { id: "deliveryFloatFade", label: "Delivery floater fade", unit: "s",
-    def: 1.20, min: 0.1, max: 3.0, step: 0.05 },
+  // CS038 P5: the six delivery-floater knobs that used to live here (rise, size, size/piece, size
+  // cap, hold, fade) are retired to DELIVERY_FLOAT_* constants — pure look, tuned by eye, no
+  // gameplay effect. Full provenance is on the constants themselves.
   // CS035 P2 (§2.3): the dock lockout's push. Inside the dock's neighborhood ring the ship cannot hook
   // Debris at all, and a piece that reaches the capture region is shoved straight back out at this
   // speed instead. The velocity is SET, not added (see the push site in the garbage loop) — a knob that
@@ -3868,14 +3992,9 @@ const DEBUG_VARS = [
   // and is untouched. `hunterVolatileAge` is untouched at 60 — nothing here argues for moving it.
   { id: "hunterVolatileAge", label: "Hunter volatile age", unit: "s",
     def: 60, min: 0, max: 120, step: 1 },
-  { id: "hunterPulseMin", label: "Hunter pulse min", unit: "%",
-    def: 80, min: 50, max: 100, step: 1 },
-  { id: "hunterPulseMax", label: "Hunter pulse max", unit: "%",
-    def: 150, min: 100, max: 200, step: 1 },
-  { id: "hunterPulseGrow", label: "Hunter pulse grow rate", unit: "%/s",
-    def: 900, min: 5, max: 5000, step: 5 },
-  { id: "hunterPulseShrink", label: "Hunter pulse shrink rate", unit: "%/s",
-    def: 20, min: 5, max: 300, step: 1 },
+  // CS038 P5: the four pulse-envelope knobs that used to live here (min/max/grow/shrink) are
+  // retired to HUNTER_PULSE_* constants — pure look, tuned by eye, no gameplay effect. Full
+  // provenance is on the constants themselves.
   // CS024 P5 (spec §2.4/§4.5/§4.6): the UFO chain, the deepest in the odometer (a two-generation carry,
   // FLAG-CS024-d) and the one where §4.6 splits every quantity by saucer size. ufoAppearFreq (INVERTED)
   // is the ONE driver — there is exactly one appearance timer, which size spawns is the flat
@@ -4037,14 +4156,22 @@ const DEBUG_VARS = [
   // non-positive interval, so the guard and the bound agree rather than relying on each other.
   { id: "telemetryInterval", label: "Telemetry snapshot interval", unit: "s",
     def: 15, min: 1, max: 120, step: 1 },
-  // CS030 P3 (spec §4.5): the achievement celebration panel's two knobs. celebrationScrollStep
-  // matches ACH_SCROLL_STEP's default but is independently tunable — the panel's row height
-  // differs from the Achievements viewer's. celebrationEmblemSize is drawEmblem()'s radius.
+  // CS038 P3 (spec §3): telemetry capture is OPT-IN, off by default and off at every launch.
+  // `sessionSwitch: true` is what makes that true — NOT a way for a future gameplay knob to dodge
+  // persistence, it exists for instrumentation only. Three effects, read together at applyDebug/
+  // rebuildDebug/saveSettings/loadSettings: (a) omitted from saveSettings' `debug` sub-object, so the
+  // blob never carries it; (b) skipped in loadSettings' per-entry restore loop, belt and braces, so an
+  // older or hand-edited blob cannot revive it either; (c) exempt from overridesOn() the same way
+  // DEBUG_OVERRIDE_ID itself is — it reads debugShown[id] directly. (c) is the part that is easy to
+  // miss: without it, with the master "Overrides Applied" toggle OFF, this row would resolve to its
+  // `def` (0) while the panel still displayed whatever the player last set — ON, reading ON, capturing
+  // nothing. A silent trap for exactly the person using the panel.
+  { id: "telemetryCapture", label: "Telemetry capture", unit: "",
+    def: 0, min: 0, max: 1, step: 1, boolLabels: ["OFF", "ON"], sessionSwitch: true },
   { header: "CELEBRATION" },
-  { id: "celebrationScrollStep", label: "Celebration scroll step", unit: "px",
-    def: 60, min: 10, max: 200, step: 10 },
-  { id: "celebrationEmblemSize", label: "Celebration emblem size", unit: "px",
-    def: 32, min: 12, max: 64, step: 2 },
+  // CS038 P5: the two knobs that used to live here (scroll step, emblem size) are retired to
+  // CELEB_SCROLL_STEP / CELEB_EMBLEM_SIZE constants — pure look, tuned by eye, no gameplay effect.
+  // Full provenance is on the constants themselves.
   // CS035 P3 (spec §3.2): the LEVEL-END PROTECTION WINDOW's knobs. They live under CELEBRATION
   // because the window exists to wrap the celebration-panel seam — wave clear -> hold -> panel (if any)
   // -> "Level N" banner -> grace -> vulnerable. NOT LEVERS: no floor/ceil/steps triple, no carriesTo, no
@@ -4156,7 +4283,10 @@ function applyDebug(id, shown) {
   // for what the toggle IS (still a plain DEBUG_ENTRIES row, still resettable by `r`/Reset All) — only
   // for what writing it must trigger downstream.
   if (id === DEBUG_OVERRIDE_ID) { rebuildDebug(); return; }
-  DEBUG[id] = debugNative(e, clamped, overridesOn());
+  // CS038 P3: a sessionSwitch row is exempt from overridesOn() — it always reads its own debugShown
+  // value, same as DEBUG_OVERRIDE_ID above. Forcing `on: true` into debugNative still runs any
+  // toNative conversion the entry declares; it just never falls back to e.def with the toggle off.
+  DEBUG[id] = debugNative(e, clamped, e.sessionSwitch ? true : overridesOn());
 }
 // CS024 P6e: the full re-derivation, called ONLY when the toggle flips (applyDebug, above) — every other
 // edit (◄►, typed entry, `r`, Reset All) goes through applyDebug's single-field write, which applies the
@@ -4164,7 +4294,11 @@ function applyDebug(id, shown) {
 function rebuildDebug() {
   const on = overridesOn();
   for (const e of DEBUG_ENTRIES)
-    DEBUG[e.id] = e.id === DEBUG_OVERRIDE_ID ? debugShown[e.id] : debugNative(e, debugShown[e.id], on);
+    // CS038 P3: sessionSwitch rows are exempt from `on` here too, for the identical reason as
+    // applyDebug — a full rebuild (triggered by flipping the master toggle) must not silently zero
+    // instrumentation the panel still shows as ON.
+    DEBUG[e.id] = e.id === DEBUG_OVERRIDE_ID ? debugShown[e.id]
+      : debugNative(e, debugShown[e.id], e.sessionSwitch ? true : on);
 }
 // CS024 P6e: extracted from the module-level seed loop so "reset every row" has exactly one
 // implementation — the seed below and the panel's Reset All action row both call this, so they cannot
@@ -4902,8 +5036,28 @@ const TELEMETRY_FIELDS = [
   "dmgDebris3", "dmgDebris2", "dmgDebris1",
   "dmgHunter3", "dmgHunter2", "dmgHunter1",
   "dmgUfoBodyLarge", "dmgUfoBodySmall", "dmgUfoShotLarge", "dmgUfoShotSmall",
+  "chainLen", "cargoMax",
+  "delivered", "deliveryScore", "cargoDamageEvents", "cargoSevers",
+  "debrisKills", "hunterKills", "saucerKills", "hunterCoalesced",
+  "deflects", "hitsTaken",
+  "scoreRepairBonus", "scoreScoopBonus",
   "debugRun", "resumedRun",
 ];
+// CS039 P2: thirteen columns added above, ahead of the two trailing flags; GATE T added a fourteenth
+// (`cargoSevers`). THREE kinds, not two, and the names do not tell you which:
+//   INSTANTANEOUS — `chainLen`/`cargoMax`, state at the sample instant (like hp/speed), the DiffLog
+//     expressions verbatim.
+//   CUMULATIVE — every other column here, a per-run counter (like the *Picked/dmgFrom* families
+//     above), monotone non-decreasing within a run.
+//   ⛔ NEITHER — `cargoDamageEvents` ALONE. It is a SAWTOOTH and it DECREASES. It is the chain-guard
+//     drop-weight PITY counter, zeroed in dropPowerup() the instant a guard is SELECTED to drop
+//     (CS035 P6 / FORK-T — not on pickup, so it can reset with no matching guardPicked increment).
+//     It counts severs SINCE THE LAST GUARD DROP, never the run. Do not "restore" it to the
+//     cumulative group: it was described as cumulative here, in the P2 spec, in test-cs039-p2's
+//     §F and in TELEMETRY-ANALYSIS-GUIDE.md §3 for the whole of CS039, and the first real capture
+//     (GATE T) showed 7 decreases in 53 rows with the LAST ROW READING 0.
+//     `cargoSevers` is the run total, incremented on the same line the pity counter is, and is the
+//     column an analysis should read. Both are emitted: guardDropWeight() needs the pity value.
 // ⛔ A NEW KEY, additive, owned by CS037 P4. Nothing below reads, writes, renames or version-bumps any
 // of the five existing keys — afd_settings_v1, afd_achievements_v2, afd_scores_v1, afd_profiles_v1,
 // afd_saves_v1 are untouched by this whole section (spec §5.6).
@@ -4928,8 +5082,16 @@ const Telemetry = {
   // cadence cannot drift: dt is clamped to 0.05 s and the knob's min is 1 s, so one subtraction
   // always lands acc back inside [0, iv). Lowering the knob mid-run can leave acc above the NEW
   // interval — it drains at one row per frame, never a burst inside a single frame.
+  // CS038 P3 (spec §3): the ONE gate for opt-in capture, and nowhere else. All of this is intended:
+  //   - No rows accrue while off, so push() never runs, so write() never runs, so afd_telemetry_v1 is
+  //     LEFT UNTOUCHED by an off session — yesterday's capture survives a today spent with it off.
+  //   - read(), telemetryExportRows() and the "Copy telemetry log" action row are NOT gated here or
+  //     anywhere else. The export must keep working while capture is off — that's precisely the state
+  //     you're in the morning after a capture session, and gating it would make the data unreachable.
+  //   - reset() stays wired to resetRun() unchanged.
   tick(dt) {
     if (Bench.running) return;
+    if (!DEBUG.telemetryCapture) return;
     const iv = DEBUG.telemetryInterval;
     if (!(iv > 0)) return;              // 0 / NaN would push a row every frame and eat the ring
     this.acc += dt;
@@ -4955,33 +5117,116 @@ const Telemetry = {
       dmgHunter3: s.dmgFromHunter3, dmgHunter2: s.dmgFromHunter2, dmgHunter1: s.dmgFromHunter1,
       dmgUfoBodyLarge: s.dmgFromUfoBodyLarge, dmgUfoBodySmall: s.dmgFromUfoBodySmall,
       dmgUfoShotLarge: s.dmgFromUfoShotLarge, dmgUfoShotSmall: s.dmgFromUfoShotSmall,
+      chainLen: game.chain.length,        // the DiffLog expression, verbatim
+      cargoMax: game.cargoMax,            // the live runtime cap, NOT payloadSlots(game.wave)
+                                           // recomputed — the two must never be two sources of truth
+      delivered: s.delivered,
+      deliveryScore: s.deliveryScore,
+      cargoDamageEvents: s.cargoDamageEvents,  // ⛔ SAWTOOTH — pity counter, resets on a guard DROP
+      cargoSevers: s.cargoSevers,              // ...the cumulative run total of the same event
+      debrisKills: s.debrisKills,         // Garbage Satellites — the inverted vocabulary, see CLAUDE.md
+      hunterKills: s.hunterKills,
+      saucerKills: s.saucerKills,         // both sizes
+      hunterCoalesced: s.hunterCoalesced,
+      deflects: s.deflects,
+      hitsTaken: s.hitsTaken,
+      scoreRepairBonus: s.scoreRepairBonus,
+      scoreScoopBonus: s.scoreScoopBonus,
       debugRun: game.debugRun, resumedRun: game.resumedRun,
     });
     while (this.rows.length > TELEMETRY_MAX) this.rows.shift();   // drop oldest, keep the cap
     this.write();   // ⛔ every snapshot, so a crash loses at most one interval (spec §5.6)
   },
 
+  // ⛔ THE ENVELOPE IS v:3, AND THE P2 SPEC'S "REUSE v2, ONE SHAPE PER CHANGESET" ⛔ WAS DELIBERATELY
+  // OVERRIDDEN AT GATE T (Paul's call; DECISIONS.md). Do not "restore" v:2 on the strength of that
+  // line — it was written before anyone knew a column would be needed after P3 shipped, and the two
+  // rules it sits between point opposite ways. P2 bumped v1 -> v2 for ONE stated reason: a stale blob
+  // missing the new keys makes telemetryCSV emit the literal string "undefined", and "silently
+  // dropping a stale run beats exporting a corrupt one." A 14th column under a reused v:2 recreates
+  // exactly that, against a v:2 blob that by then existed in the wild (GATE T's own capture). The
+  // reason won over the letter. ⛔ THE KEY NAME STILL DOES NOT CHANGE — it stays afd_telemetry_v1;
+  // the `_v1` in the key and the `v:` in the envelope are different things (P2 §3, still binding).
   read() {
     const ls = storageOK(); if (!ls) return [];
     try {
       const raw = ls.getItem(Profiles.keyFor(TELEMETRY_KEY));
       if (!raw) return [];
       const data = JSON.parse(raw);
-      if (!data || data.v !== 1 || !Array.isArray(data.rows)) return [];
+      if (!data || data.v !== 3 || !Array.isArray(data.rows)) return [];
       return data.rows.slice();
     } catch (e) { return []; }   // corrupt / unreadable — an empty buffer, never a throw
   },
   write() {
     const ls = storageOK(); if (!ls) return;
-    try { ls.setItem(Profiles.keyFor(TELEMETRY_KEY), JSON.stringify({ v: 1, rows: this.rows })); }
+    try { ls.setItem(Profiles.keyFor(TELEMETRY_KEY), JSON.stringify({ v: 3, rows: this.rows })); }
     catch (e) { /* quota / privacy mode / disabled — a background write, silent by design */ }
   },
 };
-// CSV column order matches TELEMETRY_FIELDS exactly; one header line, then one line per row. The two
-// flags go out as `true`/`false` rather than 1/0 — a sheet reads either, and this way the column says
-// what the field actually is.
-function telemetryCSV(rows) {
-  const lines = [TELEMETRY_FIELDS.join(",")];
+// CS039 P3 (spec §1, FORK-D/E/F) — THE LEVER FINGERPRINT. Seven `#` lines above the CSV header, so
+// two logs can be told apart without asking what the debug panel looked like when each was captured.
+//
+// ⛔ THE CARRIER IS `#` COMMENT LINES, AND THAT IS THE WHOLE COMPATIBILITY STORY (FORK-D). pandas
+// (`comment="#"`), R (`read.csv(comment.char="#")`) and most sheet importers skip them with ONE
+// argument, so the export stays a CSV nobody has to pre-process first. Refused options, on the record
+// so they are not re-proposed: extra COLUMNS (one constant repeated 400 times), a separate clipboard
+// block (it gets separated from its data the first time someone pastes into two files), and a second
+// export action row (two things to remember to press).
+//
+// ⛔ THE `levers=` LINE REPORTS EFFECTIVE VALUES, NOT EDITED ONES (FORK-E). ⚠ SETTLED, and the one
+// thing here most likely to be "helpfully" reverted. Each entry resolves the way rebuildDebug()
+// resolves it — `debugNative(e, debugShown[e.id], on)` under the CURRENT `overridesOn()` state — never
+// by reading `debugShown` directly. With the master "Overrides Applied" toggle OFF every gameplay knob
+// reads its own `def` no matter what the panel still displays, so the line must read `levers=none`: a
+// fingerprint listing shown-but-inert edits would be worse than no fingerprint at all, because it
+// would be believed. Same failure mode the `sessionSwitch` comment up at the registry warns about.
+//   A `sessionSwitch` row (telemetryCapture) is EXEMPT from the toggle and resolves from its own
+// debugShown, so it can legitimately differ from `def` while `overrides=OFF`. That rule lives inside
+// debugNative and is reached THROUGH it — never restated here, or the two copies drift apart.
+//
+// ⛔ NO PROFILE NAME OR ID (FORK-F). A telemetry log gets pasted into chats and files; it does not
+// need to identify a player, and TELEMETRY-ANALYSIS-GUIDE.md never reads one. Do not add one later.
+function telemetryHeaderLines(rows, from) {
+  // Display only, and only in the `levers=` list: 1e-6 rounding trims the float dust the epsilon below
+  // already forgave, so a knob that genuinely IS different does not print as 0.35000000000000003.
+  const fmt = v => String(Math.round(v * 1e6) / 1e6);
+  const on = overridesOn();
+  const changed = [];
+  for (const e of DEBUG_ENTRIES) {
+    // The master toggle gets its own `overrides=` line and is skipped HERE on purpose: resolved
+    // through debugNative under itself it reads its own `def` the moment it is off, so it could never
+    // report as changed anyway — an omission that would look like a bug rather than a decision.
+    if (e.id === DEBUG_OVERRIDE_ID) continue;
+    const live = debugNative(e, debugShown[e.id], e.sessionSwitch ? true : on);
+    const def  = debugNative(e, e.def, true);   // the default through the entry's OWN toNative
+    // ⛔ AN EPSILON, NEVER `!==`. Several entries are floats (step 0.05 / 0.02) with toNative
+    // conversions, and stepping one up and back down lands 0.30000000000000004 where 0.3 started — a
+    // bare inequality would report a knob sitting at its default as changed, on most runs. Scaled by
+    // the default's magnitude so it means the same thing at 0.08 s and at 20000 entities. Written
+    // `!(d <= eps)` rather than `d > eps` so a NaN — which fails every ordinary comparison — reports
+    // as changed instead of being silently swallowed.
+    const d = Math.abs(live - def);
+    if (!(d <= 1e-9 * Math.max(1, Math.abs(def)))) changed.push(e.id + "=" + fmt(live));
+  }
+  return [
+    "# orbital-overhaul telemetry v3",                    // the envelope's own `v`, not a second version
+    "# build=" + GAME_VERSION,
+    "# overrides=" + (on ? "ON" : "OFF"),
+    "# telemetryInterval=" + DEBUG.telemetryInterval,     // the RESOLVED value tick() reads, not debugShown
+    "# rows=" + rows.length,
+    "# source=" + from,
+    "# levers=" + (changed.length ? changed.join(" ") : "none"),
+  ];
+}
+// CSV column order matches TELEMETRY_FIELDS exactly; the CS039 P3 `#` fingerprint, then one header
+// line, then one line per row. The two flags go out as `true`/`false` rather than 1/0 — a sheet reads
+// either, and this way the column says what the field actually is.
+// `from` is threaded in from telemetryExportRows()'s own `{ rows, from }` rather than read off a
+// global, so the header can never name a source the rows did not come from. The default is stated
+// rather than left to print "source=undefined" for a bare call.
+function telemetryCSV(rows, from = "unknown") {
+  const lines = telemetryHeaderLines(rows, from);
+  lines.push(TELEMETRY_FIELDS.join(","));
   for (const row of rows) lines.push(TELEMETRY_FIELDS.map(f => row[f]).join(","));
   return lines.join("\n") + "\n";
 }
@@ -5030,7 +5275,9 @@ function copyTelemetry() {
     AudioSys.ui(false);
     return;
   }
-  const text = telemetryCSV(src.rows);
+  // CS039 P3: built ONCE, with the source string the same call resolved, and handed to both the
+  // clipboard path and the download fallback below — the two can never receive different text.
+  const text = telemetryCSV(src.rows, src.from);
   try {
     const cb = navigator.clipboard;
     if (cb && typeof cb.writeText === "function") {
@@ -5138,7 +5385,32 @@ function gotoScreen(s, index) {
   game.menu.modal = null;  // CS016 P3: a dialog belongs to the screen that raised it and never survives a screen change
   game.menu.achTab = ACH_TAB_DEFAULT;  // CS016 P5: sits beside the scroll reset — re-entry is always Weekly, unscrolled
   game.menu.slotMsg = "";  // CS032 P3: same reasoning as achTab — a stale write-failure banner must not survive a screen change
+  game.menu.linkMsg = "";  // CS038 P1: openExternal's status line, cleared for slotMsg's reason exactly
   AudioSys.ui(true);
+}
+// CS038 P1 (spec §1.2, FORK-CS038-B → c): THE BUILD'S FIRST window.open, and its only one. Screen
+// agnostic — it states its outcome on game.menu.linkMsg (the Telemetry.msg / game.menu.slotMsg
+// precedent) and returns a boolean; it never throws into its caller and is never silent.
+//
+// ⛔ "noopener" IS NOT STYLISTIC. Without it the opened page holds a live window.opener handle back
+// into the game and can navigate it.
+// ⛔ AND IT IS ALSO WHY THE RETURN VALUE CANNOT BE TRUSTED. Per the HTML spec, window.open() with
+// noopener returns NULL EVEN WHEN THE WINDOW OPENED FINE, so null means "no window handle", not
+// "blocked", and this build genuinely cannot tell the two apart. CREDITS_LINK_MSG is therefore
+// worded conditionally, and is set on every actuation rather than only on a detected failure — a
+// flat "the popup was blocked" would be a lie after every working click. Only a THROW is a definite
+// failure, and the only thing it changes is the blip.
+//
+// A blocked popup costs the player nothing anyway: drawCredits() draws every URL in full, selected or
+// not. That is FORK-CS038-B → (c)'s whole reason for existing — itch.io serves this game inside a
+// sandboxed iframe, where a blocked popup fails SILENTLY.
+function openExternal(url) {
+  let w = null, threw = false;
+  try { w = window.open(url, "_blank", "noopener"); }
+  catch (e) { threw = true; }
+  game.menu.linkMsg = CREDITS_LINK_MSG;
+  AudioSys.ui(!threw);
+  return !threw && !!w;
 }
 // CS015 P4: open the hidden Debug Options panel straight from the Title screen (where there is no root
 // menu to route through). Sibling of openPause — sets game.paused so update() freezes and menuActive()
@@ -5244,6 +5516,7 @@ function menuInput(action) {
     case "nameentry":    menuNameEntry(action); break;  // CS031 P3: the profile name grid
     case "profiles":     menuProfiles(action); break;   // CS031 P4: the roster screen
     case "slots":        menuSlots(action); break;      // CS032 P3: the save/load slots screen
+    case "credits":      menuCredits(action); break;    // CS038 P1: the Credits screen
     case "debug":        menuDebug(action); break;   // CS015 P4: hidden, secret-code-only
   }
 }
@@ -5346,6 +5619,10 @@ function menuOptions(a) {
     // CS016 P2 (§2): the "Achievements" and "High Scores" rows are GONE from MENU_OPTIONS — the title
     // menu is now their sole parent, so there are no dispatch branches for them here either.
     else if (label === "Difficulty") gotoScreen("difficulty"); // Difficulty screen (v3.0 P5)
+    // CS038 P1 (spec §1.1): Options is Credits' ONE parent. openCredits() rather than a bare
+    // gotoScreen — row 0 of CREDITS_ROWS is a heading, so gotoScreen's `index = 0` is not a valid
+    // cursor here and the first selectable row is applied after it (enterDebug()'s idiom exactly).
+    else if (label === "Credits") openCredits();
     // CS012 P4 / CS013 P1: Back is context-aware — paused mid-game OR gameover (both have a root)
     // return to it (cursor on Options). CS016 P2: from the title the `else` no longer closes the
     // overlay entirely — the title has a menu of its own to return to, with game.paused cleared.
@@ -5521,6 +5798,70 @@ function menuDifficulty(a) {
     if (row === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Difficulty"));
   }
   else if (a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Difficulty"));
+  else if (a === "pause") closePause();
+}
+
+// ---------- CS038 P1: the Credits screen (spec §1.4) ----------
+// Row model: game.menu.index indexes CREDITS_ROWS, and only a `link` row may hold it — menuDebug's
+// DEBUG_ROWS model exactly, down to creditsStep() being debugStep() with one predicate changed.
+// Read-only otherwise; the screen has no value rows, so left/right are deliberately unbound.
+function creditsFirstLink() { const i = CREDITS_ROWS.findIndex(r => r.kind === "link"); return i < 0 ? 0 : i; }
+function creditsLastLink() {
+  for (let i = CREDITS_ROWS.length - 1; i >= 0; i--) if (CREDITS_ROWS[i].kind === "link") return i;
+  return creditsFirstLink();
+}
+// The next SELECTABLE row in `dir`, wrapping — debugStep()'s walk, and its guarantee: a head/text/gap
+// can never become the selection, including across the last->first wrap. Walks at most one full lap,
+// so a table with no link rows at all returns `from` instead of spinning.
+function creditsStep(from, dir) {
+  const n = CREDITS_ROWS.length;
+  for (let k = 1; k <= n; k++) {
+    const i = ((from + dir * k) % n + n) % n;
+    if (CREDITS_ROWS[i].kind === "link") return i;
+  }
+  return from;
+}
+// The ONE reader of the cursor — input, scroll and render all ask through it. Snaps to the first link
+// when game.menu.index points at anything else, so a caller that reached this screen without
+// openCredits() (or left a stale index behind) still renders and actuates sanely.
+function creditsSelIndex() {
+  const i = game.menu.index, r = CREDITS_ROWS[i];
+  return r && r.kind === "link" ? i : creditsFirstLink();
+}
+// The screen's one entry point (enterDebug()'s shape): gotoScreen resets index/scroll, then the first
+// selectable row is applied on top, because row 0 is a heading and index 0 is not a valid cursor here.
+function openCredits() {
+  gotoScreen("credits");
+  game.menu.index = creditsFirstLink();
+}
+// ⛔ UP/DOWN MOVE THE CURSOR, NOT THE SCROLL — and the scroll is DERIVED from the cursor on every nav
+// press and every draw (debugScrollTop()'s recompute-never-nudge rule), so the window can never drift
+// out of sync with the selection. The content is taller than the panel, so "keep the selected row
+// visible" is a requirement that had to be solved rather than assumed, and creditsScroll() solves it
+// in three cases: the FIRST link pins the window to 0, the LAST link pins it to creditsMaxScroll(),
+// and everything between is a minimal bring-into-view of that link's label AND its url line.
+//
+// ⛔ THE TWO PINS ARE THE LOAD-BEARING HALF. The header block above the first link, and the whole
+// SATELLITE SILHOUETTES + LICENSE tail below the last one, carry no cursor of their own — riding the
+// end links to the extremes is the ONLY way they are ever seen. Drop either pin and the licence line
+// becomes unreachable with no visible symptom.
+//
+// Input and render clamp against the SAME creditsMaxScroll(), so the two can never disagree about the
+// ceiling (achMaxScroll()'s standing contract).
+function menuCredits(a) {
+  const m = game.menu;
+  if (a === "up" || a === "down") {
+    m.index = creditsStep(creditsSelIndex(), a === "up" ? -1 : 1);
+    creditsScroll();
+    AudioSys.ui(false);
+  }
+  else if (a === "confirm") {
+    const r = CREDITS_ROWS[creditsSelIndex()];
+    if (r && r.kind === "link") openExternal(r.url);
+  }
+  // Credits has exactly ONE parent, so back is a hardcoded destination with the cursor restored to its
+  // own row — menuAchievements' no-return-tracker precedent, resolved by LABEL like every other.
+  else if (a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Credits"));
   else if (a === "pause") closePause();
 }
 
@@ -6435,12 +6776,17 @@ function saveSettings() {
     // CS024 P6: shotPowerupMode / magnetMode / chainGuardMode STOPPED BEING WRITTEN HERE with the
     // settings fields behind them. A store written by an earlier build still holds them; this save
     // simply stops re-emitting them, and the next write drops them from the blob. Nothing reads them.
+    // CS038 P3: sessionSwitch rows (instrumentation, not gameplay tuning) are left out of the debug
+    // sub-object entirely — the blob never carries them, so a launch can never revive one from a
+    // prior session. Built from DEBUG_ENTRIES rather than `{ ...debugShown }` for exactly that filter.
+    const debugSave = {};
+    for (const e of DEBUG_ENTRIES) if (!e.sessionSwitch) debugSave[e.id] = debugShown[e.id];
     const data = { vol: { ...AudioSys.vol }, bindings: {},
       musicTrack: settings.musicTrack,                                            // v3.4 P6 (additive)
       shipTurnScale: settings.shipTurnScale,                                      // CS010 §10b (additive)
       voiceStyle: settings.voiceStyle, captions: settings.captions,               // CS011 P3 (additive)
       autoShield: settings.autoShield,                                            // CS012 P5 (additive)
-      debug: { ...debugShown } };                                                 // CS015 P4 (additive sub-object, display units)
+      debug: debugSave };                                                         // CS015 P4 (additive sub-object, display units)
     for (const name of REBINDABLE) {
       const b = bindings[name];
       data.bindings[name] = { keys: b.keys, buttons: b.buttons || [], axis: b.axis || null };
@@ -6501,6 +6847,9 @@ function loadSettings() {
     // header entries, which have no id/min/max and nothing to restore.
     if (data.debug) {
       for (const e of DEBUG_ENTRIES) {
+        // CS038 P3: belt and braces — saveSettings never writes a sessionSwitch id, but an older or
+        // hand-edited blob could still carry one. Skip it here too so it cannot be revived that way.
+        if (e.sessionSwitch) continue;
         const dv = data.debug[e.id];
         if (Number.isFinite(dv) && dv >= e.min && dv <= e.max) applyDebug(e.id, dv);
       }
@@ -6812,8 +7161,8 @@ const TIER_COLOR = ["#c8823c", "#c0c8d2", "#ffcf5a", "#e8d8b0", "#dfe8f2", "#fff
 // The six tiers are ONE FAMILY WITH SIX RUNGS, not six shapes: every rung draws the same
 // delta mark inside the SAME circle (r=0.66), and the ladder is how much of that circle
 // exists — 120° cradle, 240°, 300°, closed, closed + four points, points bound in an
-// outer facet ring. Legibility measured in the lab at r=32 (celebrationEmblemSize's
-// default): tightest gap between two features meant to read apart is 5.1px.
+// outer facet ring. Legibility measured in the lab at r=32 (CELEB_EMBLEM_SIZE's
+// value): tightest gap between two features meant to read apart is 5.1px.
 //
 // ⛔ tierIdx 0 is Bronze and is a VALID tier. Resolve with `typeof tierIdx === "number"`.
 // ⚠ The two pool marks draw in COLOR.ach, which is BYTE-IDENTICAL to TIER_COLOR[2]
@@ -7659,11 +8008,11 @@ class HunterSatellite {
       // CS035 P4 (spec §4.3): draw-only heartbeat. Asymmetric — fast growth, slow shrink — reads as
       // pumping rather than breathing. Never touches this.radius/shape/inner; see draw().
       if (this.pulseUp) {
-        this.pulseScale += DEBUG.hunterPulseGrow * dt;
-        if (this.pulseScale >= DEBUG.hunterPulseMax) { this.pulseScale = DEBUG.hunterPulseMax; this.pulseUp = false; }
+        this.pulseScale += HUNTER_PULSE_GROW * dt;
+        if (this.pulseScale >= HUNTER_PULSE_MAX) { this.pulseScale = HUNTER_PULSE_MAX; this.pulseUp = false; }
       } else {
-        this.pulseScale -= DEBUG.hunterPulseShrink * dt;
-        if (this.pulseScale <= DEBUG.hunterPulseMin) { this.pulseScale = DEBUG.hunterPulseMin; this.pulseUp = true; }
+        this.pulseScale -= HUNTER_PULSE_SHRINK * dt;
+        if (this.pulseScale <= HUNTER_PULSE_MIN) { this.pulseScale = HUNTER_PULSE_MIN; this.pulseUp = true; }
       }
     }
     if (this.homing) {
@@ -8142,10 +8491,15 @@ function resetGameStats() {
     closeShave: false,       // survived a Hunter collision under 10 HP (Close Shave)
     everBelowHalf: false,    // HP ever dropped below 50% this game (Untouchable inverts this)
     hunterCoalesced: 0,      // Hunters born this game from neglected scrap coalescing (Waste Not, v3.2 P3)
-    cargoDamageEvents: 0,    // CS035 P6: unguarded chain severs this game (the sever path of
-                             // breakChain only — a guarded absorb and scatterChain() don't count). The
-                             // chain-guard drop-weight pity counter, read by guardDropWeight(); NOT
-                             // reset in nextWave() — pity carries across waves within a run, like cargoMax growth
+    cargoDamageEvents: 0,    // CS035 P6: unguarded chain severs SINCE THE LAST GUARD DROP (the sever
+                             // path of breakChain only — a guarded absorb and scatterChain() don't count).
+                             // ⛔ NOT a run total and NOT monotone: this is the chain-guard drop-weight
+                             // PITY counter, read by guardDropWeight() and zeroed in dropPowerup() when a
+                             // guard is SELECTED to drop. NOT reset in nextWave() — pity carries across
+                             // waves within a run, like cargoMax growth. For the run total, read cargoSevers.
+    cargoSevers: 0,          // CS039 GATE T: the same event, counted CUMULATIVELY for the run. Incremented
+                             // on the line below cargoDamageEvents++ and reset NOWHERE else, so telemetry
+                             // can report a sever total instead of the lower bound the sawtooth allows.
     // CS037 P1 (spec §5.5): per-source HP attribution, flat and additive — HP actually deducted,
     // non-lethal hits only. Ten categories: Garbage Satellite x3 sizes, Hunter Satellite x3 sizes,
     // UFO body x2 sizes, UFO shot x2 sizes.
@@ -8153,6 +8507,19 @@ function resetGameStats() {
     dmgFromHunter3: 0, dmgFromHunter2: 0, dmgFromHunter1: 0,
     dmgFromUfoBodyLarge: 0, dmgFromUfoBodySmall: 0,
     dmgFromUfoShotLarge: 0, dmgFromUfoShotSmall: 0,
+    // CS039 P1: five more flat, additive counters for offline telemetry only — nothing reads these
+    // this phase (no HUD, no leaderboard, no achievement). Same flat-number shape as the pickup/dmgFrom
+    // counters above, for the same reason: buildSaveEntry()'s spread and resumeFromSave()'s known-key
+    // type-matched loop carry them for free, no special case at either site.
+    hunterKills: 0,          // every Hunter destroyed by the player, all three tiers (Achievements.lifetime.hunterKills
+                             // is cross-game; this is per-run). `hunter_kills` IS a registered statsField on the
+                             // leaderboard Worker and is deliberately still unsent — wiring it into Leaderboard.submit()
+                             // is an open, un-taken decision, not an oversight this phase forgot.
+    hitsTaken: 0,            // non-lethal hits that actually deducted HP — same population, same site, as the
+                             // dmgFrom* attribution switch, so "mean damage per hit" derived offline is coherent.
+    deliveryScore: 0,        // points earned at the recycle dock this run
+    scoreRepairBonus: 0,     // cumulative REPAIR_FULL_BONUS awarded (full-HP milestone cash-in)
+    scoreScoopBonus: 0,      // cumulative SCOOP_MAX_BONUS awarded (max-level scoop pickup cash-in)
     gameEnded: false         // set at game over so end-of-game achievements can evaluate
   };
 }
@@ -8180,7 +8547,7 @@ const game = {
   // show on a "Profile: —" title row and nothing to play as. An upgrading player (legacy data migrated
   // into p0) has firstBoot false and boots normally, exactly as before this phase.
   menu: { screen: Profiles.firstBoot ? "profiles" : "titlemenu", index: 0, row: 0, col: 0, rebinding: null, scroll: 0, modal: null, achTab: ACH_TAB_DEFAULT,
-          nameBuf: "", nameCtx: null, nameErr: "", slotMode: null, slotMsg: "", hsFilter: HS_FILTER_DEFAULT }, // scroll: CS013 P3, Achievements-viewer vertical offset (CS034 P7: the High Scores screen scrolls on the same field); modal: CS016 P3, the open confirmation dialog (null = none); achTab: CS016 P5, the viewer's active tab id; nameBuf/nameCtx/nameErr: CS031 P3, the name-entry screen (typed buffer / what commit does / inline validation message); slotMode/slotMsg: CS032 P3, the slots screen (caller-set save/load mode / inline write-failure message); hsFilter: CS034 P7, the High Scores screen's ALL PROFILES / THIS PROFILE view
+          nameBuf: "", nameCtx: null, nameErr: "", slotMode: null, slotMsg: "", hsFilter: HS_FILTER_DEFAULT, linkMsg: "" }, // scroll: CS013 P3, Achievements-viewer vertical offset (CS034 P7: the High Scores screen scrolls on the same field); modal: CS016 P3, the open confirmation dialog (null = none); achTab: CS016 P5, the viewer's active tab id; nameBuf/nameCtx/nameErr: CS031 P3, the name-entry screen (typed buffer / what commit does / inline validation message); slotMode/slotMsg: CS032 P3, the slots screen (caller-set save/load mode / inline write-failure message); hsFilter: CS034 P7, the High Scores screen's ALL PROFILES / THIS PROFILE view
   ship: new Ship(),
   camera: { x: WORLD_W / 2, y: WORLD_H / 2 }, // world point at the center of the viewport
   // CS022 P1: the world size the sim is CURRENTLY running at (WORLD_SIZE_FIELD | WORLD_SIZE_ORBIT).
@@ -8560,9 +8927,9 @@ function resetRun(wave, debugRun) {
   // follows the same rule (achTabIndex() defends against a bad id anyway, but the field should never
   // BE undefined in the first place).
   // CS031 P3: nameBuf/nameCtx/nameErr are here AND in the game literal, same standing rule.
-  // CS032 P3: slotMode/slotMsg follow it too. CS034 P7: and hsFilter.
+  // CS032 P3: slotMode/slotMsg follow it too. CS034 P7: and hsFilter. CS038 P1: and linkMsg.
   game.menu = { screen: null, index: 0, row: 0, col: 0, rebinding: null, modal: null, achTab: ACH_TAB_DEFAULT,
-                nameBuf: "", nameCtx: null, nameErr: "", slotMode: null, slotMsg: "", hsFilter: HS_FILTER_DEFAULT }; // ensure no menu carries in
+                nameBuf: "", nameCtx: null, nameErr: "", slotMode: null, slotMsg: "", hsFilter: HS_FILTER_DEFAULT, linkMsg: "" }; // ensure no menu carries in
   DiffLog.rows = []; // CS017 P2: dev log is per-run, never carries into a fresh game
   PlayPeaks.reset();  // CS037 P2.1: the run figure resets here; the session figure does not
   Telemetry.reset();  // CS037 P4: the telemetry buffer is PER-RUN, and this is the shared seam both
@@ -8907,6 +9274,9 @@ function addScore(pts) {
       game.ship.hp = Math.min(SHIP_MAX_HP, game.ship.hp + REPAIR_AMOUNT);
     } else {
       game.score += REPAIR_FULL_BONUS; // already at full HP: cash the milestone in as points
+      // CS039 P1: per-run counter for offline telemetry only — see resetGameStats(). This arm adds to
+      // game.score DIRECTLY rather than recursing through addScore(), so this cannot double-count.
+      game.stats.scoreRepairBonus += REPAIR_FULL_BONUS;
     }
     AudioSys.shieldPing();
   }
@@ -8992,6 +9362,9 @@ function destroyHunter(h, awardScore = true) {
     if (game.stats.hunterLineageKills >= ACH_LINEAGE_FULL) game.stats.hunterLineComplete = true;
     if (h.size === 3) game.stats.largeHunterKills++;
     Achievements.lifetime.hunterKills++;
+    // CS039 P1: per-run counter for offline telemetry only — see resetGameStats(). Gated on
+    // awardScore with the rest of this block so the "dying"-state chain detonations move it nowhere.
+    game.stats.hunterKills++;
   }
   boom(h.x, h.y, h.size, COLOR.satellite);
   // CS034 (Paul's call, FORK-C -> b): large/medium Hunters no longer emit Debris on death — only
@@ -9176,6 +9549,8 @@ function dropPowerup(x, y, vx = 0, vy = 0) {
   for (const k in POWERUP_DROP_WEIGHTS) { if (!eligible(k)) continue; r -= weightOf(k); if (r < 0) { type = k; break; } }
   // CS035 P6 (spec §5.3, FORK-T): the pity counter resets the instant a guard is SELECTED to drop,
   // before the Powerup is pushed — not on pickup. An uncollected guard still consumed the pity.
+  // ⛔ game.stats.cargoSevers is NOT reset here — it is the cumulative run total of the same event and
+  // has no pity semantics. Zeroing it would put the telemetry column back to the sawtooth GATE T fixed.
   if (type === "guard") game.stats.cargoDamageEvents = 0;
   game.powerups.push(new Powerup(x, y, type, vx, vy));
 }
@@ -9284,6 +9659,10 @@ function applyPowerup(type) {
       game.floaters.push(new FloatText("SCOOP +1", game.ship.x, game.ship.y - 22, POWERUP_COLOR.scoop));
     } else {
       addScore(SCOOP_MAX_BONUS);
+      // CS039 P1: per-run counter for offline telemetry only — see resetGameStats(). Unlike
+      // scoreRepairBonus, this DOES go through addScore(), so it can itself trip a repair milestone —
+      // the two bonus counters are not symmetric code, and that is fine.
+      game.stats.scoreScoopBonus += SCOOP_MAX_BONUS;
       game.floaters.push(new FloatText("SCOOP MAX", game.ship.x, game.ship.y - 22, POWERUP_COLOR.scoop));
     }
     game.stats.powerupsPicked++;
@@ -10072,6 +10451,10 @@ function damageShip(amount, srcX, srcY, srcTag) {
   game.stats.dmgThisWave++;
   Achievements.lifetime.hitsSurvived++;
   if (s.hp < SHIP_MAX_HP * 0.5) game.stats.everBelowHalf = true;
+  // CS039 P1: per-run counter for offline telemetry only — see resetGameStats(). Lands on the same
+  // side of the shielded/i-frame early return as the dmgFrom* switch below, so it counts exactly the
+  // same population those ten sums do.
+  game.stats.hitsTaken++;
   // CS037 P1 (spec §5.5): per-source HP attribution, observational only. Ten flat accumulators,
   // one per category; an unrecognised/absent srcTag attributes nothing.
   switch (srcTag) {
@@ -10813,6 +11196,7 @@ function breakChain(i, src = null) { // node i destroyed; everything aft breaks 
   // CS035 P6 (spec §5.3): the sever path only — a guarded absorb returned above and never reaches
   // here; scatterChain() (ship death) is its own terminal event and does not increment this.
   game.stats.cargoDamageEvents++;
+  game.stats.cargoSevers++;   // CS039 GATE T: same event, cumulative — the pity counter above resets, this never does
   boom(hit.x, hit.y, 1, COLOR.garbage);
   for (let j = i + 1; j < chain.length; j++) {
     game.garbage.push(Garbage.fromNode(chain[j]));
@@ -11602,19 +11986,20 @@ function update(dt) {
         if (game.deliveryCount === CARGO_CAP_MAX) superMegaDelivery();
         Achievements.lifetime.delivered++;
         Achievements.lifetime.deliveryScore += pts;
+        game.stats.deliveryScore += pts; // CS039 P1: per-run mirror, offline telemetry only — see resetGameStats()
         // CS026 P4 (spec §3.3a/§3.4): rise read from the DELIVERY registry knobs. CS029 P4
         // (model C, gate G1/§6.3): the towed branch no longer spawns a new floater per canister — one
         // ticker lives for the whole visit, pinned at the dock anchor, its text rewritten to the
         // running visit total as each canister lands. It is released (unpinned, becomes an ordinary
         // rising/fading floater) at the visit's last canister, below. The running total is carried on
         // the ticker itself — there is nowhere else that needs it.
-        // CS034 P8 (spec §3.5): size grows per piece (deliveryFloatSize/SizeStep/SizeMax) and life
-        // splits into a hold (full opacity after release) plus a fade (the linear falloff) — the
-        // old single-life knob is retired.
+        // CS034 P8 (spec §3.5): size grows per piece (DELIVERY_FLOAT_SIZE/SIZE_STEP/SIZE_MAX) and
+        // life splits into a hold (full opacity after release) plus a fade (the linear falloff) —
+        // the old single-life knob is retired.
         if (!game.deliveryTicker) {
           game.deliveryTicker = new FloatText("+" + pts, deliveryAnchorX, deliveryAnchorY,
-            COLOR.dock, DEBUG.deliveryFloatSize, DEBUG.deliveryFloatRise,
-            DEBUG.deliveryFloatHold + DEBUG.deliveryFloatFade, DEBUG.deliveryFloatFade);
+            COLOR.dock, DELIVERY_FLOAT_SIZE, DELIVERY_FLOAT_RISE,
+            DELIVERY_FLOAT_HOLD + DELIVERY_FLOAT_FADE, DELIVERY_FLOAT_FADE);
           game.deliveryTicker.pinned = true;
           game.deliveryTicker.total = pts;
           game.floaters.push(game.deliveryTicker);
@@ -11622,8 +12007,8 @@ function update(dt) {
           game.deliveryTicker.total += pts;
           game.deliveryTicker.text = "+" + game.deliveryTicker.total;
           // CS034 P8 (spec §3.5): size grows one step per piece, clamped at the ceiling.
-          game.deliveryTicker.size = Math.min(DEBUG.deliveryFloatSizeMax,
-            DEBUG.deliveryFloatSize + DEBUG.deliveryFloatSizeStep * (game.deliveryCount - 1));
+          game.deliveryTicker.size = Math.min(DELIVERY_FLOAT_SIZE_MAX,
+            DELIVERY_FLOAT_SIZE + DELIVERY_FLOAT_SIZE_STEP * (game.deliveryCount - 1));
         }
         AudioSys.deliver(game.deliveryCount);
         // CS010 P9 (FORK-5 = b): Dan sizes up the haul on the pop that EMPTIES the chain — the offload
@@ -12209,6 +12594,7 @@ function drawMenu() {
   else if (s === "nameentry") drawNameEntry();   // CS031 P3: the profile name grid
   else if (s === "profiles") drawProfiles();     // CS031 P4: the roster screen
   else if (s === "slots") drawSlots();           // CS032 P3: the save/load slots screen
+  else if (s === "credits") drawCredits();       // CS038 P1: the Credits screen
   else if (s === "debug") drawDebug();   // CS015 P4: hidden, secret-code-only
   drawModal();  // CS016 P3: LAST, unconditionally — it must paint over whichever panel raised it
 }
@@ -12417,6 +12803,108 @@ function drawDifficulty() {
   drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, y + 204, 22, backSel ? COLOR.text : COLOR.menuIdle);
   if (m.index < HELP.length) drawMenuHint(locked ? DIFFICULTY_LOCK_HELP : HELP[m.index], VIEW_W / 2, y + 248);
   drawMenuHint("↑↓ move    ◄► toggle    ENTER / A select    ESC / B back", VIEW_W / 2, y + 278);
+}
+
+// ---------- CS038 P1: the Credits screen's render (spec §1.2/§1.4) ----------
+// Panel geometry + per-KIND line metrics, mirrored off menuPanel()'s own centring the way HS_PANEL_X/Y
+// mirror drawHighScores'. Every row's height comes from its kind, so the layout is as data-driven as
+// the table: creditsLayout() is the one place the two meet, and creditsMaxScroll(), creditsScroll()
+// and drawCredits() all read it rather than growing copies of the maths.
+const CREDITS_PANEL_W = 900, CREDITS_PANEL_H = 660;   // ACH_PANEL_H's height — 30px of viewport margin
+const CREDITS_PANEL_X = (VIEW_W - CREDITS_PANEL_W) / 2;
+const CREDITS_PANEL_Y = (VIEW_H - CREDITS_PANEL_H) / 2;
+const CREDITS_HEAD_SIZE = 16, CREDITS_TEXT_SIZE = 15, CREDITS_LINK_SIZE = 15, CREDITS_URL_SIZE = 12;
+const CREDITS_HEAD_STEP = 27;   // baseline -> next row's baseline, after a heading (a heading earns air)
+const CREDITS_TEXT_STEP = 21;
+const CREDITS_LINK_STEP = 19;   // a link row's LABEL baseline -> its URL baseline
+const CREDITS_URL_STEP  = 23;   // ...and that URL baseline -> the next row's baseline
+const CREDITS_GAP_STEP  = 12;
+const CREDITS_ROW0_Y      = CREDITS_PANEL_Y + 92;    // row 0's baseline, unscrolled
+const CREDITS_CLIP_TOP    = CREDITS_ROW0_Y - 20;     // headroom above row 0's ink, below the panel title
+const CREDITS_CLIP_BOTTOM = CREDITS_PANEL_Y + 592;   // headroom above the ▼ cue, the footer and the status line
+const CREDITS_VISIBLE_H   = CREDITS_CLIP_BOTTOM - CREDITS_CLIP_TOP;
+const CREDITS_HINT_Y      = CREDITS_PANEL_Y + 622;
+const CREDITS_MSG_Y       = CREDITS_PANEL_Y + 644;
+const CREDITS_MSG_SIZE    = 13;
+const CREDITS_HINT        = "↑↓ move    ENTER / A open link    ESC / B back";
+// Per-row baseline offsets from CREDITS_ROW0_Y, each row's ink band, and the total content height.
+// ⚠ contentH is MEASURED FROM THE CLIP TOP, not from row 0's baseline — scoresMaxScroll()'s header
+// records why achMaxScroll()'s from-the-baseline form falls its own headroom short at full scroll.
+// Recomputed rather than cached: thirty-odd rows of arithmetic on one menu screen, against a cache
+// that could go stale behind a table edit — which is the exact edit this screen exists to make cheap.
+function creditsLayout() {
+  const rows = [];
+  let y = 0;
+  for (const r of CREDITS_ROWS) {
+    const two = r.kind === "link";
+    const size = r.kind === "head" ? CREDITS_HEAD_SIZE
+               : r.kind === "text" ? CREDITS_TEXT_SIZE
+               : two ? CREDITS_LINK_SIZE : 0;
+    const lastBase = y + (two ? CREDITS_LINK_STEP : 0);           // a link's SECOND line
+    const lastSize = two ? CREDITS_URL_SIZE : size;
+    rows.push({ y, size, top: y - size, bot: lastBase + lastSize * 0.3 });   // 0.3 = the descender allowance
+    y += r.kind === "head" ? CREDITS_HEAD_STEP
+       : r.kind === "text" ? CREDITS_TEXT_STEP
+       : two ? CREDITS_LINK_STEP + CREDITS_URL_STEP
+       : CREDITS_GAP_STEP;
+  }
+  const last = rows[rows.length - 1];
+  return { rows, contentH: (CREDITS_ROW0_Y - CREDITS_CLIP_TOP) + (last ? last.bot : 0) };
+}
+function creditsMaxScroll() { return Math.max(0, creditsLayout().contentH - CREDITS_VISIBLE_H); }
+// The derived window. See menuCredits()'s header for the two pins and why they are load-bearing.
+// Writes game.menu.scroll (drawHighScores() clamps the same field in its own draw, for the same
+// reason) and returns it, so the renderer and the input path can only ever read one answer.
+function creditsScroll() {
+  const L = creditsLayout(), max = Math.max(0, L.contentH - CREDITS_VISIBLE_H);
+  const sel = creditsSelIndex(), lead = CREDITS_ROW0_Y - CREDITS_CLIP_TOP;
+  let s = Math.max(0, Math.min(max, game.menu.scroll));
+  if (sel === creditsFirstLink()) s = 0;
+  else if (sel === creditsLastLink()) s = max;
+  else {
+    const r = L.rows[sel], top = lead + r.top, bot = lead + r.bot;
+    if (top < s) s = top;
+    else if (bot > s + CREDITS_VISIBLE_H) s = bot - CREDITS_VISIBLE_H;
+  }
+  game.menu.scroll = Math.max(0, Math.min(max, s));
+  return game.menu.scroll;
+}
+// Renders the whole screen off CREDITS_ROWS — no typed draw call per line, so a table edit is the only
+// edit a new credit ever needs.
+//
+// ⛔ A LINK ROW'S FULL URL IS DRAWN UNDER ITS LABEL WHETHER OR NOT THE ROW IS SELECTED. That is
+// FORK-CS038-B → (c) itself, not decoration: itch.io serves this game inside a sandboxed iframe where
+// a blocked window.open fails silently, and a URL that is always on screen means a blocked popup costs
+// the player nothing — they can read it and type it. Do not "tidy" this into a selected-row-only
+// readout; see openExternal()'s header for why the build cannot even detect the block.
+function drawCredits() {
+  menuPanel(CREDITS_PANEL_W, CREDITS_PANEL_H, "CREDITS");   // its {x,y} is mirrored by CREDITS_PANEL_X/Y above
+  const cx = VIEW_W / 2, L = creditsLayout(), sel = creditsSelIndex();
+  const maxScroll = Math.max(0, L.contentH - CREDITS_VISIBLE_H);
+  const scroll = creditsScroll();     // the SAME derivation menuCredits() drives — never a second copy
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(CREDITS_PANEL_X, CREDITS_CLIP_TOP, CREDITS_PANEL_W, CREDITS_VISIBLE_H);
+  ctx.clip();   // not a fill — GDD §3.2's no-fills rule gains no new exception here
+  CREDITS_ROWS.forEach((r, i) => {
+    const by = CREDITS_ROW0_Y + L.rows[i].y - scroll;
+    if (r.kind === "head") drawText(r.text, cx, by, CREDITS_HEAD_SIZE, COLOR.text);
+    else if (r.kind === "text") drawText(r.text, cx, by, CREDITS_TEXT_SIZE, COLOR.menuIdle);
+    else if (r.kind === "link") {
+      const on = i === sel;
+      drawText((on ? "▶ " : "   ") + r.text, cx, by, CREDITS_LINK_SIZE, on ? COLOR.text : COLOR.menuIdle);
+      drawText(r.url, cx, by + CREDITS_LINK_STEP, CREDITS_URL_SIZE, COLOR.dim);
+    }
+    // a "gap" row draws nothing — it is pure vertical air, and creditsLayout() already spent it
+  });
+  ctx.restore();
+  // Scroll affordance, drawn OUTSIDE the clip like the rest of the chrome — drawHighScores' rule.
+  if (maxScroll > 0) {
+    if (scroll > 0)         drawText("▲", cx, CREDITS_CLIP_TOP - 4, 16, COLOR.menuIdle);
+    if (scroll < maxScroll) drawText("▼", cx, CREDITS_CLIP_BOTTOM + 12, 16, COLOR.menuIdle);
+  }
+  drawMenuHint(CREDITS_HINT, cx, CREDITS_HINT_Y);
+  if (game.menu.linkMsg) drawText(game.menu.linkMsg, cx, CREDITS_MSG_Y, CREDITS_MSG_SIZE, COLOR.dim);
 }
 
 // Hidden Debug Options panel renderer (CS015 P4) — generic over DEBUG_ROWS, following drawSound's value-row
@@ -13132,13 +13620,13 @@ const CELEB_HINT = "↑↓ scroll    ENTER / A / ESC / B  continue";
 // bottom row's emblem. The ROLE is the analogue — one shared, row-count-derived ceiling — not the
 // arithmetic. Measured from the clip top, full scroll lands a row's lowest ink exactly on the clip
 // bottom. That lowest ink is normally the description's; the emblem only overtakes it once
-// celebrationEmblemSize is cranked past CELEB_DESC_DY + CELEB_DESC_SIZE (40), which is why the knob
-// is read here. Past ~40 that knob also lets adjacent rows touch — a consequence of the slider, not
-// of the shipped layout, whose default (32) leaves 20px of air between emblems.
+// CELEB_EMBLEM_SIZE is cranked past CELEB_DESC_DY + CELEB_DESC_SIZE (40), which is why the constant
+// is read here. Past ~40 it would also let adjacent rows touch — a consequence noted for whoever
+// next retunes it, not of the shipped layout, whose 32 leaves 20px of air between emblems.
 function celebrationMaxScroll() {
   const n = game.celebration ? game.celebration.items.length : 0;
   if (n === 0) return 0;
-  const rowBottom = Math.max(CELEB_DESC_DY + CELEB_DESC_SIZE, CELEB_EMBLEM_DY + DEBUG.celebrationEmblemSize);
+  const rowBottom = Math.max(CELEB_DESC_DY + CELEB_DESC_SIZE, CELEB_EMBLEM_DY + CELEB_EMBLEM_SIZE);
   const contentH = (CELEB_ROW0_Y - CELEB_ROW_CLIP_TOP) + (n - 1) * CELEB_ROW_STEP + rowBottom;
   return Math.max(0, contentH - CELEB_ROW_VISIBLE_H);
 }
@@ -13149,7 +13637,7 @@ function celebrationMaxScroll() {
 function celebrationScroll(dir) {
   const c = game.celebration;
   if (!c) return;
-  c.scroll = Math.max(0, Math.min(celebrationMaxScroll(), c.scroll + dir * DEBUG.celebrationScrollStep));
+  c.scroll = Math.max(0, Math.min(celebrationMaxScroll(), c.scroll + dir * CELEB_SCROLL_STEP));
 }
 // Confirm/back dismisses UNCONDITIONALLY, at any scroll position — the Achievements viewer's own
 // convention (§2.6, FORK-CS030-E). No "scroll to the bottom before you can leave" gate exists
@@ -13176,7 +13664,7 @@ function dismissCelebration() {
 // string is built exactly as onUnlock()'s toast label is ("Name — Gold"), so the panel and the toast
 // that fired during play name the same unlock the same way.
 function drawCelebrationRow(item, x, ry) {
-  const r = DEBUG.celebrationEmblemSize;
+  const r = CELEB_EMBLEM_SIZE;
   drawEmblem(x + r, ry + CELEB_EMBLEM_DY, r, item.tierIdx, item.pool);
   // ⛔ typeof, never truthiness — tierIdx 0 is Bronze, a VALID tier (see drawEmblem's header).
   const tiered = typeof item.tierIdx === "number";
@@ -13463,32 +13951,44 @@ function draw() {
 // block comment above the Capture object) only ever hides the always-on overlay, never anything
 // modal or transient.
 function drawHUD() {
-  // CS010 P3 — low-health CORNER GLOW (§5, FORK-3 = FILL; a NAMED GDD §3.2 fills-exception, Paul signed
-  // off). A peripheral-vision alarm: four radial-gradient corner fills in the low-health red. It engages
-  // on the EXACT SAME predicate as the siren (game.lowHpSiren) and pulses IN PHASE with the critical-hull
-  // ring and the siren — all read game.lowHpPhase, one instrument. It NEVER reads a Web Audio LFO value:
-  // the phase is a game-side accumulator, so the glow renders even with audio unavailable (ctx null, no
-  // user gesture yet). WHY A FILL, not a glowStroke arc: a corner-of-the-eye alarm is low-frequency,
+  // CS010 P3, shape retuned CS038 P6 (GATE A) — low-health EDGE-VIGNETTE GLOW (§5, FORK-3 = FILL; a
+  // NAMED GDD §3.2 fills-exception, Paul signed off). A peripheral-vision alarm: four linear-gradient
+  // bands, one inward from each screen edge, in the low-health red — the bands overlap in the corners
+  // under source-over, so the corners stay the brightest part for free. It engages on the EXACT SAME
+  // predicate as the siren (game.lowHpSiren) and pulses IN PHASE with the critical-hull ring and the
+  // siren — all read game.lowHpPhase, one instrument. It NEVER reads a Web Audio LFO value: the phase
+  // is a game-side accumulator, so the glow renders even with audio unavailable (ctx null, no user
+  // gesture yet). WHY A FILL, not a glowStroke arc: a corner-of-the-eye alarm is low-frequency,
   // large-area and EDGELESS by definition — that is what makes it readable without competing for focus.
   // A glowStroke arc is a LINE (high-frequency, small-area) that would read as a THIRD red HUD element
   // beside the two red rings — the very noise this phase exists to remove — and it is more expensive
-  // (glowStroke is shadowBlur, the renderer's hot spot; four blurred arcs would burn it in the busiest
-  // frames). Drawn FIRST so the HUD readouts paint crisply over it. Lives in drawHUD() so Capture's H key
-  // hides it and P exports a clean frame. Intensity scales with t (BRIGHTER near death) AND the shared
-  // pulse — never merely faster. Alpha rides the gradient stop, so this block NEVER touches globalAlpha
-  // (it can't leak). Two corners (top-right rings, bottom-left powerup rows) are occupied; the radius is
-  // sized to FRAME rather than fight — a PLAYTEST KNOB (STATUS.md).
+  // (glowStroke is shadowBlur, the renderer's hot spot; blurred bands would burn it in the busiest
+  // frames — this shape adds none). Drawn FIRST so the HUD readouts paint crisply over it. Lives in
+  // drawHUD() so Capture's H key hides it and P exports a clean frame. Intensity scales with t
+  // (BRIGHTER near death) AND the shared pulse — never merely faster. Alpha rides the gradient stop, so
+  // this block NEVER touches globalAlpha (it can't leak).
+  // CS038 P6: the four-CORNER shape (shipped CS010–CS037) left the middle of every edge unlit — 720px
+  // across the top alone — which is what GATE A's lab (tools/lowhp-glow-lab.html) found unfindable
+  // regardless of alpha. This is that lab's "edge vignette" shape, ported verbatim; LOWHP_GLOW_RADIUS
+  // is now read as vignette DEPTH (inward from each edge), not a corner blob's reach.
   if (game.lowHpSiren) {
     const gt = clamp01(1 - game.ship.hp / LOW_HP_THRESHOLD);            // HP urgency, the same t the siren uses
     const gpulse = 0.6 + 0.4 * Math.sin(game.lowHpPhase);              // shared phase → locked to the hull ring + siren
     const peak = (LOWHP_GLOW_ALPHA_MIN + (LOWHP_GLOW_ALPHA_MAX - LOWHP_GLOW_ALPHA_MIN) * gt) * gpulse;
-    const R = LOWHP_GLOW_RADIUS;
-    for (const c of [[0, 0], [VIEW_W, 0], [0, VIEW_H], [VIEW_W, VIEW_H]]) {
-      const grad = ctx.createRadialGradient(c[0], c[1], 0, c[0], c[1], R);
-      grad.addColorStop(0, `rgba(${LOWHP_GLOW_RGB},${peak})`);
-      grad.addColorStop(1, `rgba(${LOWHP_GLOW_RGB},0)`);
+    const D = LOWHP_GLOW_RADIUS;
+    const c0 = `rgba(${LOWHP_GLOW_RGB},${peak})`, c1 = `rgba(${LOWHP_GLOW_RGB},0)`;
+    const bands = [
+      [0, 0, 0, D,                 0, 0, VIEW_W, D],                    // top
+      [0, VIEW_H, 0, VIEW_H - D,   0, VIEW_H - D, VIEW_W, D],           // bottom
+      [0, 0, D, 0,                 0, 0, D, VIEW_H],                    // left
+      [VIEW_W, 0, VIEW_W - D, 0,   VIEW_W - D, 0, D, VIEW_H],           // right
+    ];
+    for (const b of bands) {
+      const grad = ctx.createLinearGradient(b[0], b[1], b[2], b[3]);
+      grad.addColorStop(0, c0);
+      grad.addColorStop(1, c1);
       ctx.fillStyle = grad;
-      ctx.fillRect(Math.max(0, c[0] - R), Math.max(0, c[1] - R), R, R);
+      ctx.fillRect(b[4], b[5], b[6], b[7]);
     }
   }
   // CS024 P6d: the visible tell for a debug run — without it, a good score silently failing to record
