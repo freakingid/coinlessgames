@@ -416,9 +416,12 @@ const LOWHP_GLOW_ALPHA_MAX = 0.40;  // peak vignette alpha near death (t=1) — 
 const LOWHP_GLOW_RADIUS     = 280;  // vignette depth in px, inward from each edge (CS038 GATE A A3 — this constant kept its name across the shape change, per the lab's own dump)
 const LOWHP_GLOW_RGB        = "255,64,64";  // edge-vignette color channels — mirrors COLOR.lowhp (#ff4040), CS038 GATE A A5 kept the mirror; kept as a triple so a gradient stop can carry the pulsing alpha
 const LOWHP_RELIEF_FLASH    = 0.5;  // sec — the geometry-only hull-ring "exhale" when low-health CLEARS with the ship alive (§5 relief cue, FLAG-CS010-a). HUD_CAP_FLASH's neighbourhood.
-const REPAIR_MILESTONE = 10000; // score interval that grants a hull-repair bonus (was: extra life)
-const REPAIR_AMOUNT = 25;       // +HP granted at each milestone (capped at max)
-const REPAIR_FULL_BONUS = 2500; // flat score awarded instead when already at full HP
+const REPAIR_MILESTONE = 10000; // score interval that SPAWNS a Health powerup while the hull is hurt
+                                // (CS040 P1; was a direct hull repair, and before that an extra life)
+// CS040 P1 (spec §1.2): REPAIR_AMOUNT (25) and REPAIR_FULL_BONUS (2500) STOOD HERE and are DELETED, not
+// parked — the milestone no longer heals and no longer pays, so neither constant has a consumer left.
+// Do not reinstate either one without reinstating the mechanism, which is Paul's call, not a cleanup
+// pass. The measured reason the arm changed at all is written out in full at addScore().
 
 // v3.6 P5 — the death spectacle. killShip() enters a new "dying" state for DEATH_DURATION seconds
 // instead of freezing straight to "gameover": the field keeps simulating (updateDeath) while an
@@ -468,7 +471,7 @@ const SCORES_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 // CS037 P8: "1.0.0.36" -> "1.0.0.37". Still tracking the changeset number.
 // CS038 P7: "1.0.0.37" -> "1.0.0.38". Still tracking the changeset number.
 // CS039 P4: "1.0.0.38" -> "1.0.0.39". Still tracking the changeset number.
-const GAME_VERSION = "1.0.0.39";
+const GAME_VERSION = "1.0.0.40";
 const VERSION_STAMP_INSET_X = 16; // px in from the right edge of the viewport (title screen only)
 const VERSION_STAMP_INSET_Y = 16; // px in from the bottom edge of the viewport (title screen only)
 
@@ -484,6 +487,12 @@ const HUD_CARGO_CX = 1232;      // CARGO ring center x (76px right of HULL — 1
 const HUD_RING_CY = 74;         // both rings share this center y
 const HUD_RING_LABEL_Y = 122;   // y of the "HULL"/"CARGO" text labels beneath the rings
 const HUD_SHIELD_R_GAP = 9;     // shield arc radius = HUD_RING_R - this (concentric, inside HULL ring)
+// CS040 P3 (spec §1.5): the banked-Health pip row, tucked UNDER the "HULL" label. PLAIN CONSTANTS, not
+// registry rows — pure presentation, tuned by eye, exactly the CAPTION_LINGER / CS038 P5 category.
+// ⛔ Sized to stay INSIDE the HULL cluster's own footprint: r + stroke spans x 1143..1169, and the CARGO
+// ring's left edge is 1200, so the 16 px of air between the two clusters is untouched. See the draw site.
+const HUD_BANK_PIP_R  = 11;     // radius of the segmented banked-charge pip ring
+const HUD_BANK_PIP_DY = 17;     // its center y, measured DOWN from HUD_RING_LABEL_Y
 // The HULL ring's center glyph — the player's own ship, so the ring is unmistakably theirs. This is the
 // L1949 hull poly [[16,0],[-11,-9],[-6,0],[-11,9]] scaled to 55% (drawPoly takes no scale, and scaling
 // the context would scale the glow blur too — CS009 P2, spec §3). Drawn nose-up via angle -Math.PI/2.
@@ -1104,10 +1113,29 @@ const POWERUP_DROP_WEIGHTS = { rapid: 30, triple: 30, scoop: 20, magnet: 10, eng
 // live value is DEBUG.sweepPowerupCap (POWERUPS section), which superMegaDelivery() reads. The old
 // "fixed, not configurable" pin is superseded by that gate decision; see the knob for the shipped 24.
 const SWEEP_POWERUP_CAP = 48;
-const POWERUP_HEALTH_GAP = [18, 26]; // sec between ambient Health spawns (saucer-like cadence)
+// CS040 P2 (spec §1.3): pity-driven ambient Health cadence, replacing the flat [18, 26] gap.
+// healthGapRoll() interpolates between these on missing hull — same "pressure-driven, clamped
+// at both ends" shape as guardDropWeight().
+const HEALTH_GAP_LOW_OK    = 22;  // roll floor at full hull
+const HEALTH_GAP_HIGH_OK   = 30;  // roll ceiling at full hull
+const HEALTH_GAP_LOW_HURT  = 6;   // roll floor at zero hull
+const HEALTH_GAP_HIGH_HURT = 10;  // roll ceiling at zero hull
 const POWERUP_HEALTH_AMOUNT = 25;    // +HP on Health pickup, capped at max (matches the F2 milestone repair)
+// CS040 P3 (spec §1.4): the health BANK's cap — how many spare charges the ship may carry.
+// ⛔ A CHARGE IS A WHOLE CHARGE, worth POWERUP_HEALTH_AMOUNT, never a partial-HP reserve: a pickup at
+// 240/250 applies 10 HP and banks a FULL charge. That is deliberate, not a rounding accident — a
+// fractional bank is unreadable to the player (the HUD pips can only show whole units) and untunable
+// for us. This const is only the registry row's `def` source; the LIVE cap is DEBUG.healthBankMax,
+// which applyPowerup(), resumeFromSave()'s clamp and the HUD pip row all read (the standing
+// chainGuardIntercepts idiom).
+const HEALTH_BANK_MAX = 2;
 const POWERUP_HEALTH_MIN_DIST = 220; // ambient Health spawns in a ring this..MAX from the ship (reachable, visible)
 const POWERUP_HEALTH_MAX_DIST = 520;
+// CS040 P4 (spec §2.2, FORK-CS040-C c1): the recycle hub's dry-weapon relief multiplier. Applied only
+// at the hub's dropPowerup() call — see dropPowerup(x, y, vx, vy, hubBias) — to the weight of any
+// budgeted type (rapid/triple/magnet/engine, NOT guard) currently sitting at game.powerBudget[type] === 0.
+// This const is only the registry row's `def` source; the live value is DEBUG.hubDryWeightMult.
+const HUB_DRY_WEIGHT_MULT = 4;
 // Weapon caps. Triple's cap (12) is also the combined Rapid+Triple cap — the higher of the two,
 // not the product (24), to keep bullet clutter from fighting Pillar 1 (vector clarity).
 const RAPID_MAX_BULLETS  = 8;       // Rapid Fire bullet cap (2x base MAX_BULLETS)
@@ -1198,7 +1226,7 @@ const SCOOP_HITS_PER_LEVEL = 5;              // non-lethal hits that cost one sc
                                               // hits; with SHIP_MAX_HP 250 and DMG_MEDIUM 35 a full-health run
                                               // only takes ~7 hits total, so the scoop is now effectively sticky
                                               // once earned. That's the intent, not a bug to "fix."
-const SCOOP_MAX_BONUS = 500;                 // score paid when a scoop pickup lands at max level (mirrors the full-HP REPAIR_FULL_BONUS pattern; tunable)
+const SCOOP_MAX_BONUS = 500;                 // score paid when a scoop pickup lands at max level (once mirrored the full-HP REPAIR_FULL_BONUS, deleted CS040 P1; this one stands; tunable)
 const SCOOP_SPILL_KICK = 85;                 // v3.3 P4 (9c): px/s outward kick on the leftover when a clump is PARTIALLY scooped ("the rest floats off and away"); playtest knob (~60-110)
 // CS025 P3 added four SCOOP_MAGNET_* look-call constants here (stroke width / blur / nose-V width /
 // nose-V depth) for the magnet-pull scoop tell. CS025 P5 DELETED them with the tell itself — the
@@ -1550,6 +1578,33 @@ const AudioSys = {
     g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
     o.connect(g).connect(this.sfx);
     o.start(t); o.stop(t + 0.21);
+  },
+
+  // CS040 P3 (spec §1.4): a BANKED Health charge auto-spending itself on a hit. Deliberately unlike
+  // every other voice on this bus in two ways at once, because it has to be told apart from the two
+  // sounds nearest it in MEANING: powerup() (the pickup — triangle, two SEQUENTIAL notes, instant
+  // attack) and shieldPing() (the milestone spawn kept by FORK-CS040-A — one sine FALLING 1400->500).
+  //   1. It SWELLS in (setValueAtTime + a linear ramp UP) where every other voice here attacks at full
+  //      gain and only decays. That rise is the "the hull answered" reading.
+  //   2. It is a DYAD — two sines a fifth apart sounding together, both bending gently UP.
+  // The 0.12 s pre-delay is the other half of the tell: hit() fires on the very same frame, and a chime
+  // stacked exactly on that thud is masked by it. The offset lives INSIDE the method so the game side
+  // stays a plain call — no timer, no state, nothing for the damage path to carry.
+  bankspend() {
+    if (!this.ctx) return;
+    const t = this.now() + 0.12;
+    [[523, 587], [784, 880]].forEach(([f0, f1]) => { // C5->D5 under G5->A5: a fifth, both rising
+      const o = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      o.type = "sine";
+      o.frequency.setValueAtTime(f0, t);
+      o.frequency.linearRampToValueAtTime(f1, t + 0.22);
+      g.gain.setValueAtTime(0.0001, t);                  // an exponential ramp may not start FROM zero
+      g.gain.linearRampToValueAtTime(0.10, t + 0.09);    // ...the swell
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.34);
+      o.connect(g).connect(this.sfx);
+      o.start(t); o.stop(t + 0.35);
+    });
   },
 
   secretArm() { // CS015 P4: the debug secret code armed a capture window — 3 quick ASCENDING blips
@@ -3633,12 +3688,30 @@ function rootItems() { return game.state === "gameover" ? MENU_ROOT_OVER : MENU_
 // y+400 footer, and the panel needs no resize. Still ONE parent per screen (CS016 P2's IA): Credits'
 // one parent is Options. Safe positionally-blind for the same reason CS016 P2's shrink was — every
 // consumer resolves rows by LABEL via MENU_OPTIONS.indexOf(), re-verified by grep at this insert.
-const MENU_OPTIONS = ["Sound / Music", "Controls", "Difficulty", "Credits", "Back"];
+// CS040 P6 (spec §4.1): "Telemetry" inserted before "Back" the identical way, 5 rows -> 6 — its own
+// sub-screen (TELEMETRY_ROWS below), same one-parent-per-screen IA. Re-verified by grep: every
+// consumer still resolves MENU_OPTIONS rows by LABEL, no positional addressing anywhere.
+const MENU_OPTIONS = ["Sound / Music", "Controls", "Difficulty", "Credits", "Telemetry", "Back"];
 // CS010 P4 (§9): the Sound/Music sub-screen's rows, same template as DIFFICULTY_ROWS. CS010 P9 (§11c)
 // added the Voice Volume slider — SOUND_ROWS + VOL_LABELS + VOL_CATS grow together so the parallel
 // label→category lookup stays paired. CS011 P3 added "Voice" (style picker) + "Captions" (toggle),
 // both dispatched by label in menuSound/drawSound like the existing Music Track cycler.
 const SOUND_ROWS   = ["SFX Volume", "Music Volume", "Master Volume", "Voice Volume", "Voice", "Captions", "Music Track", "Back"];
+// CS040 P6 (spec §4.2): the Telemetry sub-screen's rows, same label-dispatch template as SOUND_ROWS.
+// "Capture" and "Sample rate" are ◄►-adjusted value rows over the existing DEBUG.telemetryCapture /
+// DEBUG.telemetryInterval knobs (applyDebug() is still the one write path — this screen is a more
+// convenient place to flip them, not a second store); "Copy log" is a plain action row calling the
+// existing copyTelemetry(), unchanged from the debug panel's own row.
+const TELEMETRY_ROWS = ["Capture", "Sample rate", "Copy log", "Back"];
+// The preset ring (spec §4.4). `def: 15` on the registry entry is untouched — a stock run still
+// reports `levers=none` — but the label is DERIVED from TELEMETRY_MAX, not hardcoded, so a future
+// change to the ring size (like P5's 400 -> 800) moves these minutes without a second edit here.
+const TELEMETRY_RATE_PRESETS = [5, 10, 15];
+const TELEMETRY_RATE_NAMES = { 5: "Detail", 10: "Balanced", 15: "Full run" };
+function telemetryRateLabel(iv) {
+  const mins = Math.round(TELEMETRY_MAX * iv / 60);
+  return iv + " s — " + (TELEMETRY_RATE_NAMES[iv] || "Custom") + " (" + mins + " min)";
+}
 const VOL_CATS     = ["sfx", "music", "master", "voice"]; // parallel to VOL_LABELS (NOT to any MENU_OPTIONS/SOUND_ROWS position)
 const VOL_LABELS   = ["SFX Volume", "Music Volume", "Master Volume", "Voice Volume"]; // the slider rows, by label
 const VOL_STEP     = 0.1;                         // per left/right nudge on a volume slider
@@ -4076,6 +4149,32 @@ const DEBUG_VARS = [
     def: 24, min: 0, max: 64, step: 1 },
   { id: "dockPowerupSpeed", label: "Dock powerup speed", unit: "px/s",
     def: 180, min: 40, max: 400, step: 10 },
+  // CS040 P2 (spec §1.3): the pity-driven ambient Health cadence's four playtest knobs, each `def`
+  // deriving from its shipped const (the standing idiom). Not a lever — Health cadence is a powerup
+  // pacing pity mechanism, not a difficulty ramp — so no floor/ceil/steps triple, no ▼/↳ glyph, no
+  // indent, no LEVERS entry, same reasoning as engineBurnSeconds above.
+  { id: "healthGapLowOk", label: "Health gap low (full hull)", unit: "s",
+    def: HEALTH_GAP_LOW_OK, min: 1, max: 60, step: 1 },
+  { id: "healthGapHighOk", label: "Health gap high (full hull)", unit: "s",
+    def: HEALTH_GAP_HIGH_OK, min: 1, max: 60, step: 1 },
+  { id: "healthGapLowHurt", label: "Health gap low (zero hull)", unit: "s",
+    def: HEALTH_GAP_LOW_HURT, min: 1, max: 60, step: 1 },
+  { id: "healthGapHighHurt", label: "Health gap high (zero hull)", unit: "s",
+    def: HEALTH_GAP_HIGH_HURT, min: 1, max: 60, step: 1 },
+  // CS040 P3 (spec §1.4): the health bank's cap, `def` deriving from HEALTH_BANK_MAX (the standing
+  // idiom). Not a lever, for the same reason the four rows above aren't — banking is health PACING,
+  // not a difficulty ramp. min 0 DISABLES banking outright (nothing ever banks, every leftover HP
+  // lands in game.stats.hpWasted instead, and the HUD pip row renders zero segments): the gate's
+  // clean A/B for the whole mechanic, the magnetPushKick-at-0 idiom.
+  { id: "healthBankMax", label: "Health bank charges", unit: "",
+    def: HEALTH_BANK_MAX, min: 0, max: 5, step: 1 },
+  // CS040 P4 (spec §2.2, FORK-CS040-C c1): the recycle hub's dry-weapon relief multiplier, `def`
+  // deriving from HUB_DRY_WEIGHT_MULT (the standing idiom). Not a lever — this is a supply-starvation
+  // escape hatch, not a difficulty ramp — so no floor/ceil/steps triple, no ▼/↳ glyph, no indent, no
+  // LEVERS entry, same reasoning as the healthGap rows above. min 1 disables the bias outright (every
+  // weight multiplies by 1, byte-identical to today's roll), the magnetPushKick-at-0 idiom.
+  { id: "hubDryWeightMult", label: "Hub dry-weapon weight x", unit: "",
+    def: HUB_DRY_WEIGHT_MULT, min: 1, max: 20, step: 1 },
   // CS018 P6: GLOBAL fields — not per-lever tiers. Frequency jitter (formerly this section's own
   // `freqJitter` knob, scaling every frequency-shaped lever — appearance + direction-change) is CS024
   // P2's to freeze at its shipped 25% default (FREQ_JITTER, at jitteredInterval()'s site) and remove
@@ -4150,10 +4249,11 @@ const DEBUG_VARS = [
   //   No shipped constant backs the default. "How often do we snapshot" has no meaning outside this
   // knob, so this entry IS the source of truth for it — the earlyWorldLevels idiom, not the
   // DEBRIS_BOUNCE_RESTITUTION one.
-  //   ⛔ min is 1, not 0. The buffer is a 400-row ring and the tick fires at most once per frame, so a
-  // sub-second interval would burn the whole ring inside seven seconds of play and the oldest rows —
-  // the ones a post-mortem wants — would be the first gone. Telemetry.tick() independently refuses a
-  // non-positive interval, so the guard and the bound agree rather than relying on each other.
+  //   ⛔ min is 1, not 0. The buffer is an 800-row ring (CS040 P5, was 400) and the tick fires at most
+  // once per frame, so a sub-second interval would burn the whole ring inside fourteen seconds of play
+  // and the oldest rows — the ones a post-mortem wants — would be the first gone. Telemetry.tick()
+  // independently refuses a non-positive interval, so the guard and the bound agree rather than
+  // relying on each other.
   { id: "telemetryInterval", label: "Telemetry snapshot interval", unit: "s",
     def: 15, min: 1, max: 120, step: 1 },
   // CS038 P3 (spec §3): telemetry capture is OPT-IN, off by default and off at every launch.
@@ -4221,6 +4321,17 @@ const DEBUG_VARS = [
 // "each knob" (the startup seed below, loadSettings' per-entry validation) goes through this — a header has
 // no `id`/`def`/`min`/`max`, so iterating DEBUG_VARS directly would seed `debugShown[undefined]`.
 const DEBUG_ENTRIES = DEBUG_VARS.filter(v => !v.header);
+// CS040 P6 (spec §4.5): the two telemetry knobs and the export action moved off this panel onto the
+// Options "Telemetry" sub-screen (menuTelemetry/drawTelemetryMenu). They STAY in DEBUG_VARS/DEBUG_ENTRIES
+// at their existing position — Telemetry.tick()/flush(), the CSV header fingerprint and the
+// sessionSwitch/save-exemption machinery all still read them there unchanged, and every OTHER entry's
+// DEBUG_VARS index must keep matching its DEBUG_ROWS index (dozens of phase-local tests navigate the
+// panel by that index). `TELEMETRY_PANEL_HIDDEN` rows are therefore marked `hidden: true` rather than
+// filtered out — still occupying their slot, but skipped by debugStep/debugFirstRow (unreachable by
+// ↑↓, same treatment a header gets) and skipped by drawDebug's render loop (no row drawn, no vertical
+// space spent) — invisible and inert, exactly "removed from the debug panel", with zero index drift
+// for every entry after them.
+const TELEMETRY_PANEL_HIDDEN = ["telemetryInterval", "telemetryCapture"];
 // CS018 P2: the panel's ROW MODEL, derived from the registry — never a hardcoded count or offset. Each
 // registry entry becomes one row (a header row or a value row carrying its entry), and the two trailing rows
 // (the CS017 P2 "Dump difficulty log" action and Back) are APPENDED HERE rather than special-cased in the
@@ -4228,7 +4339,8 @@ const DEBUG_ENTRIES = DEBUG_VARS.filter(v => !v.header);
 // everything else, and both menuDebug and drawDebug read row `kind` instead of comparing against
 // DEBUG_VARS.length. `game.menu.index` indexes THIS array, not DEBUG_VARS.
 const DEBUG_ROWS = [
-  ...DEBUG_VARS.map(v => v.header ? { kind: "header", label: v.header } : { kind: "var", label: v.label, e: v }),
+  ...DEBUG_VARS.map(v => v.header ? { kind: "header", label: v.header }
+    : { kind: "var", label: v.label, e: v, hidden: TELEMETRY_PANEL_HIDDEN.includes(v.id) }),
   { kind: "action", label: "Dump difficulty log" },
   // CS024 P6e (spec §2/§4): two more action rows, same kind as Dump — no value, no chevrons, fired by
   // the normal confirm input, dispatched by label in menuDebug's existing action branch.
@@ -4241,11 +4353,9 @@ const DEBUG_ROWS = [
   // erase rows above do.
   { kind: "action", label: "Run benchmark battery" },
   { kind: "action", label: "Copy benchmark results" },
-  // CS037 P4 (spec §5.3): the telemetry export, appended the same way and dispatched by LABEL in
-  // menuDebug. ⛔ THE EXPORT LIVES HERE AND NOWHERE ELSE — never in Options. Not destructive (it
-  // copies, and does not clear the buffer the way "Dump difficulty log" clears DiffLog), so it does
-  // not go through openModal.
-  { kind: "action", label: "Copy telemetry log" },
+  // CS037 P4 (spec §5.3) added "Copy telemetry log" here, appended the same way. CS040 P6 (spec §4.5)
+  // REMOVES it — Options' "Telemetry" sub-screen is the row's only home now (menuTelemetry's "Copy
+  // log"), and copyTelemetry() itself is untouched: only the control surface moved, never the export.
   { kind: "back",   label: "Back" },
 ];
 // CS018 P2: the panel's transient VIEW state — the scroll window's top row and the pending numeric-entry
@@ -5023,7 +5133,18 @@ function dumpDifficultyLog() {
 // loop() never calls update() while the battery runs, so a real frame cannot reach this during one;
 // the guard is written explicitly rather than left implicit because update(dt) is the one function
 // CLAUDE.md's Test rules say headless tests drive directly, bypassing loop().
-const TELEMETRY_MAX = 400;      // per-run ring; oldest rolls off (spec §5.3)
+const TELEMETRY_MAX = 800;      // per-run ring; oldest rolls off (spec §5.3)
+// CS040 P5 (FORK-CS040-D): 400 -> 800. The 2026-08-26 capture overran the 400-row ring and lost its
+// first 21.5 minutes and waves 1-7 SILENTLY — noticing it took arithmetic on t[0]. Coverage is now
+// 67 min at a 5 s interval, 133 at 10 s, 200 at 15 s. The wrap is no longer silent either: the ring
+// latches `wrapped` on the first dropped row and the export reports it as `# ringWrapped=`.
+// ⛔ THE RING DOUBLING AND THE PERSIST CADENCE ARE ONE CHANGE, NOT TWO. Doubling the ring alone
+// doubles the JSON.stringify payload on EVERY snapshot — an untested surface (CS037's benchmark
+// measured update and draw, not this). One write per four snapshots of a doubled payload is HALF the
+// pre-CS040 write volume per unit of game time, at a risk of losing at most three rows to a hard
+// crash. Undoing either half alone gets the arithmetic wrong in the other direction.
+// ⛔ The game-over flush persists REGARDLESS of where the counter stands — see Telemetry.flush().
+const TELEMETRY_PERSIST_EVERY = 4;
 // ⛔ ONE SOURCE OF TRUTH for the row shape AND the CSV column order, exactly as DIFFLOG_FIELDS is.
 // SIX "remaining uses" columns, not seven, and that asymmetry is spec C10 rather than an omission:
 // powerBudget holds five (rapid/triple/magnet/engine/guard), scoop is a persistent LEVEL on
@@ -5037,27 +5158,42 @@ const TELEMETRY_FIELDS = [
   "dmgHunter3", "dmgHunter2", "dmgHunter1",
   "dmgUfoBodyLarge", "dmgUfoBodySmall", "dmgUfoShotLarge", "dmgUfoShotSmall",
   "chainLen", "cargoMax",
+  "hunterCount", "debrisCount", "garbageCount", "healthBanked",
   "delivered", "deliveryScore", "cargoDamageEvents", "cargoSevers",
   "debrisKills", "hunterKills", "saucerKills", "hunterCoalesced",
-  "deflects", "hitsTaken",
-  "scoreRepairBonus", "scoreScoopBonus",
+  "deflects", "hitsTaken", "hpWasted",
+  "scoreScoopBonus", "scoopHits",
   "debugRun", "resumedRun",
 ];
-// CS039 P2: thirteen columns added above, ahead of the two trailing flags; GATE T added a fourteenth
-// (`cargoSevers`). THREE kinds, not two, and the names do not tell you which:
-//   INSTANTANEOUS — `chainLen`/`cargoMax`, state at the sample instant (like hp/speed), the DiffLog
-//     expressions verbatim.
+// CS039 P2 added thirteen columns ahead of the two trailing flags and GATE T a fourteenth
+// (`cargoSevers`); CS040 P5 retired `scoreRepairBonus` and added six more, for 49.
+// THREE kinds, not two, and the names do not tell you which:
+//   INSTANTANEOUS — `chainLen`/`cargoMax` (the DiffLog expressions verbatim) and CS040 P5's
+//     `hunterCount`/`debrisCount`/`garbageCount`/`healthBanked`: state at the sample instant, like
+//     hp/speed. ⛔ THE THREE POPULATION COLUMNS CARRY THE BUILD'S OWN INVERTED VOCABULARY ON PURPOSE
+//     (CLAUDE.md's table): `game.debris` holds GARBAGE SATELLITES — the enemies you shoot — and
+//     `game.garbage` holds towable DEBRIS, the salvage you tow. So `debrisCount` counts Garbage
+//     Satellites, matching `debrisKills` and the `dmgDebris*` family above, and `garbageCount` counts
+//     towable Debris. Renaming either to "fix" it would put this column list at odds with every other
+//     column in it.
 //   CUMULATIVE — every other column here, a per-run counter (like the *Picked/dmgFrom* families
-//     above), monotone non-decreasing within a run.
-//   ⛔ NEITHER — `cargoDamageEvents` ALONE. It is a SAWTOOTH and it DECREASES. It is the chain-guard
-//     drop-weight PITY counter, zeroed in dropPowerup() the instant a guard is SELECTED to drop
-//     (CS035 P6 / FORK-T — not on pickup, so it can reset with no matching guardPicked increment).
-//     It counts severs SINCE THE LAST GUARD DROP, never the run. Do not "restore" it to the
-//     cumulative group: it was described as cumulative here, in the P2 spec, in test-cs039-p2's
-//     §F and in TELEMETRY-ANALYSIS-GUIDE.md §3 for the whole of CS039, and the first real capture
-//     (GATE T) showed 7 decreases in 53 rows with the LAST ROW READING 0.
-//     `cargoSevers` is the run total, incremented on the same line the pity counter is, and is the
-//     column an analysis should read. Both are emitted: guardDropWeight() needs the pity value.
+//     above), monotone non-decreasing within a run. CS040 P5's `hpWasted` joins this group: healing
+//     thrown away at the hull cap with the bank ALSO full.
+//   ⛔ NEITHER — `cargoDamageEvents` AND `scoopHits`. BOTH ARE SAWTOOTHS AND BOTH DECREASE. Any
+//     monotonicity check must exclude the two BY NAME.
+//     · `cargoDamageEvents` is the chain-guard drop-weight PITY counter, zeroed in dropPowerup() the
+//       instant a guard is SELECTED to drop (CS035 P6 / FORK-T — not on pickup, so it can reset with
+//       no matching guardPicked increment). It counts severs SINCE THE LAST GUARD DROP, never the
+//       run. Do not "restore" it to the cumulative group: it was described as cumulative here, in the
+//       P2 spec, in test-cs039-p2's §F and in TELEMETRY-ANALYSIS-GUIDE.md §3 for the whole of CS039,
+//       and the first real capture (GATE T) showed 7 decreases in 53 rows with the LAST ROW READING 0.
+//       `cargoSevers` is the run total, incremented on the same line the pity counter is, and is the
+//       column an analysis should read. Both are emitted: guardDropWeight() needs the pity value.
+//     · `scoopHits` (CS040 P5, spec §3.3) is the SECOND one, and it is here because of the first.
+//       damageShip() zeroes it every time a scoop LEVEL IS ACTUALLY LOST, so it counts non-lethal
+//       hits SINCE THE LAST LEVEL LOSS, not the run — the same shape as the pity counter above, from
+//       a different mechanism. There is no cumulative twin: nothing in the build counts scoop hits
+//       across a run, and none was added to serve this column.
 // ⛔ A NEW KEY, additive, owned by CS037 P4. Nothing below reads, writes, renames or version-bumps any
 // of the five existing keys — afd_settings_v1, afd_achievements_v2, afd_scores_v1, afd_profiles_v1,
 // afd_saves_v1 are untouched by this whole section (spec §5.6).
@@ -5068,15 +5204,25 @@ const TELEMETRY_FIELDS = [
 // rather than throwing or partially trusting a bad blob. LAZY like SaveSlots: nothing reads it at boot.
 // ⛔ IT FAILS SILENTLY, and that is the one place it deliberately differs from SaveSlots.write()'s
 // boolean return. That exception exists because Save is a player-initiated act with an expectation of
-// success (CS032 §4.4); this is a background write every 15 s that nobody is watching, so a quota or
-// privacy-mode failure must cost the run nothing.
+// success (CS032 §4.4); this is a background write every fourth snapshot that nobody is watching, so
+// a quota or privacy-mode failure must cost the run nothing.
 const TELEMETRY_KEY = "afd_telemetry_v1";
 const Telemetry = {
   rows: [],
   acc: 0,     // game-time seconds accrued since the last snapshot
   msg: "",    // the export's ONE visible channel — drawDebug draws it in the panel's footer band
+  // CS040 P5 (spec §3.6/§3.7). Three per-run pieces of state, all cleared by reset() with the rows:
+  //   wrapped       — latched the first time the ring drops a row. The export's `# ringWrapped=` line.
+  //   endFlushed    — latched by flush(), so the export can say whether the LAST ROW IS THE DEATH.
+  //   sincePersist  — snapshots since the last write(), for the every-fourth cadence (FORK-CS040-D).
+  // ⛔ ALL THREE RESET WITH THE BUFFER. A stale `wrapped` would claim a fresh run had already eaten
+  // its own opening minutes, and a stale `sincePersist` would put the first write of a new run
+  // somewhere between one and four snapshots in.
+  wrapped: false,
+  endFlushed: false,
+  sincePersist: 0,
 
-  reset() { this.rows = []; this.acc = 0; },
+  reset() { this.rows = []; this.acc = 0; this.wrapped = false; this.endFlushed = false; this.sincePersist = 0; },
 
   // Once per playing frame, from update()'s cleanup block. `acc -= iv` rather than `acc = 0` so the
   // cadence cannot drift: dt is clamped to 0.05 s and the knob's min is 1 s, so one subtraction
@@ -5100,10 +5246,31 @@ const Telemetry = {
     this.push();
   },
 
+  // CS040 P5 (spec §3.5) — THE GAME-OVER FLUSH. Both CS039 captures ended up to one whole interval
+  // short of the run they were recording, with the killing blow — the single most interesting frame in
+  // the log — never sampled. killShip() calls this on the frame it sets game.stats.gameEnded, so the
+  // last row of a completed run IS the death.
+  // ⛔ acc IS ZEROED, NOT DECREMENTED, AND THAT IS THE ANTI-DOUBLE-PUSH. killShip() runs in the
+  // collision pass; Telemetry.tick() runs later in the SAME frame's cleanup block and would push a
+  // second, near-identical row if acc had already crossed the interval. Zeroed, tick()'s next
+  // `acc += dt` lands at most 0.05 s — far under the knob's 1 s minimum — so the flush is the frame's
+  // only row.
+  // ⛔ IT ALWAYS PERSISTS, wherever the every-fourth counter stands. This is precisely the row that
+  // cannot be left to a later snapshot which, the run being over, will never come.
+  // The gates are tick()'s own two minus the interval: capture off means no row here either, so an
+  // off session still leaves afd_telemetry_v1 untouched (CS038 P3's contract, unchanged).
+  flush() {
+    if (Bench.running) return;
+    if (!DEBUG.telemetryCapture) return;
+    this.endFlushed = true;
+    this.push(true);
+    this.acc = 0;
+  },
+
   // ⛔ Math.hypot is CORRECT here and is not a wrap-aware-helper miss. The wrap-aware rule covers
   // world-space distance, aiming and link math between two POSITIONS; this is the magnitude of one
   // velocity vector, which has no seam to cross (spec §5.2 names this expression).
-  push() {
+  push(persistNow = false) {
     const s = game.stats, b = game.powerBudget, sh = game.ship;
     this.rows.push({
       t: s.gameTime, level: game.wave, score: game.score,
@@ -5120,6 +5287,14 @@ const Telemetry = {
       chainLen: game.chain.length,        // the DiffLog expression, verbatim
       cargoMax: game.cargoMax,            // the live runtime cap, NOT payloadSlots(game.wave)
                                            // recomputed — the two must never be two sources of truth
+      // CS040 P5 (spec §3.1): three live populations and the health reserve, all instantaneous, all
+      // sampled on the post-cull seam tick() already stands on. ⛔ INVERTED VOCABULARY, DELIBERATELY:
+      // debrisCount counts GARBAGE SATELLITES (game.debris) and garbageCount counts towable DEBRIS
+      // (game.garbage) — see the kinds block above TELEMETRY_KEY and CLAUDE.md's table.
+      hunterCount: game.hunters.length,
+      debrisCount: game.debris.length,
+      garbageCount: game.garbage.length,
+      healthBanked: game.healthBank,
       delivered: s.delivered,
       deliveryScore: s.deliveryScore,
       cargoDamageEvents: s.cargoDamageEvents,  // ⛔ SAWTOOTH — pity counter, resets on a guard DROP
@@ -5130,40 +5305,66 @@ const Telemetry = {
       hunterCoalesced: s.hunterCoalesced,
       deflects: s.deflects,
       hitsTaken: s.hitsTaken,
-      scoreRepairBonus: s.scoreRepairBonus,
+      hpWasted: s.hpWasted,               // CS040 P3's counter: healing discarded with the bank ALSO full
       scoreScoopBonus: s.scoreScoopBonus,
+      // ⛔ A SAWTOOTH, the second in this row — damageShip() zeroes it on every scoop LEVEL LOSS, so it
+      // reads "hits since the last loss", never the run. Read the kinds block above TELEMETRY_KEY
+      // before treating it as a counter. (CS040 P1's scoreRepairBonus column stood between these two
+      // and is GONE: P1 deleted the counter, P5 dropped the column, and nothing emits a stand-in.)
+      scoopHits: game.scoopHits,
       debugRun: game.debugRun, resumedRun: game.resumedRun,
     });
-    while (this.rows.length > TELEMETRY_MAX) this.rows.shift();   // drop oldest, keep the cap
-    this.write();   // ⛔ every snapshot, so a crash loses at most one interval (spec §5.6)
+    // CS040 P5: the wrap latch is set HERE, at the one place a row is actually dropped, so
+    // `# ringWrapped=` can never report a complete log for a ring that quietly ate its opening minutes.
+    while (this.rows.length > TELEMETRY_MAX) { this.rows.shift(); this.wrapped = true; }
+    // FORK-CS040-D: one write per TELEMETRY_PERSIST_EVERY snapshots rather than one per snapshot, so a
+    // crash costs at most three rows. `persistNow` is the game-over flush overriding the counter — and
+    // it resets the counter too, because the buffer genuinely HAS just been persisted.
+    // ⛔ The increment is unconditional (it is the left operand, always evaluated) — a forced write
+    // must not also leave the ordinary cadence a snapshot short.
+    if (++this.sincePersist >= TELEMETRY_PERSIST_EVERY || persistNow) { this.sincePersist = 0; this.write(); }
   },
 
-  // ⛔ THE ENVELOPE IS v:3, AND THE P2 SPEC'S "REUSE v2, ONE SHAPE PER CHANGESET" ⛔ WAS DELIBERATELY
-  // OVERRIDDEN AT GATE T (Paul's call; DECISIONS.md). Do not "restore" v:2 on the strength of that
-  // line — it was written before anyone knew a column would be needed after P3 shipped, and the two
-  // rules it sits between point opposite ways. P2 bumped v1 -> v2 for ONE stated reason: a stale blob
-  // missing the new keys makes telemetryCSV emit the literal string "undefined", and "silently
-  // dropping a stale run beats exporting a corrupt one." A 14th column under a reused v:2 recreates
-  // exactly that, against a v:2 blob that by then existed in the wild (GATE T's own capture). The
-  // reason won over the letter. ⛔ THE KEY NAME STILL DOES NOT CHANGE — it stays afd_telemetry_v1;
-  // the `_v1` in the key and the `v:` in the envelope are different things (P2 §3, still binding).
-  read() {
-    const ls = storageOK(); if (!ls) return [];
+  // ⛔ THE ENVELOPE IS v:4 — CS040 P5 CHANGED THE ROW SHAPE, SO THE ENVELOPE MOVED WITH IT. That is
+  // the standing rule (CLAUDE.md, Telemetry): a row-shape change bumps the envelope's `v`, NEVER the
+  // storage key name. It stays afd_telemetry_v1; the `_v1` in the key and the `v:` in the envelope are
+  // different things (P2 §3, still binding). A v:3 blob has scoreRepairBonus and none of P5's six new
+  // keys, so accepting one would export the literal string "undefined" in six columns — exactly the
+  // failure P2 bumped v1 -> v2 to prevent and GATE T bumped v2 -> v3 to prevent again. Silently
+  // dropping a stale run beats exporting a corrupt one, every time this has come up.
+  //   (History, so v:2 is not "restored" on the strength of a line still in the P2 spec: that spec's
+  // "reuse v2, one shape per changeset" was deliberately overridden at GATE T — Paul's call,
+  // DECISIONS.md — for this same reason, and P5 is the third time the reason has won over the letter.)
+  // ⛔ CS040 P5 also puts `wrapped` and `endFlushed` in the envelope, and they are NOT decoration.
+  // telemetryHeaderLines() reports both, and a "storage" export — the morning after a capture, live
+  // buffer empty — has no other way to know them. Reading the live latches there would print
+  // `ringWrapped=false` over a run that wrapped, which is the single failure mode the line exists to
+  // kill. Both are read back defensively (`!!`), so a hand-edited or partial blob degrades to false.
+  //   readEnvelope() is the whole-blob face and read() is its rows-only one, so the validation lives
+  // in exactly one place and the two can never drift.
+  readEnvelope() {
+    const nil = () => ({ rows: [], wrapped: false, endFlushed: false });
+    const ls = storageOK(); if (!ls) return nil();
     try {
       const raw = ls.getItem(Profiles.keyFor(TELEMETRY_KEY));
-      if (!raw) return [];
+      if (!raw) return nil();
       const data = JSON.parse(raw);
-      if (!data || data.v !== 3 || !Array.isArray(data.rows)) return [];
-      return data.rows.slice();
-    } catch (e) { return []; }   // corrupt / unreadable — an empty buffer, never a throw
+      if (!data || data.v !== 4 || !Array.isArray(data.rows)) return nil();
+      return { rows: data.rows.slice(), wrapped: !!data.wrapped, endFlushed: !!data.endFlushed };
+    } catch (e) { return nil(); }   // corrupt / unreadable — an empty buffer, never a throw
   },
+  read() { return this.readEnvelope().rows; },
   write() {
     const ls = storageOK(); if (!ls) return;
-    try { ls.setItem(Profiles.keyFor(TELEMETRY_KEY), JSON.stringify({ v: 3, rows: this.rows })); }
-    catch (e) { /* quota / privacy mode / disabled — a background write, silent by design */ }
+    try {
+      ls.setItem(Profiles.keyFor(TELEMETRY_KEY), JSON.stringify({
+        v: 4, rows: this.rows, wrapped: this.wrapped, endFlushed: this.endFlushed,
+      }));
+    } catch (e) { /* quota / privacy mode / disabled — a background write, silent by design */ }
   },
 };
-// CS039 P3 (spec §1, FORK-D/E/F) — THE LEVER FINGERPRINT. Seven `#` lines above the CSV header, so
+// CS039 P3 (spec §1, FORK-D/E/F) — THE LEVER FINGERPRINT. `#` lines above the CSV header (seven at
+// P3, nine since CS040 P5's ringWrapped/finalRowIsGameOver pair), so
 // two logs can be told apart without asking what the debug panel looked like when each was captured.
 //
 // ⛔ THE CARRIER IS `#` COMMENT LINES, AND THAT IS THE WHOLE COMPATIBILITY STORY (FORK-D). pandas
@@ -5191,6 +5392,12 @@ function telemetryHeaderLines(rows, from) {
   // already forgave, so a knob that genuinely IS different does not print as 0.35000000000000003.
   const fmt = v => String(Math.round(v * 1e6) / 1e6);
   const on = overridesOn();
+  // CS040 P5 (spec §3.6): the two new lines describe THE BUFFER THE ROWS CAME FROM, not this session.
+  // telemetryExportRows() resolves `from` to "storage" exactly when the live ring is empty and the
+  // persisted one is not — the morning after a capture — and the live latches are both false then, so
+  // reading them would report a wrapped, death-terminated run as neither. The envelope carries both
+  // for that case; the live module IS the meta object for its own rows.
+  const meta = from === "storage" ? Telemetry.readEnvelope() : Telemetry;
   const changed = [];
   for (const e of DEBUG_ENTRIES) {
     // The master toggle gets its own `overrides=` line and is skipped HERE on purpose: resolved
@@ -5209,11 +5416,20 @@ function telemetryHeaderLines(rows, from) {
     if (!(d <= 1e-9 * Math.max(1, Math.abs(def)))) changed.push(e.id + "=" + fmt(live));
   }
   return [
-    "# orbital-overhaul telemetry v3",                    // the envelope's own `v`, not a second version
+    "# orbital-overhaul telemetry v4",                    // the envelope's own `v`, not a second version
     "# build=" + GAME_VERSION,
     "# overrides=" + (on ? "ON" : "OFF"),
     "# telemetryInterval=" + DEBUG.telemetryInterval,     // the RESOLVED value tick() reads, not debugShown
     "# rows=" + rows.length,
+    // ⛔ ringWrapped true means THE OPENING OF THE RUN IS MISSING and every "since the start" reading
+    // below is wrong. The 2026-08-26 capture wrapped and lost its first 21.5 minutes and waves 1-7 in
+    // silence; noticing it took arithmetic on t[0]. One boolean removes the format's most misleading
+    // failure mode, so it goes ABOVE source=, where it cannot be skimmed past.
+    "# ringWrapped=" + (meta.wrapped ? "true" : "false"),
+    // ...and its counterpart at the other end: is the last row the death, or does the log stop up to
+    // one interval short of it? Marked HERE and never as a column (spec §3.5) — a per-run fact does
+    // not belong repeated 800 times.
+    "# finalRowIsGameOver=" + (meta.endFlushed ? "true" : "false"),
     "# source=" + from,
     "# levers=" + (changed.length ? changed.join(" ") : "none"),
   ];
@@ -5258,16 +5474,17 @@ function telemetryDownload(text, why) {
     AudioSys.ui(false);
   }
 }
-// "Copy telemetry log" — the debug panel's action row. ⛔ THE EXPORT LIVES HERE AND NOWHERE ELSE, never
-// in Options (spec §5.3). It shares benchCopyResults()'s failure contract for the same reason that one
-// has it: navigator.clipboard is absent on file:// in several browsers and rejects without a user
-// gesture in others, so BOTH paths fall through to a Blob download and every outcome — copied,
-// downloaded, or neither — is stated in Telemetry.msg. A copy that quietly did nothing is
-// indistinguishable from one that worked.
+// "Copy log" — CS037 P4 put this on the debug panel's action row; CS040 P6 (spec §4.2/§4.5) moved the
+// CONTROL to Options' "Telemetry" sub-screen and removed the panel row. The function itself is
+// untouched: it shares benchCopyResults()'s failure contract for the same reason that one has it —
+// navigator.clipboard is absent on file:// in several browsers and rejects without a user gesture in
+// others, so BOTH paths fall through to a Blob download and every outcome — copied, downloaded, or
+// neither — is stated in Telemetry.msg. A copy that quietly did nothing is indistinguishable from one
+// that worked.
 //
-// ⛔ REACHABLE AT GAME OVER. The buffer is per-run and resetRun() clears it, so a finished run's data
-// is only exportable between the death and the next start — which is exactly why the secret code's
-// gate now admits a PAUSED GAMEOVER screen alongside a paused live game (see the keydown listener).
+// Reachable at game over too, same as any other Options row (Options' pause-menu entry point already
+// admits a paused gameover screen) — the buffer is per-run and resetRun() clears it, so a finished
+// run's data is only exportable between the death and the next start.
 function copyTelemetry() {
   const src = telemetryExportRows();
   if (!src.rows.length) {
@@ -5517,6 +5734,7 @@ function menuInput(action) {
     case "profiles":     menuProfiles(action); break;   // CS031 P4: the roster screen
     case "slots":        menuSlots(action); break;      // CS032 P3: the save/load slots screen
     case "credits":      menuCredits(action); break;    // CS038 P1: the Credits screen
+    case "telemetry":    menuTelemetry(action); break;  // CS040 P6: the Telemetry sub-screen
     case "debug":        menuDebug(action); break;   // CS015 P4: hidden, secret-code-only
   }
 }
@@ -5623,6 +5841,7 @@ function menuOptions(a) {
     // gotoScreen — row 0 of CREDITS_ROWS is a heading, so gotoScreen's `index = 0` is not a valid
     // cursor here and the first selectable row is applied after it (enterDebug()'s idiom exactly).
     else if (label === "Credits") openCredits();
+    else if (label === "Telemetry") gotoScreen("telemetry"); // CS040 P6 (spec §4.1)
     // CS012 P4 / CS013 P1: Back is context-aware — paused mid-game OR gameover (both have a root)
     // return to it (cursor on Options). CS016 P2: from the title the `else` no longer closes the
     // overlay entirely — the title has a menu of its own to return to, with game.paused cleared.
@@ -5865,13 +6084,44 @@ function menuCredits(a) {
   else if (a === "pause") closePause();
 }
 
+// CS040 P6 (spec §4): the Telemetry sub-screen — moved off the debug panel so capture is reachable
+// without the secret code. Follows the menuSound/menuOptions label-dispatch template exactly.
+// "Capture" and "Sample rate" write through applyDebug(), the SAME path the (now-removed) debug-panel
+// rows used — this screen is a more convenient control surface, not a second store. §4.3: Capture
+// stays session-only because DEBUG.telemetryCapture is a `sessionSwitch` registry entry — that
+// exemption (never persisted, never revived by a reload) lives at the registry, untouched here.
+function menuTelemetry(a) {
+  const m = game.menu, N = TELEMETRY_ROWS.length, label = TELEMETRY_ROWS[m.index];
+  if (a === "up")   { m.index = (m.index + N - 1) % N; AudioSys.ui(false); }
+  else if (a === "down") { m.index = (m.index + 1) % N; AudioSys.ui(false); }
+  else if (a === "left" || a === "right") {
+    if (label === "Capture") {
+      applyDebug("telemetryCapture", DEBUG.telemetryCapture ? 0 : 1);
+      saveSettings();
+      AudioSys.ui(false);
+    } else if (label === "Sample rate") {
+      const vals = TELEMETRY_RATE_PRESETS, n = vals.length;
+      const idx = Math.max(0, vals.indexOf(DEBUG.telemetryInterval));
+      applyDebug("telemetryInterval", vals[(idx + (a === "right" ? 1 : -1) + n) % n]);
+      saveSettings();
+      AudioSys.ui(false);
+    }
+  }
+  else if (a === "confirm") {
+    if (label === "Copy log") copyTelemetry();
+    else if (label === "Back") gotoScreen("options", MENU_OPTIONS.indexOf("Telemetry"));
+  }
+  else if (a === "back") gotoScreen("options", MENU_OPTIONS.indexOf("Telemetry"));
+  else if (a === "pause") closePause();
+}
+
 // --- CS018 P2: the debug panel's row model, scroll window and direct numeric entry ---
 // Every index below is DERIVED from DEBUG_ROWS (which is itself derived from the registry). There is no
 // literal row count, no "dumpRow = N" offset and no assumption that m.index maps onto DEBUG_VARS — that
 // mapping is exactly what section headers break, and it is what CS015 P5's "derive the index" lesson was
 // about in the first place. The registry can grow to 32 entries with headers interleaved and none of this
 // needs an edit.
-function debugFirstRow() { return DEBUG_ROWS.findIndex(r => r.kind !== "header"); }
+function debugFirstRow() { return DEBUG_ROWS.findIndex(r => r.kind !== "header" && !r.hidden); }
 // The registry entry under the cursor, or null when the cursor is on a header / Dump / Back. The one place
 // "is a value row selected?" is answered — the keydown numeric-entry gate, the ◄► step and the renderer all
 // ask through it.
@@ -5879,14 +6129,16 @@ function debugSelectedVar() {
   const r = DEBUG_ROWS[game.menu.index];
   return r && r.kind === "var" ? r.e : null;
 }
-// The next SELECTABLE row in `dir`, wrapping. Headers are skipped entirely (FLAG-j) so one can never become
-// the selection — including on the wrap from the last row back to the first, and vice versa. Walks at most
-// one full lap, so an all-headers registry (impossible: Dump and Back are always appended) returns `from`.
+// The next SELECTABLE row in `dir`, wrapping. Headers are skipped entirely (FLAG-j), and so — CS040 P6 —
+// are `hidden` rows (spec §4.5's telemetryInterval/telemetryCapture): unreachable by ↑↓, same treatment
+// a header gets, so a cursor can never land on a knob this screen no longer shows. Walks at most one
+// full lap, so an all-skipped registry (impossible: Dump and Back are always appended and never hidden)
+// returns `from`.
 function debugStep(from, dir) {
   const n = DEBUG_ROWS.length;
   for (let k = 1; k <= n; k++) {
     const i = ((from + dir * k) % n + n) % n;
-    if (DEBUG_ROWS[i].kind !== "header") return i;
+    if (DEBUG_ROWS[i].kind !== "header" && !DEBUG_ROWS[i].hidden) return i;
   }
   return from;
 }
@@ -6000,9 +6252,6 @@ function menuDebug(a) {
       // the keydown listener both hand it the frame and the keyboard while Bench.running.
       else if (r.label === "Run benchmark battery") Bench.start();
       else if (r.label === "Copy benchmark results") benchCopyResults();
-      // CS037 P4: the telemetry export. Reachable at gameover through the same panel (see the keydown
-      // listener's secret-code gate), which is the whole point — resetRun() clears the buffer.
-      else if (r.label === "Copy telemetry log") copyTelemetry();
     }
     else if (r && r.kind === "back") debugReturn();
   }
@@ -8518,8 +8767,18 @@ function resetGameStats() {
     hitsTaken: 0,            // non-lethal hits that actually deducted HP — same population, same site, as the
                              // dmgFrom* attribution switch, so "mean damage per hit" derived offline is coherent.
     deliveryScore: 0,        // points earned at the recycle dock this run
-    scoreRepairBonus: 0,     // cumulative REPAIR_FULL_BONUS awarded (full-HP milestone cash-in)
+    // CS040 P1 (spec §1.2): scoreRepairBonus STOOD HERE and is DELETED along with the mechanism that
+    // fed it — the full-HP milestone no longer pays, so the counter could only ever read 0. A save
+    // written before CS040 still carries the key; it orphans harmlessly under the known-value-else-
+    // default rule, which is exactly why removing a field needs no migration shim.
     scoreScoopBonus: 0,      // cumulative SCOOP_MAX_BONUS awarded (max-level scoop pickup cash-in)
+    // CS040 P3 (spec §1.4): HP from a Health pickup that landed with the hull full AND the bank
+    // already at its cap — healing that arrived at the WRONG TIME, which is a different complaint
+    // from healing that was never offered, and telling those two apart is the whole reason this
+    // counter exists. Cumulative for the run, integer HP, incremented at exactly ONE site
+    // (applyPowerup's health arm). Nothing reads it this phase: its consumer is P5's telemetry
+    // column (FLAG-CS040-a), which is how HEALTH_BANK_MAX eventually gets tuned.
+    hpWasted: 0,
     gameEnded: false         // set at game over so end-of-game achievements can evaluate
   };
 }
@@ -8577,6 +8836,11 @@ const game = {
   scoopLevel: 0,                                       // PERSISTENT scoop upgrade level 0..SCOOP_MAX_LEVEL (v3.3 P3; NOT a budgeted effect)
   scoopHits: 0,                                        // running non-lethal-hit tally; every SCOOP_HITS_PER_LEVEL costs a level
   healthTimer: 0,                                      // countdown to the next ambient Health spawn
+  healthBank: 0,                                       // CS040 P3: WHOLE spare Health charges held, 0..DEBUG.healthBankMax,
+                                                        // each worth POWERUP_HEALTH_AMOUNT. Banked at a pickup the hull has no
+                                                        // room for; spent one-per-hit in damageShip(). Declared in BOTH this
+                                                        // literal and resetRun() per the standing CS016 P3 rule — a field that
+                                                        // lands in only one of the two is `undefined` for a whole run.
   sweepPause: 0,                                       // CS018 P9: sec of Super-Mega-Delivery coalescence
                                                         // pause remaining (0 = coalescence live). Set by
                                                         // superMegaDelivery(), ticked+consumed at the
@@ -8877,6 +9141,7 @@ function buildSaveEntry() {
     nextRepair: game.nextRepair,
     scoopLevel: game.scoopLevel,
     scoopHits: game.scoopHits,
+    healthBank: game.healthBank,   // CS040 P3: ADDITIVE — a new key in the existing envelope, no schema bump
     powerBudget: { ...game.powerBudget },
     stats: { ...game.stats, powerUsed: { ...game.stats.powerUsed } },
     debugRun: game.debugRun,
@@ -8977,7 +9242,8 @@ function resetRun(wave, debugRun) {
                                    // the field must exist in both places (the CS016 P3 rule), and carrying a
                                    // stale `true` out of a previous run would swallow the first fill's kick.
   game.scoopLevel = 0; game.scoopHits = 0;               // persistent scoop upgrade resets each run (v3.3 P3)
-  game.healthTimer = rand(POWERUP_HEALTH_GAP[0], POWERUP_HEALTH_GAP[1]);
+  game.healthBank = 0;             // CS040 P3: the spare-charge reserve is PER-RUN — a fresh run starts empty
+  game.healthTimer = healthGapRoll();
   game.sweepPause = 0;             // CS018 P9: no sweep coalescence-pause carries into a fresh run
   game.cargoMax = CARGO_BASE;      // pre-level-1 default; nextWave() below immediately overwrites it via payloadSlots(game.wave) (8 at level 1) — CS018 P5
   game.cargoFlash = 0;             // CS009 P3: no cap-up flash carries into a fresh run
@@ -9082,6 +9348,13 @@ function resumeFromSave(entry) {
   game.nextRepair = num(e.nextRepair, game.nextRepair);
   game.scoopLevel = num(e.scoopLevel, game.scoopLevel);
   game.scoopHits  = num(e.scoopHits, game.scoopHits);
+  // CS040 P3 (spec §1.4): additive state, restored through the same known-value-else-default num()
+  // idiom as its neighbours. Clamped against the LIVE cap (DEBUG.healthBankMax — the same expression
+  // applyPowerup() and the HUD read) rather than the HEALTH_BANK_MAX const, so a slot saved with the
+  // knob raised can never resume holding more charges than the HUD has pips to show. A save written
+  // before this field existed carries no key at all: num() falls through to the 0 resetRun() just
+  // set, which is exactly right — no migration shim, which is the whole point of that rule.
+  game.healthBank = Math.max(0, Math.min(DEBUG.healthBankMax, num(e.healthBank, game.healthBank)));
   // HP is set on the Ship resetRun() just constructed. Clamped into [1, SHIP_MAX_HP]: a slot is only
   // ever written mid-play so a real one is always in range, but a value outside it would resume either
   // an unkillable ship or an already-dead one that no damage path is holding the death for.
@@ -9267,18 +9540,34 @@ function addScore(pts) {
   // ⛔ CS037 P2 (spec §3.3): benchmark mode is SEALED — it may not reach the score. See Bench.
   if (Bench.running) return;
   game.score += pts;
-  // Score milestones repair the hull instead of granting an extra life (F2).
+  // ---- Score milestones SPAWN health. They do not heal, and they do not pay (CS040 P1, spec §1.2) ----
+  // ⛔ WHY THIS IS A SPAWN AND NOT A REPAIR. Measured across the 2026-08-23 and 2026-08-26 telemetry
+  // captures, this one arm supplied 63% and 62% of ALL healing in those runs — 1,650 and 1,525 HP,
+  // against <= 950 from pickups in each. Nobody designed that; it emerged. A milestone is a flat 10,000
+  // points, score rate climbs with wave, so healing throughput climbed with wave all by itself.
+  // ⛔ AND WHY IT COULD NOT SIMPLY BE DELETED. Replaying each capture's exact damage trace with this arm
+  // removed and nothing else changed kills run A at wave 4 (it actually reached 14) and run B at wave 9
+  // (it reached 16). The rescue is NOT a bigger number: run B took 485 HP of damage between two
+  // consecutive health pickups, against a 250 HP hull, so no value of POWERUP_HEALTH_AMOUNT saves it.
+  // It is a DELIVERY-TIMING problem — the pity cadence (spec §1.3) and the health bank (§1.4) are the
+  // two pieces that answer it, and they land in P2 and P3. Do not re-tune the pickup amount here.
+  // ⛔ THE FULL-HULL GATE IS DELIBERATE — it is not a missing else to be "completed". A milestone must
+  // not be generous exactly when the player is safest, so at SHIP_MAX_HP the crossing does nothing at
+  // all, and therefore also makes no sound (FORK-CS040-A: the ping sits INSIDE the spawn arm).
   if (game.score >= game.nextRepair) {
+    // Advances on EVERY crossing, whatever the hull reads. The full-hull case skips the reward, never
+    // the bookkeeping — otherwise a stretch spent at full HP would bank crossings and cash them all at
+    // the first scratch.
     game.nextRepair += REPAIR_MILESTONE;
     if (game.ship.hp < SHIP_MAX_HP) {
-      game.ship.hp = Math.min(SHIP_MAX_HP, game.ship.hp + REPAIR_AMOUNT);
-    } else {
-      game.score += REPAIR_FULL_BONUS; // already at full HP: cash the milestone in as points
-      // CS039 P1: per-run counter for offline telemetry only — see resetGameStats(). This arm adds to
-      // game.score DIRECTLY rather than recursing through addScore(), so this cannot double-count.
-      game.stats.scoreRepairBonus += REPAIR_FULL_BONUS;
+      // The AMBIENT placement path, reused as-is (spec §1.2: "do not write a second placement path") —
+      // random angle, a distance in [POWERUP_HEALTH_MIN_DIST, POWERUP_HEALTH_MAX_DIST], wrapped.
+      // ⛔ The one-health-at-a-time gate lives at the AMBIENT CALL SITE in update(), not inside
+      // spawnHealthPowerup(), so a milestone CAN put a second one on the field. That is what the spec
+      // asks for; adding the gate here would be a design change, not a tidy-up.
+      spawnHealthPowerup();
+      AudioSys.shieldPing();
     }
-    AudioSys.shieldPing();
   }
 }
 
@@ -9527,11 +9816,22 @@ function guardDropWeight() {
     DEBUG.chainGuardDropBase + DEBUG.chainGuardDropPity * game.stats.cargoDamageEvents);
 }
 
+// CS040 P2 (spec §1.3): ambient Health spawn gap, dynamic and pity-driven — the timer re-rolls only
+// where it re-rolls today (resetRun's seed, the ambient spawn site). No re-roll on the damage path:
+// that would let a player farm spawns by tanking hits. Clamped at both ends by construction (frac is
+// clamp01'd, and lerp between two fixed bounds cannot overshoot either).
+function healthGapRoll() {
+  const frac = clamp01(game.ship.hp / SHIP_MAX_HP);
+  const lo = DEBUG.healthGapLowHurt + (DEBUG.healthGapLowOk - DEBUG.healthGapLowHurt) * frac;
+  const hi = DEBUG.healthGapHighHurt + (DEBUG.healthGapHighOk - DEBUG.healthGapHighHurt) * frac;
+  return rand(lo, hi);
+}
+
 // v3.6 P3: unconditionally roll a random weapon/utility powerup and launch it on the given
 // vector. No chance gate here — the three emitters (destroySaucer, destroyHunter's large core,
 // the recycle hub) each decide WHEN to call this; this only decides WHAT drops. Health is NOT in
 // this pool — it spawns ambiently via spawnHealthPowerup.
-function dropPowerup(x, y, vx = 0, vy = 0) {
+function dropPowerup(x, y, vx = 0, vy = 0, hubBias = false) {
   // weighted roll over POWERUP_DROP_WEIGHTS (favors the shot powerups), NOT a flat pick over
   // POWERUP_DROP_TYPES — the two structures are deliberately separate (Scoop drops but isn't a budgeted effect).
   // CS017 P6: "guard" is CONDITIONAL — it only enters the roll while the player is towing at least
@@ -9541,8 +9841,15 @@ function dropPowerup(x, y, vx = 0, vy = 0) {
   // CS035 P6 (spec §5.3): guard's weight is no longer the flat table entry — weightOf(k) substitutes
   // guardDropWeight() for it, in BOTH the total and the walk, composing with (not replacing) the
   // eligible() gate above. Every non-guard key still reads POWERUP_DROP_WEIGHTS[k] unchanged.
+  // CS040 P4 (spec §2.2, FORK-CS040-C c1): hubBias is passed true ONLY by the recycle hub's own call
+  // site. While set, any budgeted type at game.powerBudget[type] === 0 has its weight multiplied by
+  // DEBUG.hubDryWeightMult, composing with (not replacing) guard's pity substitution below. Guard is
+  // deliberately excluded from the dry set — its budget resting at 0 is normal, not starvation.
+  // ⛔ destroyHunter()'s and destroySaucer()'s drops never pass hubBias — those are kill-gated, and
+  // biasing them would defeat the whole point: a dry player isn't killing anything to trigger them.
   const eligible = k => k !== "guard" || game.chain.length >= DEBUG.chainGuardMinTow;
-  const weightOf = k => k === "guard" ? guardDropWeight() : POWERUP_DROP_WEIGHTS[k];
+  const isDry = k => hubBias && k !== "guard" && game.powerBudget[k] === 0;
+  const weightOf = k => (k === "guard" ? guardDropWeight() : POWERUP_DROP_WEIGHTS[k]) * (isDry(k) ? DEBUG.hubDryWeightMult : 1);
   let total = 0;
   for (const k in POWERUP_DROP_WEIGHTS) if (eligible(k)) total += weightOf(k);
   let r = Math.random() * total, type;
@@ -9650,8 +9957,9 @@ function applyPowerup(type) {
   if (type !== "health" && typeof game.stats[pickKey] === "number") game.stats[pickKey]++;
   if (type === "scoop") {
     // Scoop is a PERSISTENT, non-timed upgrade (v3.3 P3) — it lives on game.scoopLevel, NOT in
-    // powerBudget. Each pickup adds a level; at the cap it pays a small score bonus instead,
-    // mirroring the full-HP Health-milestone pattern. It still counts as a powerup pick (FLAG A-8:
+    // powerBudget. Each pickup adds a level; at the cap it pays a small score bonus instead, mirroring
+    // what the full-HP Health milestone once paid — that arm was DELETED in CS040 P1 and this one
+    // deliberately stands. It still counts as a powerup pick (FLAG A-8:
     // this freezes the maxWaveNoPowerup achievement — accepted, it IS a powerup), but it does NOT
     // feed powerUsed[] (that gates "Powered Up", the four original drop types only).
     if (game.scoopLevel < SCOOP_MAX_LEVEL) {
@@ -9659,9 +9967,10 @@ function applyPowerup(type) {
       game.floaters.push(new FloatText("SCOOP +1", game.ship.x, game.ship.y - 22, POWERUP_COLOR.scoop));
     } else {
       addScore(SCOOP_MAX_BONUS);
-      // CS039 P1: per-run counter for offline telemetry only — see resetGameStats(). Unlike
-      // scoreRepairBonus, this DOES go through addScore(), so it can itself trip a repair milestone —
-      // the two bonus counters are not symmetric code, and that is fine.
+      // CS039 P1: per-run counter for offline telemetry only — see resetGameStats(). This DOES go
+      // through addScore(), so it can itself trip a repair milestone — which as of CS040 P1 means it
+      // can SPAWN A HEALTH POWERUP, not pay a second bonus. Its asymmetric twin scoreRepairBonus was
+      // deleted with that arm; this counter stands alone now.
       game.stats.scoreScoopBonus += SCOOP_MAX_BONUS;
       game.floaters.push(new FloatText("SCOOP MAX", game.ship.x, game.ship.y - 22, POWERUP_COLOR.scoop));
     }
@@ -9671,7 +9980,22 @@ function applyPowerup(type) {
     return;
   }
   if (type === "health") {
-    game.ship.hp = Math.min(SHIP_MAX_HP, game.ship.hp + POWERUP_HEALTH_AMOUNT);
+    // CS040 P3 (spec §1.4): apply what the hull has room for; BANK the remainder. Before this phase a
+    // pickup taken at full hull gave nothing at all — Math.min clamped it and ~305 HP (run A) and
+    // ~205 HP (run B) of healing evaporated at the cap across the two measured captures.
+    // ⛔ THE BANK STORES WHOLE CHARGES, NOT LEFTOVER HP. Any remainder at all — 1 HP or 25 — banks
+    //   ONE charge worth the full POWERUP_HEALTH_AMOUNT: a pickup at 240/250 applies 10 and banks a
+    //   full charge. See HEALTH_BANK_MAX for why a fractional reserve was rejected outright.
+    // ⛔ `leftover` is nevertheless the honest quantity to WASTE when the bank is also full: what was
+    //   thrown away there really is the unapplied HP, not a notional charge.
+    const room = Math.max(0, SHIP_MAX_HP - game.ship.hp);   // hp is clamped at max everywhere; never negative
+    const applied = Math.min(POWERUP_HEALTH_AMOUNT, room);
+    game.ship.hp += applied;
+    const leftover = POWERUP_HEALTH_AMOUNT - applied;
+    if (leftover > 0) {
+      if (game.healthBank < DEBUG.healthBankMax) game.healthBank++;
+      else game.stats.hpWasted += leftover;
+    }
   } else {
     // CS009 P5: check BEFORE the += — this is what distinguishes a bank (effect already running) from
     // a fresh pickup (it wasn't). A fresh pickup arms no badge.
@@ -10469,6 +10793,25 @@ function damageShip(amount, srcX, srcY, srcTag) {
     case "ufoShotLarge": game.stats.dmgFromUfoShotLarge += amount; break;
     case "ufoShotSmall": game.stats.dmgFromUfoShotSmall += amount; break;
   }
+  // CS040 P3 (spec §1.4) — THE BANKED-CHARGE AUTO-SPEND, at the ONE site the hull is ever reduced.
+  // It sits with the dmgFrom* attribution above for that exact reason: every real HP-dealing hit
+  // passes through here once, so the spend needs no second call site and must never grow one.
+  // ⛔ ONE CHARGE PER DAMAGE EVENT (FLAG-CS040-b), never a drain back to full. A single hit must not
+  //   evaporate the whole reserve — that is what makes two charges read as two saves, not one.
+  // ⛔ It writes s.hp DIRECTLY and rings its own voice. It must NOT re-enter damageShip(), and must
+  //   not re-fire the hit SFX, the knockback or the shake: the hit already happened, and this is the
+  //   hull's answer to it, not a second event.
+  // ⛔ It is BELOW the `s.hp <= 0` exit on purpose, so the reserve never rescues a LETHAL hit — a
+  //   bank is a repair, not an extra life, and killShip() has already run by the time we could.
+  // The counters above deliberately read the PRE-spend hull: hitsTaken / dmgThisWave / everBelowHalf /
+  // dmgFrom* all describe the HIT, and the trough it caused was real whether or not a charge answers
+  // it. The `hp < SHIP_MAX_HP` guard is the spec's own wording ("at the point hull drops below max"),
+  // and it also means a 0-damage call could never burn a charge for nothing.
+  if (s.hp < SHIP_MAX_HP && game.healthBank > 0) {
+    game.healthBank--;
+    s.hp = Math.min(SHIP_MAX_HP, s.hp + POWERUP_HEALTH_AMOUNT);
+    AudioSys.bankspend();
+  }
   for (let i = 0; i < 6; i++) game.particles.push(new Particle(s.x, s.y, "#ff9060"));
   AudioSys.hit();
   // CS037 P5 (spec §4.1) — A REAL HP-DEALING HIT RELEASES THE WHOLE TOW, from any source.
@@ -10552,6 +10895,10 @@ function killShip() { // hull destroyed (0 HP): a true, permanent game over — 
   // Achievements (F9): a game just ended — flag it so end-of-game checks (Waste Not) can fire,
   // run a final evaluation, and flush lifetime progress to storage.
   game.stats.gameEnded = true;
+  // CS040 P5 (spec §3.5): the game-over flush, on the same line as the flag it belongs to so the two
+  // can never drift apart. One final row, carrying the killing blow the interval clock would otherwise
+  // have missed by up to a whole interval; gated inside flush() by telemetryCapture and nothing else.
+  Telemetry.flush();
   // Daredevil / Wave Rider (lifetime, once-per-game — FLAG A-12-a: these conditions are inherently
   // once-per-game, so per-event ≡ per-game). Read the same per-game state the weekly Glass Cannon /
   // Shield Surfer read, from their monotonic counters, so this can only tally a genuine event.
@@ -11951,7 +12298,8 @@ function update(dt) {
         // visit" rule. The former 12/16/20 latches are deleted, not restructured.
         if (game.deliveryCount === 8) {
           const a = rand(0, TAU);
-          dropPowerup(game.dock.x, game.dock.y, Math.cos(a) * DEBUG.dockPowerupSpeed, Math.sin(a) * DEBUG.dockPowerupSpeed);
+          // CS040 P4 (spec §2.2): the hub's own call passes hubBias=true — the resupply relief valve.
+          dropPowerup(game.dock.x, game.dock.y, Math.cos(a) * DEBUG.dockPowerupSpeed, Math.sin(a) * DEBUG.dockPowerupSpeed, true);
         }
         // Salvage King (lifetime MAX): best canisters delivered in one game. game.stats.delivered only
         // climbs within a run, so Math.max here tracks the per-game best and keeps the all-time record.
@@ -12056,7 +12404,7 @@ function update(dt) {
   game.healthTimer -= dt;
   if (game.healthTimer <= 0) {
     if (!game.powerups.some(p => p.type === "health")) spawnHealthPowerup();
-    game.healthTimer = rand(POWERUP_HEALTH_GAP[0], POWERUP_HEALTH_GAP[1]);
+    game.healthTimer = healthGapRoll();
   }
 
   // --- Collisions: player bullets vs targets ---
@@ -12595,6 +12943,7 @@ function drawMenu() {
   else if (s === "profiles") drawProfiles();     // CS031 P4: the roster screen
   else if (s === "slots") drawSlots();           // CS032 P3: the save/load slots screen
   else if (s === "credits") drawCredits();       // CS038 P1: the Credits screen
+  else if (s === "telemetry") drawTelemetryMenu(); // CS040 P6: the Telemetry sub-screen
   else if (s === "debug") drawDebug();   // CS015 P4: hidden, secret-code-only
   drawModal();  // CS016 P3: LAST, unconditionally — it must paint over whichever panel raised it
 }
@@ -12907,6 +13256,35 @@ function drawCredits() {
   if (game.menu.linkMsg) drawText(game.menu.linkMsg, cx, CREDITS_MSG_Y, CREDITS_MSG_SIZE, COLOR.dim);
 }
 
+// CS040 P6 (spec §4.2): the Telemetry sub-screen's render. Follows drawSound's value-row layout
+// (left-aligned label + value + ◄► chevrons on the focused row) for the two ◄►-adjusted rows, and
+// drawDebug's action-row style (centered, ▶ marker, no chevrons) for "Copy log" and "Back". Reuses
+// Telemetry.msg for the copy-status line — the same channel the debug panel's own row used to show.
+function drawTelemetryMenu() {
+  const { x, y } = menuPanel(680, 360, "TELEMETRY");
+  const m = game.menu;
+  let cy = y + 100;
+  ["Capture", "Sample rate"].forEach((label, i) => {
+    const sel = m.index === i;
+    drawText(label, x + 40, cy + 6, 18, sel ? COLOR.text : COLOR.menuIdle, "left");
+    const ox = x + 220;
+    const val = label === "Capture" ? (DEBUG.telemetryCapture ? "ON" : "OFF") : telemetryRateLabel(DEBUG.telemetryInterval);
+    ctx.font = "16px monospace";
+    const w = ctx.measureText(val).width;
+    drawText(val, ox, cy + 6, 16, sel ? COLOR.text : COLOR.menuIdle, "left");
+    if (sel) { drawText("◄", ox - 20, cy + 7, 16, COLOR.text); drawText("►", ox + w + 16, cy + 7, 16, COLOR.text); }
+    cy += 46;
+  });
+  cy += 14;
+  const copySel = m.index === TELEMETRY_ROWS.indexOf("Copy log");
+  drawText((copySel ? "▶ " : "   ") + "Copy log", VIEW_W / 2, cy + 6, 18, copySel ? COLOR.text : COLOR.menuIdle);
+  cy += 46;
+  const backSel = m.index === TELEMETRY_ROWS.indexOf("Back");
+  drawText((backSel ? "▶ " : "   ") + "Back", VIEW_W / 2, cy + 6, 22, backSel ? COLOR.text : COLOR.menuIdle);
+  if (Telemetry.msg) drawText(Telemetry.msg, VIEW_W / 2, y + 300, 13, COLOR.dim);
+  drawMenuHint("↑↓ move    ◄► adjust    ENTER / A select    ESC / B back", VIEW_W / 2, y + 332);
+}
+
 // Hidden Debug Options panel renderer (CS015 P4) — generic over DEBUG_ROWS, following drawSound's value-row
 // layout (left-aligned label + value + ◄► chevrons on the focused row) plus a centered Back row. CS017 P2
 // added one more row between the values and Back: "Dump difficulty log" — an ACTION row, rendered like Back
@@ -12928,6 +13306,7 @@ function drawDebug() {
   let cy = y + DEBUG_ROWS_Y;
   for (let i = top; i < end; i++) {
     const r = DEBUG_ROWS[i], sel = m.index === i;
+    if (r.hidden) continue;   // CS040 P6 (spec §4.5): telemetryInterval/telemetryCapture — no row, no space spent
     if (r.kind === "header") {
       drawText("— " + r.label + " —", x + 40, cy + 6, 15, COLOR.dim, "left");   // never selectable, never a cursor
     } else if (r.kind === "var") {
@@ -14058,6 +14437,28 @@ function drawHUD() {
   drawPoly(HUD_SHIP_GLYPH, HUD_HULL_CX, HUD_RING_CY, -Math.PI / 2, hullColor);
   ctx.globalAlpha = 1;   // ALWAYS restore — a leaked alpha would tint the rest of the frame
   drawText("HULL", HUD_HULL_CX, HUD_RING_LABEL_Y, 13, COLOR.dim, "center");
+  // CS040 P3 (spec §1.5; FLAG-CS040-d, overridden from "defer" to "required"): THE BANKED-CHARGE TELL
+  // — a short segmented pip row tucked under the "HULL" label, one segment per possible charge, with
+  // game.healthBank of them lit. A banked charge is invisible state that spends itself, so without
+  // this the whole mechanic is unreadable. It is the SCOOP row's idiom verbatim: one drawRingSegments()
+  // call, segment count DERIVED from the live cap and never hardcoded, and ALWAYS DRAWN — dim track at
+  // zero, the same always-shown-muted convention every other persistent readout in this HUD follows
+  // (FLAG-CS040-f; GATE T decides whether that reads as clutter).
+  // ⛔ STROKE ONLY. drawRingSegments never fills, and no fill dot goes back in — GDD §3.2's no-fills
+  //   rule is exactly why the old SCOOP pip row lost its own dot.
+  // ⛔ NOT ON THE SHIP, and a future reader should not retry it: CS025 P3 put a magnet-blue scoop tell
+  //   on the hull and CS025 P5 backed it out WHOLE at the playtest gate as unreadable against the hull
+  //   stroke (the do-not-re-add comment still stands at the Ship draw). Persistent state lives in the
+  //   HUD corners in this game.
+  // ⛔ NOT a ring outside HUD_RING_R either, for a second and independent reason: HUD_HULL_CX and
+  //   HUD_CARGO_CX are 76 px apart with only 16 px of air between the two ring EDGES, and a concentric
+  //   ring at HUD_RING_R + n eats that air from both sides until the two clusters read as one object.
+  //   Beneath the label at HUD_BANK_PIP_R the row spans x 1143..1169 against the CARGO ring's 1200 left
+  //   edge — measured off the running build, not estimated (test-cs040-p3.js §G re-measures it).
+  // At DEBUG.healthBankMax = 0 (banking switched off) there are no segments and this draws nothing,
+  // which is the honest rendering of a mechanic that is not running.
+  drawRingSegments(HUD_HULL_CX, HUD_RING_LABEL_Y + HUD_BANK_PIP_DY, HUD_BANK_PIP_R,
+    DEBUG.healthBankMax, game.healthBank, POWERUP_COLOR.health, COLOR.dim);
 
   // CARGO ring (top-right, beside HULL). FORK-2 A: game.cargoMax is NOT a constant — it steps
   // 8->24 at level boundaries per payloadSlots(game.wave) (CS018 P5), so the fraction and
@@ -14183,7 +14584,7 @@ function drawHUD() {
   // powerup (wrap-aware nearest-scan, not find-first — correct even if a second ever coexists).
   // Drawn only in the low-health state AND when a health powerup actually exists on the field;
   // hidden otherwise, per FLAG-8a (no force-spawn, so the pointer can legitimately have nothing to
-  // point at for up to POWERUP_HEALTH_GAP's 26s).
+  // point at for up to HEALTH_GAP_HIGH_OK's 30s).
   if (game.state === "playing" && !game.ship.dead && game.ship.hp <= LOW_HP_THRESHOLD) {
     let nearest = null, bestD = Infinity;
     for (const p of game.powerups) {
