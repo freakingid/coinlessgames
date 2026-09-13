@@ -51,7 +51,7 @@
    `mass` field; chain thrust/top-speed/tug now scale with the chain's total mass
    (sum of node.mass), not its node count.
    v1.5: Global difficulty ramp — difficultyFactor(wave) climbs from ~0 at wave 1
-   toward 1 over many waves (RAMP_WAVES is the single knob), and threat parameters
+   toward 1 over many waves (RAMP_WAVES was the single knob at the time), and threat parameters
    interpolate floor->ceiling through it via ramp() (CS024 P4: ramp() is gone with the
    last lever on it, and the curve itself — never a difficulty lever after CS018 P4 —
    is renamed musicIntensity()/MUSIC_INTENSITY_WAVES to say what it actually drives).
@@ -96,7 +96,7 @@
    produces (kills by type/tier, dock deliveries, HP thresholds, powerup usage, wave reached,
    damage-free waves, play time) via light hooks at each event site; unlocks pop a non-blocking toast
    and are browsable in a viewer (Pause -> Options -> Achievements). Weekly rotation index =
-   (isoYear*52 + isoWeek) % 15; progress + unlock state persist to their own localStorage key. This
+   (isoYear*52 + isoWeek) % 16; progress + unlock state persist to their own localStorage key. This
    completes the v2.0 feature set (Phases 1-9).
    ============================================================ */
 
@@ -494,7 +494,9 @@ const SCORES_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 // because IMPLEMENTATION-PHASES-CS042.md P11 item 7 said to write the next integer, which had
 // silently stopped being the changeset number one changeset earlier; Paul caught it at the close.
 // The scheme at the head of this block is authoritative over any phase doc that disagrees.
-const GAME_VERSION = "1.0.0.42";
+// CS043 P5: "1.0.0.42" -> "1.0.0.43". Still tracking the changeset number.
+// CS044 P5: "1.0.0.43" -> "1.0.0.44". Still tracking the changeset number.
+const GAME_VERSION = "1.0.0.44";
 const VERSION_STAMP_INSET_X = 16; // px in from the right edge of the viewport (title screen only)
 const VERSION_STAMP_INSET_Y = 16; // px in from the bottom edge of the viewport (title screen only)
 
@@ -575,6 +577,8 @@ const HUD_CAP_FLASH = 0.5;      // sec — reserved flash duration for a cap-rel
 // reads the latter. Severed garbage (Garbage.fromNode) routes through the one ctor, so it is permanent
 // too; that is intended (§4.4).
 const GARBAGE_PICKUP = 18;      // pickup radius from ship center
+// ⚠ CS044 GATE A tried SHIP_RADIUS (13) here and for powerups (00a7127); Paul's playtest put both back —
+// the circle felt too small with no Scoop (DECISIONS.md). 18 and p.radius + SHIP_RADIUS are the settled sizes.
 // FLAG-CS024-c: a pure guess, and Gate A question 3 is its A/B ("does the cull ever visibly fire?" —
 // it should not). Above SOFT, ONE piece is culled per frame — the oldest, preferring a single over a
 // clump — so the ceiling is approached as a slow drip the player never sees, not a purge. HARD is a
@@ -771,7 +775,9 @@ const DELIVERY_FLOAT_ANCHOR_FRAC = 0.50;
 
 // Larger world & scrolling camera (v1.2)
 const CULL_MARGIN = 100;        // px beyond the viewport edge still worth drawing
-const SPAWN_MIN_DIST = 220;     // new debris satellites: nearest allowed to the ship
+const SPAWN_MIN_DIST = 380;     // new debris satellites: nearest allowed to the ship (CS043 P4: 220 -> 380,
+                                // clearing the 1280x720 viewport's half-height so nothing spawns directly
+                                // above/below the ship on screen — spec §5.2. DEBUG.spawnMinDist below.
 const SPAWN_MAX_DIST = 640;     // new debris satellites: farthest from the ship (stay reachable; clamped
                                 // to the reachable radius min(WORLD_W,WORLD_H)/2-60, which is 660 at
                                 // WORLD_SIZE_FIELD and 1020 at WORLD_SIZE_ORBIT — CS022 P1 (spec C5)
@@ -1291,17 +1297,34 @@ const POWERUP_BUDGET = { rapid: RAPID_SHOTS, triple: TRIPLE_SHOTS, magnet: MAGNE
 // HITS (never on a clock). Each level widens/deepens an oriented capture BOX (the "mouth") on the
 // ship's facing axis that scoops garbage in ADDITION to the base GARBAGE_PICKUP circle (they're OR'd,
 // so scoopLevel 0 is byte-identical to the pre-scoop build).
-// CS042 P8 (spec §4.3): 5 -> 7. Levels 1-5 grow the forward mouth exactly as before; levels 6 and 7
-// add the flanking ORBS below — the Scoop's first LATERAL reach, and the first level that grants a
-// capability rather than a bigger number. This constant governs the CAP, the HUD ring's segment
-// count and the two orb tables. It does NOT govern the mouth curve — see SCOOP_MOUTH_LEVELS.
+// CS042 P8 (spec §4.3): 5 -> 7. Levels 1-5 grow the forward mouth exactly as before.
+// ⛔ CS044 P2 (spec §1, Paul's CS043 GATE A call A10) REPLACED WHAT THE TOP TWO LEVELS ARE, AND
+// THIS COMMENT IS REWRITTEN IN PLACE RATHER THAN DELETED BECAUSE WHAT IT REVERSES WAS DELIBERATE.
+// P8 gave levels 6-7 two flanking capture ORBS abreast of the hull — the Scoop's first LATERAL
+// reach, and the first level that granted a capability rather than a bigger number. Paul's GATE A
+// read was that the orbs, and the dashed field CS042 P11 stroked them through, were "distracting
+// and cumbersome"; what he asked for instead is "a larger cone of pickup that extrapolates from the
+// size of the scoop lines drawn at level 5", drawing nothing bigger than level 5 draws. So the orbs
+// are GONE and the mouth curve simply keeps going (buildScoopSteps below, FORK-CS044-A (a)).
+// This constant governs the CAP and the HUD ring's segment count. It does NOT govern the mouth
+// curve — see SCOOP_MOUTH_LEVELS, which since CS044 P2 answers two questions rather than one.
 const SCOOP_MAX_LEVEL = 7;
 // ⛔ CS042 P8 — THE MOUTH CURVE HAS ITS OWN SPAN, AND IT IS NOT SCOOP_MAX_LEVEL. FORK-CS042-A (a).
 // buildScoopSteps() divides by (N - 1). Handing it SCOOP_MAX_LEVEL after the cap went 5 -> 7 would
 // re-spread the same min->max range over seven steps and SILENTLY SHRINK every existing level:
 // L2's mouth would go 38.7 -> 33.0 px, L3 55.8 -> 44.4, L4 72.9 -> 55.8, with only L1 and L5 held.
-// The mouth therefore keeps its own five-step span, and levels 6-7 read level 5's mouth unchanged.
-// The mouth's numbers do not move when the cap does.
+// The mouth therefore keeps its own five-step span: the mouth's numbers do not move when the cap
+// does. FORK-CS042-A is UNCHANGED by CS044 and this divisor is not up for re-decision.
+// ⛔ CS044 P2 — THIS CONSTANT NOW ANSWERS TWO QUESTIONS, AND THEY ARE NOT THE SAME QUESTION.
+//   (1) THE CURVE'S DIVISOR, exactly as above — (SCOOP_MOUTH_LEVELS - 1), never the cap. Handing
+//       the cap to the divisor still silently shrinks levels 2-4, with the numbers above.
+//   (2) THE TOP LEVEL WHOSE MOUTH IS DRAWN. buildScoopSteps() no longer clamps above this level
+//       (spec §1.2: levels 6-7 EXTRAPOLATE the same curve), so the CAPTURE region keeps growing
+//       past it — while Ship.draw() reads SCOOP_WIDTH/SCOOP_DEPTH at Math.min(lvl,
+//       SCOOP_MOUTH_LEVELS), so a level-6 or level-7 ship draws exactly the level-5 V. Paul ruled
+//       out drawing anything bigger than level 5 (CS043 GATE A, A10). Handing the CAP to the render
+//       clamp is that mistake; handing it to the divisor is the older one. Two constants, and now
+//       three jobs between them.
 const SCOOP_MOUTH_LEVELS = 5;
 const SHIP_DRAW_W = 18;    // the drawn hull's width (see Ship's draw poly) - the unit the scoop is spec'd in
 // v3.4 P3: SCOOP_WIDTH/SCOOP_DEPTH are GENERATED from this config instead of hand-picked, so the mouth's
@@ -1341,54 +1364,93 @@ const SCOOP_CONFIG = {
 // build at scoopLevel 0 — see inScoopBox); indices 1..SCOOP_MOUTH_LEVELS interpolate min->max via
 // `curve` (1.0 linear, >1 weights growth toward the top levels).
 // ⛔ CS042 P8: the interpolation divides by (SCOOP_MOUTH_LEVELS - 1), NEVER (SCOOP_MAX_LEVEL - 1).
-// The table is still cap-length so `inScoopBox`/`Ship.draw()` can index it by raw level, but every
-// level above the mouth's own span CLAMPS to the top step rather than re-spreading the curve.
 // Restoring SCOOP_MAX_LEVEL here is the one edit that silently shrinks levels 2-4 — see
-// SCOOP_MOUTH_LEVELS' own comment for the exact numbers it would move.
+// SCOOP_MOUTH_LEVELS' own comment for the exact numbers it would move. CS044 did not touch it.
+// ⛔ CS044 P2 (spec §1.2; FORK-CS044-A resolved (a), Paul 2026-09-13) — LEVELS ABOVE THE MOUTH'S
+// SPAN EXTRAPOLATE, THEY NO LONGER CLAMP. The `const m = Math.min(k, SCOOP_MOUTH_LEVELS);` that
+// used to stand here held levels 6-7 at level 5's mouth, because CS042 P8 gave those two levels
+// flanking ORBS instead of a bigger cone. The orbs are gone (see SCOOP_MAX_LEVEL), so the curve
+// simply keeps going: `k` is used raw and the fraction passes 1.0 above the span.
+// ⛔ THE DIVISOR IS UNTOUCHED, WHICH IS WHY LEVELS 1-5 COME OUT BYTE-IDENTICAL — same formula,
+// same span, same endpoints, bit for bit. At the shipped SCOOP_CONFIG each further level adds
+// 10.8 px of width and 6.5 px of depth: L6 is 100.8 x 66.5 and L7 is 111.6 x 73.0, against L5's
+// 90.0 x 60. Capture area (width x (depth + SHIP_RADIUS)) goes 6,570 -> 8,014 -> 9,598 px².
+// The table is still cap-length so `inScoopBox`/`Ship.draw()` can index it by raw level; the render
+// is what clamps at SCOOP_MOUTH_LEVELS now, not this builder.
 function buildScoopSteps(min, max, curve) {
   const steps = [0];
   for (let k = 1; k <= SCOOP_MAX_LEVEL; k++) {
-    const m = Math.min(k, SCOOP_MOUTH_LEVELS);
-    steps.push(min + (max - min) * Math.pow((m - 1) / (SCOOP_MOUTH_LEVELS - 1), curve));
+    steps.push(min + (max - min) * Math.pow((k - 1) / (SCOOP_MOUTH_LEVELS - 1), curve));
   }
   return steps;
 }
 const SCOOP_WIDTH = buildScoopSteps(SCOOP_CONFIG.minWidthMult * SHIP_DRAW_W,
                                      SCOOP_CONFIG.maxWidthMult * SHIP_DRAW_W, SCOOP_CONFIG.curve);
 const SCOOP_DEPTH = buildScoopSteps(SCOOP_CONFIG.minDepth, SCOOP_CONFIG.maxDepth, SCOOP_CONFIG.curve);
-// CS042 P8 (spec §4.3) — THE FLANKING ORBS. Two capture discs abreast of the ship, one per side, at
-// +/-SCOOP_ORB_OFFSET[lvl] lateral in the SAME ship-local space the mouth is tested in, each of
-// radius SCOOP_ORB_R[lvl], OR'd into the capture region beside the mouth and the base circle. Index
-// = scoop level, so both tables are SCOOP_MAX_LEVEL+1 long and zero at every level below the orb
-// tier; the load-time guard below is what makes a level-0 ship unable to grow orbs. Starting values
-// from spec §4.3 — re-pick in tools/scoop-lab.html, which renders and sizes them.
-const SCOOP_ORB_OFFSET = [0, 0, 0, 0, 0, 0, 62, 84];  // px lateral from ship center, mirrored both sides
-const SCOOP_ORB_R      = [0, 0, 0, 0, 0, 0, 26, 34];  // px capture radius of one orb (2 x pi x r^2 = 4,247 / 7,263 px²)
-const SCOOP_ORB_SEGS = 12;            // sides of the drawn orb ring — a stroked poly, never an arc fill
-const SCOOP_ORB_TETHER_LEVEL = 7;     // the level at which each orb also draws a faint tether to the hull
-// ⛔ CS042 P11 (GATE C, G4) — THE SCOOP RENDERS AS A FIELD, NOT AS HULL. These two numbers are the
-// dash pattern every scoop shape strokes through: the mouth V, both orbs and the level-7 tethers.
-// Paul's GATE C read was that solid glow-strokes out there imply hittable ship geometry, so a hit
-// landing near an orb feels as though it should have hurt — when nothing drawn by the scoop has ever
-// been collidable. A broken outline reads as a projected field; a continuous one reads as a plate.
-// ⛔ PLAIN CONSTANTS, NOT DEBUG_VARS ROWS, and that is the standing rule rather than an omission:
-// pure-presentation values tuned by eye with no gameplay effect live here, exactly like
-// CAPTION_LINGER / CAPTION_FADE / LEVEL_BANNER_TIME and the twelve knobs CS038 P5 retired off the
-// registry. A future retune edits these two numbers. Registry count is unmoved.
-// ⚠ Sized against the shapes they stroke, not picked round: an L6 orb ring is ~160 px of perimeter
-// and an L7 ring ~210, so 6/6 puts ~13-17 dashes around one orb — plainly broken, never dotted.
-// glowStroke's shadowBlur paints a continuous halo THROUGH the gaps while the bright core stays
-// broken, which is the intended look (an energy field, not a dashed line on a blueprint).
-const SCOOP_FIELD_DASH = 6;           // px of stroke in each dash of the scoop's field outline
-const SCOOP_FIELD_GAP  = 6;           // px of gap between dashes
+// ⛔ CS044 P2 — THE FLANKING ORBS ARE DELETED, NOT PARKED, AND THIS COMMENT IS REWRITTEN IN PLACE
+// SO THE REVERSAL IS LEGIBLE BESIDE WHAT IT REVERSES. CS042 P8 (spec §4.3) put two capture discs
+// abreast of the ship, one per side, at +/-SCOOP_ORB_OFFSET[lvl] lateral in the same ship-local
+// space the mouth is tested in, each of radius SCOOP_ORB_R[lvl] (62/r26 at L6, 84/r34 at L7),
+// OR'd into the capture region beside the mouth and the base circle. Four constants stood here:
+// SCOOP_ORB_OFFSET, SCOOP_ORB_R, SCOOP_ORB_SEGS (12, the drawn ring's sides) and
+// SCOOP_ORB_TETHER_LEVEL (7). They were the Scoop's first LATERAL reach.
+// ⛔ Paul's CS043 GATE A call (A10) reverses that design: levels 6-7 get "a larger cone of pickup
+// that extrapolates from the size of the scoop lines drawn at level 5" instead, which
+// buildScoopSteps() above now produces. FORK-CS044-A resolved (a), linear extrapolation — the
+// smaller mechanism, and what Paul's own words describe. Levels 6-7 are consequently a smaller
+// reward than the orbs were (8,014 / 9,598 px² against ~10,300 / ~13,800); if GATE A says they
+// feel weak, spec §1.3 (b) is a two-number follow-up, NOT a reason to bring the orbs back.
+// ⛔ THERE IS NO "OLD MODE" FLAG AND NO COMMENTED-OUT TABLE TO REACTIVATE. A future session that
+// wants lateral reach again is proposing new design — surface it, don't resurrect these.
+// ⛔ CS044 P2 — THE DASHED FIELD STROKE IS DELETED, AND THIS COMMENT IS REWRITTEN IN PLACE FOR THE
+// SAME REASON THE ORB COMMENT ABOVE IS: CS042 P11 was a deliberate call, answered at a gate.
+// P11 (GATE C, G4) put SCOOP_FIELD_DASH / SCOOP_FIELD_GAP here — 6 px of stroke, 6 px of gap — the
+// pattern every scoop shape stroked through (the mouth V, both orbs, the level-7 tethers). Paul's
+// GATE C read then was that solid glow-strokes out at the mouth imply hittable ship geometry, so a
+// hit landing near one feels as though it should have hurt, when nothing the Scoop draws has ever
+// been collidable; a broken outline was meant to read as a projected field rather than a plate.
+// ⛔ SHIPPED UNSEEN IN A BROWSER, AND PAUL SAW IT AT CS043 GATE A: "distracting and cumbersome",
+// go back to solid scoop lines (A10). So both constants, both ctx.setLineDash() calls and the
+// `scoopField` binding in Ship.draw() are gone, and THE BUILD NOW HAS ZERO setLineDash() SITES.
+// ⚠ G4's underlying observation is NOT overturned and is still on the record in GDD §2.14.1 — the
+// scoop's shapes are a capture tell and are not collidable. The dash was simply not the answer to
+// it, and transparency remains unavailable in that block: ctx.globalAlpha there belongs to the
+// level-end grace pulse's SET-DRAW-RESTORE, which is also why CS042 P8's tether was a COLOUR
+// choice. Don't re-add a dash, an alpha, or a third channel without a fresh decision from Paul.
 // ⛔ THE LOAD-TIME GUARD — A DELIBERATE INVARIANT GUARD, NOT TEST SCAFFOLDING. It is what makes
 // inScoopBox() return false at scoopLevel 0, which keeps pickup byte-identical to the pre-scoop
-// build. CS042 P8 extended it over the two orb tables for the same reason (an orb table with a
-// non-zero index 0 grows orbs on a level-0 ship) and added the LENGTH check: the mouth tables are
-// generated from the cap while the orb tables are literals, so a future cap change that misses them
-// would index `undefined` at the top level and capture nothing rather than failing loudly.
-if (SCOOP_WIDTH[0] !== 0 || SCOOP_DEPTH[0] !== 0 || SCOOP_ORB_OFFSET[0] !== 0 || SCOOP_ORB_R[0] !== 0) throw new Error("SCOOP step 0 must be 0 - inScoopBox depends on it");
-if (SCOOP_ORB_OFFSET.length !== SCOOP_MAX_LEVEL + 1 || SCOOP_ORB_R.length !== SCOOP_MAX_LEVEL + 1) throw new Error("SCOOP orb tables must be SCOOP_MAX_LEVEL+1 long - inScoopBox indexes them by level");
+// build. If it fires, SCOOP_CONFIG / buildScoopSteps broke the invariant and the assertion is
+// correct. Do not delete it on a cleanup pass (CLAUDE.md, "Two traps that have each burned twice").
+// ⛔ CS044 P2 NARROWED IT BACK TO ITS PRE-CS042-P8 FORM, AND NARROWING IS NOT DELETING. P8 had
+// extended it over SCOOP_ORB_OFFSET[0] / SCOOP_ORB_R[0] and added a LENGTH check, because the orb
+// tables were hand-written literals where the mouth tables are generated from the cap. Both orb
+// tables are gone (above), so their clauses went with their subject; the SCOOP_WIDTH/SCOOP_DEPTH
+// clause — the whole original guard, and the load-bearing one — is untouched.
+if (SCOOP_WIDTH[0] !== 0 || SCOOP_DEPTH[0] !== 0) throw new Error("SCOOP step 0 must be 0 - inScoopBox depends on it");
+// ⛔ CS044 GATE A (Paul, 2026-09-13; DECISIONS.md) — THE CAPTURE REGION IS A SQUARE, NOT A RECTANGLE.
+// Seeing the pickup flash, Paul expected "a square, with one of the corners located where the V shape
+// connects to the ship", and chose it SIZED TO TODAY'S AREA. So each level's box is a rhombus with its
+// back corner at the V's apex (SCOOP_APEX_X, the hull's nose vertex — Ship.draw()'s V starts there) and
+// its two back sides running ALONG the V's lines, closing forward. Its area is held at the rectangle it
+// replaces, SCOOP_WIDTH[lvl] x (SCOOP_DEPTH[lvl] + SHIP_RADIUS), so no level's capture area moved — only
+// where it sits: it no longer reaches back beside the hull, and it reaches past the drawn V tips (L5
+// ~129 px forward against the V's 60). The V's opening runs 105 deg at L1 to 89 deg at L7, so this is
+// a true square within ~2 deg from L4 up and a slightly squashed one below. SCOOP_WIDTH/SCOOP_DEPTH
+// still define the drawn V and still extrapolate at 6-7; this table is derived from them at load, so a
+// SCOOP_CONFIG retune carries the square with it. Level 0 is an empty entry — inScoopBox() returns
+// before reading it, on the guard above.
+const SCOOP_APEX_X = 16;   // ship-local forward of the hull's nose vertex, where the drawn V meets the ship
+function buildScoopSquares() {
+  return SCOOP_WIDTH.map((w, lvl) => {
+    if (lvl === 0) return { cx: 1, cy: 0, side: 0 };
+    const hw = w / 2, len = SCOOP_DEPTH[lvl] - SCOOP_APEX_X;
+    const L = Math.hypot(len, hw);                         // ship-local, not world space: no wrap
+    const cx = len / L, cy = hw / L;                       // unit direction of the V's upper line
+    const area = w * (SCOOP_DEPTH[lvl] + SHIP_RADIUS);     // the replaced rectangle's area, held
+    return { cx, cy, side: Math.sqrt(area / (2 * cx * cy)) };   // area = side^2 * sin(apex angle)
+  });
+}
+const SCOOP_SQUARE = buildScoopSquares();
 // CS042 P9 (spec §4.4) — ⛔ THE STICKINESS IS REVERSED, AT PAUL'S REQUEST. This comment is REWRITTEN
 // in place rather than deleted, because what it used to say was a deliberate design call and the
 // reversal is only legible beside it. v3.4 P3 took this constant 2 -> 5 and wrote the result down as
@@ -1405,6 +1467,22 @@ const SCOOP_HITS_PER_LEVEL = 2;              // non-lethal hits that cost one sc
                                               // v3.4 P3 took it 2->5, CS042 P9 takes it back to 2)
 const SCOOP_MAX_BONUS = 500;                 // score paid when a scoop pickup lands at max level (once mirrored the full-HP REPAIR_FULL_BONUS, deleted CS040 P1; this one stands; tunable)
 const SCOOP_SPILL_KICK = 85;                 // v3.3 P4 (9c): px/s outward kick on the leftover when a clump is PARTIALLY scooped ("the rest floats off and away"); playtest knob (~60-110)
+// CS044 P3 (spec §2.2): the powerup-pickup scoop flash — a glowing outline of the capture area that
+// flashes and fades on every powerup pickup (never a Debris pickup). Pure presentation, plain
+// constants, no registry rows (the CAPTION_LINGER precedent) — game.scoopFlashT (ticked in update(),
+// zeroed in resetRun(), not saved) is the only piece of state. `SCOOP_FLASH_RGB` mirrors
+// POWERUP_COLOR.scoop (#c07bff) as an R,G,B triple so the render can bake the fading alpha into an
+// rgba() string, the LOWHP_GLOW_RGB idiom — never ctx.globalAlpha, which this block does not own.
+const SCOOP_FLASH_TIME = 0.25;               // seconds the flash takes to fade out
+const SCOOP_FLASH_ALPHA_START = 0.9;         // opacity on the pickup frame
+const SCOOP_FLASH_ALPHA_END = 0.2;           // opacity reached at SCOOP_FLASH_TIME, where it vanishes
+                                              // rather than lingering (spec §2.2)
+const SCOOP_FLASH_RGB = "192,123,255";       // mirrors POWERUP_COLOR.scoop (#c07bff)
+// CS044 GATE A (Paul): the flash also FILLS its shapes, with a glow, under the outline — a fourth,
+// deliberate exception to GDD §3.2's no-fills rule, measured as negligible (it draws only for the
+// 0.25 s after a pickup). Fill opacity is this fraction of the outline's; alpha stays in the colour.
+const SCOOP_FLASH_FILL_FRAC = 0.35;          // fill alpha = outline alpha x this (0.9 -> 0.315 at the start)
+const SCOOP_FLASH_GLOW = 16;                 // shadowBlur on the fill
 // CS025 P3 added four SCOOP_MAGNET_* look-call constants here (stroke width / blur / nose-V width /
 // nose-V depth) for the magnet-pull scoop tell. CS025 P5 DELETED them with the tell itself — the
 // playtest gate (Q4) found magnet-blue indistinguishable from the hull, so the whole render branch
@@ -3007,23 +3085,25 @@ const CAPTION_LINGER = 1.5, CAPTION_FADE = 0.4, CAPTION_Y = 64, CAPTION_SIZE = 2
 //   FADE:  seconds of linear alpha ramp at EACH end (in and out) — 2*FADE must stay < TIME or the
 //          banner never reaches full opacity. At 0.5/2.2 it holds solid for 1.2 s.
 //   SIZE:  font px. Large enough to read at a glance mid-fight without covering the play area.
-//   Y:     px DOWN from the vertical centre for the text BASELINE — a positive offset that optically
-//          centres the glyph box, since drawText positions by baseline, not by box centre.
-const LEVEL_BANNER_TIME = 2.2, LEVEL_BANNER_FADE = 0.5, LEVEL_BANNER_SIZE = 72, LEVEL_BANNER_Y = 24;
+//   Y:     px DOWN from the vertical centre for the text BASELINE (drawText positions by baseline, not by
+//          box centre); negative is UP. ⛔ CS043 P3 (spec §3): 24 -> -120, baseline at y = 240, a THIRD
+//          of the way down the 720-high view (Paul, CS043 §0.1 d). It was 24 — a small positive offset
+//          that optically centred the glyph box on the screen's middle, where "Level N" sat on top of the
+//          ship. With the level-end freeze deleted (CS043 P1) the banner plays over LIVE play and is the
+//          only level announcement left, so it moves off the ship's line rather than shrinking or
+//          shortening. The registry row's def reads this constant, so this is the one edit.
+const LEVEL_BANNER_TIME = 2.2, LEVEL_BANNER_FADE = 0.5, LEVEL_BANNER_SIZE = 72, LEVEL_BANNER_Y = -120;
 
-// CS036 P2 (spec §1.3) — the COMPLETION ANNOUNCEMENT's two look-calls, the "Level N Complete" twins of
-// the four above. Everything else it draws with is the banner's own: DEBUG.levelBannerSize / ...Y /
-// ...Fade and COLOR.text, read live, so the two announcements can never drift apart on a slider drag.
-//   HINT:  the prompt line under it, in CELEB_HINT's idiom — the ACTUAL bindings named, not a physical
-//          button ("ENTER / A"). ESC / B dismiss too (the same confirm-or-back pair the celebration
-//          panel takes), and are left off the line deliberately: it is a two-key hint at a moment with
-//          exactly one thing to do, not a control reference. ⚠ Wording is a CS036 gate question (H3).
-//   HINT_DY: px DOWN from the announcement's own baseline to the hint's. Clears the descenders of a
-//          72px line with air to spare, and stays clear up to the size knob's 160 ceiling.
-const LEVEL_DONE_HINT = "ENTER / A  continue", LEVEL_DONE_HINT_DY = 44;
+// ⛔ CS043 P1 (spec §1.1) — LEVEL_DONE_HINT / LEVEL_DONE_HINT_DY STOOD HERE, and are DELETED, not
+// parked. They were the "Level N Complete" announcement's two look-calls; that announcement, its
+// freeze, its two input branches and its renderer are all gone, so the four constants above are once
+// again the level announcement's ONLY look-calls and the "two announcements must not drift apart on a
+// slider drag" concern they answered no longer has a second announcement to drift from. A future
+// session wanting a completion announcement back is proposing new design, not restoring dead code.
 
 // CS042 P5 (spec §3; GATE A's ceremony-lab copy-out, preset "Cross-fade" taken unedited) — THE
-// CEREMONY CROSS-FADES. Three durations and two curves are the whole numeric content of that block:
+// CEREMONY CROSS-FADES. Three durations and two curves were the whole numeric content of that block;
+// CS043 P1 deleted one of the three with the announcement it timed, and two remain:
 // ⛔ NOTHING ABOUT THE CEREMONY'S TIMING MOVES. No DEBUG_VARS row changes, the registry count is
 // unchanged, and levelBannerTime / levelBannerFade / levelEndGrace / DEATH_DURATION all stay exactly
 // where they were — both sequence totals are identical to shipped. Every one of the fourteen changes
@@ -3031,13 +3111,15 @@ const LEVEL_DONE_HINT = "ENTER / A  continue", LEVEL_DONE_HINT_DY = 44;
 //   Plain constants, not registry rows, on CAPTION_LINGER / LEVEL_BANNER_TIME's own standing LOOK-CALL
 // precedent (CLAUDE.md, Debug registry): pure presentation, tuned by eye in tools/ceremony-lab.html,
 // no gameplay effect.
-//   ANNOUNCE_OUT: "Level N Complete" dissolves for this long AFTER the confirm (A2 out, easeIn). Its
-//                 fade-IN is unchanged and still DEBUG.levelBannerFade, so the two announcements still
-//                 ramp in alike on a slider drag.
-//   PANEL_FADE:   the celebration panel's fade, in AND out, at BOTH call sites — one number, which is
-//                 why drawCelebrationPanel() needs no per-site fork (A3/B3 in easeOut, out easeIn).
+//   ⛔ CS043 P1 (spec §1.1): CEREMONY_ANNOUNCE_OUT STOOD FIRST ON THIS LINE and is DELETED with the
+//                 announcement it dissolved. Its only two readers were inside dismissLevelDone() and
+//                 drawLevelDone(), both gone. The other two survive unchanged — EDIT THE LINE, do not
+//                 delete it — and P5's "no timing moved" claim still holds for both of them.
+//   PANEL_FADE:   the celebration panel's fade, in AND out — one number, which is why
+//                 drawCelebrationPanel() needs no per-site fork (A3/B3 in easeOut, out easeIn). It was
+//                 written for BOTH call sites; CS043 P2 left game over as the only one, number unmoved.
 //   GAMEOVER_IN:  the GAME OVER stack's fade-in once the panel is gone (B4 in, easeOut).
-const CEREMONY_ANNOUNCE_OUT = 0.35, CEREMONY_PANEL_FADE = 0.35, CEREMONY_GAMEOVER_IN = 0.40;
+const CEREMONY_PANEL_FADE = 0.35, CEREMONY_GAMEOVER_IN = 0.40;
 
 // The lab's curves, ported verbatim from tools/ceremony-lab.html's CURVES table, and applied the way
 // its alphaOf() applies them: the curve takes the FRACTION ELAPSED for a fade-in and the FRACTION
@@ -3734,23 +3816,15 @@ window.addEventListener("keydown", e => {
   if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
   keys[k] = true;
 
-  // CS036 P2 (spec §1.4): the "Level N Complete" announcement owns input while it is up — and it sits
-  // IMMEDIATELY ABOVE the celebration panel's branch so input priority matches the visual order:
-  // announcement -> panel -> play. ⛔ THIS BRANCH MIRRORS THAT ONE; it does not invent a contract. Same
-  // confirm-or-back pair, same `!e.repeat` edge, same unconditional `return`, and the same two functions
-  // shared with the gamepad path so neither handler carries its own copy of the fork.
-  //   The `return` is load-bearing twice over here: without it the confirm that just dismissed the
-  // announcement would fall through into the panel branch below and dismiss the panel it JUST opened, in
-  // one keypress — and ESC (which is `back` AND `pause`) would dismiss and then open the pause menu.
-  //   ⛔ A HELD BUTTON CANNOT SKIP THE ANNOUNCEMENT, structurally, which is why no minimum-hold timer
-  // was added (spec §1.4): the keydown that fired the killing shot arrived BEFORE the freeze armed, and
-  // every keydown after it carries e.repeat. Fire is " " and confirm is "enter", so the key the player is
-  // most likely holding at a wave clear is not even a candidate. ⚠ Gate question H2 verifies this in the
-  // hand.
-  if (levelDoneActive()) {
-    if (!e.repeat && (bindings.confirm.keys.includes(k) || bindings.back.keys.includes(k))) dismissLevelDone();
-    return;
-  }
+  // ⛔ CS043 P1 (spec §1.1/§1.2): THE "Level N Complete" ANNOUNCEMENT'S KEYBOARD BRANCH STOOD HERE,
+  // immediately above the panel's, and is DELETED — together with its gamepad mirror at (2.3) in
+  // handleGamepadMenu(). ⛔ BOTH HANDLERS OR NEITHER (CLAUDE.md's CS030 P4 rule) cuts the same way on
+  // the way out as on the way in: deleting one and not the other would leave a controller player
+  // pressing A at a levelDoneActive() that no longer exists. The wave now advances at the wave-clear
+  // latch itself, so there is no confirm to take and nothing here for a branch to own; the panel's
+  // branch below is once again the FIRST in-play interception, and its own `return` reasoning is
+  // unchanged. What is gone with it: the untimed hold, its `!e.repeat` edge, and the held-button
+  // argument (there is nothing left to skip).
 
   // CS030 P4 (FORK-CS030-C): the achievement celebration panel owns input while it is up. The `return`
   // is load-bearing: without it the confirm that just dismissed the panel would fall straight through
@@ -3766,6 +3840,8 @@ window.addEventListener("keydown", e => {
     if (!e.repeat) {
       if (k === "arrowup" || k === "w") celebrationScroll(-1);
       else if (k === "arrowdown" || k === "s") celebrationScroll(1);
+      else if (k === "arrowleft" || k === "a") celebrationTab(-1);    // CS044 P4 — mirrored at (2.4)
+      else if (k === "arrowright" || k === "d") celebrationTab(1);
       else if (bindings.confirm.keys.includes(k) || bindings.back.keys.includes(k)) dismissCelebration();
     }
     return;
@@ -3833,18 +3909,10 @@ function handleGamepadMenu() {
     return;
   }
 
-  // (2.3) CS036 P2 (spec §1.4): the "Level N Complete" announcement — the MANDATORY mirror of the keydown
-  // branch above, sitting ahead of the panel's (2.4) for the same priority reason it does there
-  // (announcement -> panel -> play). ⛔ BOTH HANDLERS OR NEITHER (CLAUDE.md's standing CS030 P4 rule): a
-  // guard added to one and not the other lets a controller player blow straight through with Start and
-  // never see the announcement. Start is SWALLOWED, not acted on — exactly as at (2.4), and that is what
-  // stops it reaching the startGame()/openPause() chain at (3). gpPressed() is a rising edge, so A held
-  // through the killing shot cannot dismiss this either; nothing here reads a direction, so the arm's
-  // resetMenuNav() has no consumer in this branch and is there for whatever takes input next.
-  if (levelDoneActive()) {
-    if (pressedConfirm || pressedBack) dismissLevelDone();
-    return;
-  }
+  // ⛔ CS043 P1 (spec §1.1/§1.2): (2.3), THE "Level N Complete" ANNOUNCEMENT'S GAMEPAD BRANCH, STOOD
+  // HERE and is DELETED — the MANDATORY other half of the keydown deletion above it, taken in the same
+  // phase for the same standing CS030 P4 rule. (2.4) below keeps its number: renumbering it would make
+  // every surviving cross-reference to "(2.4), the panel" wrong for no gain.
 
   // (2.4) CS030 P4: the celebration panel — the MANDATORY mirror of the keydown guard. Without this
   // half a controller player blows straight through the panel with Start and never sees it.
@@ -3859,6 +3927,8 @@ function handleGamepadMenu() {
     const nav = menuNavEdges();
     if (nav.up)   celebrationScroll(-1);
     if (nav.down) celebrationScroll(1);
+    if (nav.left)  celebrationTab(-1);   // CS044 P4 — the keydown guard's left/right, same verb; after
+    if (nav.right) celebrationTab(1);    // up/down (menuInput's order), so a diagonal still lands at scroll 0
     if (pressedConfirm || pressedBack) dismissCelebration();
     return;
   }
@@ -3917,8 +3987,11 @@ function menuNavEdges() {
 // Prime the latch to the CURRENT direction state so a direction held at the moment a menu opens
 // doesn't fire a phantom first move. CS042 P10 (spec §5.3): also clears menuKeys{} and the repeat
 // timer, for the same reason — a direction held across a screen change must not repeat into whatever
-// takes input next either. Called at four sites (menu open, the wave-clear arm, both celebration-panel
-// opens); openDebug()'s own call inherits the same fix for the same reason.
+// takes input next either. Called at two sites (menu open, the celebration panel's open at the death
+// seam — updateDeath()'s "dying" -> "gameover" handoff, the run killShip() started);
+// openDebug()'s own call inherits the same fix for the same reason. There were four: CS043 P1 deleted
+// the wave-clear arm's call and dismissLevelDone()'s level-seam panel open, and CS043 P2 made the panel
+// game-over-only in name as well as in fact.
 function resetMenuNav() {
   Object.assign(menuNav, menuDirState());
   for (const k in menuKeys) menuKeys[k] = false;
@@ -4313,8 +4386,8 @@ const clamp01 = v => Math.max(0, Math.min(1, v));
 const settings = {
   musicTrack:      "zen",  // "zen" | "derelict" | "drift" | "warehouse" — selected gameplay track (v3.5; zen default)
   shipTurnScale:   SHIP_TURN_SCALE_DEFAULT, // CS010 §10b: player rotation-speed multiplier (0.5..1.5), read by shipTurnRate()
-  voiceStyle:      "comms", // CS011: selected Dan voice — "off" or a VOICE_STYLE_VALUES id. NOT persisted yet (later phase).
-  captions:        true,    // CS011: show on-screen captions of Dan's lines. NOT persisted yet (later phase).
+  voiceStyle:      "comms", // CS011: selected Dan voice — "off" or a VOICE_STYLE_VALUES id. Persisted since CS011 P3.
+  captions:        true,    // CS011: show on-screen captions of Dan's lines. Persisted since CS011 P3.
   autoShield:      false,   // CS012 P5: auto-raise the shield on a hit at critical hull (costs energy + AUTO_SHIELD_SCORE_PENALTY). Off by default.
 };
 
@@ -4783,6 +4856,16 @@ const DEBUG_VARS = [
   // DEBRIS_BOUNCE_RESTITUTION one directly above.
   { id: "earlyWorldLevels", label: "Small-world levels", unit: "",
     def: 5, min: 0, max: 20, step: 1 },
+  // CS043 P4 (spec §5.2): the live spawn floor. spawnFieldSatellites() places every new large Garbage
+  // Satellite in a ring [DEBUG.spawnMinDist, SPAWN_MAX_DIST] around the ship's CURRENT world position —
+  // now visible every wave since CS043 P1 deleted the level-end freeze, not just at the start of a run.
+  // def derives from SPAWN_MIN_DIST, which stays in place as the documented shipped value — the
+  // earlyWorldLevels idiom just above.
+  //   NOT A LEVER: a fixed placement floor, in the same category as SPAWN_MAX_DIST/DOCK_MAX_DIST beside
+  // it — no floor/ceil/steps triple, no ▼/↳ glyph, no carriesTo, no LEVERS row. GLOBAL rather than JUNK
+  // because it governs placement, not the junk chain's pressure.
+  { id: "spawnMinDist", label: "Spawn ring floor", unit: "px",
+    def: SPAWN_MIN_DIST, min: 0, max: 600, step: 10 },
   // CS024 P6d (gate tooling, PLANNED-FEATURES-CS024.md §4.5): jumps startGame()'s wave seed so Gate B
   // can sample a deep level without playing up to it. NOT A LEVER — a plain flat knob, no ▼/↳ glyph, no
   // (inv), no floor/ceil/steps triple; it belongs to no chain. FIDELITY LIMIT (real, do not "fix" by
@@ -4848,27 +4931,48 @@ const DEBUG_VARS = [
     def: MENU_REPEAT_DELAY, min: 0.1, max: 1.5, step: 0.05 },
   { id: "menuRepeatRate", label: "Menu repeat rate", unit: "s",
     def: MENU_REPEAT_RATE, min: 0.03, max: 0.5, step: 0.01 },
+  // CS044 P1 (spec §3.1): the collision-hitbox overlay — paints the ship's and every hazard's
+  // collision circle, filled, so a near-miss can be read against the ART rather than guessed at.
+  // Instrumentation, not a gameplay knob — sessionSwitch: true (FORK-CS044-D, resolved (a)): off at
+  // every launch, never persisted, exempt from the master "Overrides Applied" toggle in both
+  // applyDebug and rebuildDebug (the telemetryCapture precedent; see CLAUDE.md, Debug registry —
+  // sessionSwitch and presentation knobs). NOT A LEVER — no floor/ceil/steps triple, no ▼/↳ glyph, no
+  // carriesTo, no LEVERS row.
+  { id: "hitboxOverlay", label: "Show collision hitboxes", unit: "",
+    def: 0, min: 0, max: 1, step: 1, boolLabels: ["OFF", "ON"], sessionSwitch: true },
   { header: "CELEBRATION" },
   // CS038 P5: the two knobs that used to live here (scroll step, emblem size) are retired to
   // CELEB_SCROLL_STEP / CELEB_EMBLEM_SIZE constants — pure look, tuned by eye, no gameplay effect.
   // Full provenance is on the constants themselves.
-  // CS035 P3 (spec §3.2): the LEVEL-END PROTECTION WINDOW's knobs. They live under CELEBRATION
-  // because the window exists to wrap the celebration-panel seam — wave clear -> hold -> panel (if any)
-  // -> "Level N" banner -> grace -> vulnerable. NOT LEVERS: no floor/ceil/steps triple, no carriesTo, no
-  // LEVERS row. A protection window is a look-and-feel call, not a pressure axis (DIFFICULTY-LEVERS.md §4).
+  // CS035 P3 (spec §3.2): the LEVEL-END PROTECTION WINDOW's knobs. ⛔ CS043 P3 (item 4) — THE WINDOW'S
+  // SHAPE IS NOW: wave clear -> nextWave() on that SAME frame -> "Level N+1" banner -> grace ->
+  // vulnerable. Every step is live play with damage off; nothing between the clear and the next level
+  // stops the field, and the window is bounded at levelBannerTime + levelEndGrace.
+  //   Why these rows sit under CELEBRATION is HISTORY, kept rather than deleted: CS035 put them here
+  // because the window then existed to wrap the celebration-panel seam — wave clear -> hold -> panel (if
+  // any) -> banner -> grace. CS036 stretched that into a frozen, player-paced ceremony; CS043 P1 deleted
+  // the hold and the freeze and CS043 P2 made the panel game-over-only, so the panel no longer sits inside
+  // this window at all. ⛔ NO ROW MOVES GROUP: registry order fixes row index, and a group move is a
+  // re-index for zero behavioural gain. NOT LEVERS: no floor/ceil/steps triple, no carriesTo, no LEVERS
+  // row. A protection window is a look-and-feel call, not a pressure axis (DIFFICULTY-LEVERS.md §4).
   //   ⛔ CS036 P2 (spec §1.2, FORK-CS036-E) RETIRED `levelEndHold` — the fourth row, which stood at the
-  // top of this group and timed the pre-nextWave() pause (5.00 s, min 0 / max 15 / step 0.25). The hold
-  // it timed is now PLAYER-PACED: the completion announcement holds until confirm or back, so there is
-  // nothing left for a duration knob to time. Registry 106 -> 105. ⛔ NO MIGRATION SHIM AND NONE IS
+  // top of this group and timed the pre-nextWave() pause (5.00 s, min 0 / max 15 / step 0.25). CS036 made
+  // the hold PLAYER-PACED, leaving a duration knob nothing to time, and CS043 P1 then deleted the hold
+  // outright. Registry 106 -> 105. ⛔ NO MIGRATION SHIM AND NONE IS
   // WANTED — a saved `debug.levelEndHold` in afd_settings_v1 orphans harmlessly under loadSettings'
   // known-value-else-default rule, which is the whole point of that rule (CLAUDE.md, Save data).
+  //   ⛔ CS043 P3 (spec §4.2): levelEndGrace's def 3.00 -> 1.25. CS043 P1 turned the whole 2.2 s banner
+  // into live protected play, so at 3.00 the protected stretch grew from ~3.5 s to 5.2 s. Paul's Q3
+  // answer was "about what today's live part gives (~3.5 s)"; the banner's hold is a readability
+  // requirement and does not give, so the grace does: 2.2 + 1.25 = 3.45 s. 1.25 is on this row's own
+  // 0.25 step — 1.30 would hit 3.5 exactly and is off-step, false precision on a number given as "about".
   //   ⛔ BOTH TIME KNOBS BELOW ARE ONE-WAY TRANSITION TIMES — "how long does 100% -> 20% take". The full
   // pulse PERIOD is 2x each of them (0.5 s at rest, 0.16 s at the end of the grace). They are in the same
   // units as each other deliberately: levelEndGracePulseEnd was offered in conversation as a 0.15 s
   // PERIOD, and a mixed-units pair sitting two rows apart would eventually be read against each other and
   // be wrong by a factor of two. Do not "fix" one of them into a period.
   { id: "levelEndGrace", label: "Level-end grace", unit: "s",
-    def: 3.00, min: 0, max: 10, step: 0.25 },
+    def: 1.25, min: 0, max: 10, step: 0.25 },
   { id: "levelEndFade", label: "Level-end fade time", unit: "s",
     def: 0.25, min: 0.05, max: 1.50, step: 0.05 },
   { id: "levelEndGracePulseEnd", label: "Level-end grace pulse end", unit: "s",
@@ -7970,6 +8074,16 @@ const COLOR = {
   ach: "#ffcf5a"            // achievement gold — the unlock toast + earned-achievement highlight (F9)
 };
 
+// CS044 P1 (spec §3.2): the debug collision-hitbox overlay's fill — a THIRD, debug-only exception to
+// GDD §3.2's no-fills rule (drawText and the low-health edge glow are the other two), by Paul's
+// decision — it draws nothing unless a developer switches DEBUG.hitboxOverlay on. Alpha lives in the
+// colour string, never ctx.globalAlpha (the low-health edge glow's own convention).
+const HITBOX_FILL = "rgba(255,40,40,0.5)";
+// CS044 GATE A (Paul): the ship's disc is SHIP_RADIUS (13 px), about the size of the hull art it sits
+// under, so filled alone it read as a red tint on the ship rather than a hitbox — Paul took it for not
+// drawing at all. The ship's circle also gets this outline ring. A glowStroke, so no new fill exception.
+const HITBOX_RING = "#ff3030";
+
 // Tiered-achievement ladders (v3.0 P7): every tiered lifetime achievement climbs bronze -> diamond.
 // The badge colours stay a warm-metal -> cool-white ramp inside the vector-glow discipline (FLAG
 // A-1-a): no teal/green/lime (those are Hunter/Debris/salvage tells) so a tier badge never reads as
@@ -8202,15 +8316,23 @@ class Ship {
     // top of the 2Hz pulse. The pulse REPLACES it; ship.invuln itself is untouched and still decays.
     // ⛔ THE 0.2 FLOOR AND THE 1.0 CEILING ARE NOT KNOBS (spec §3.5). Two more sliders for a thing whose
     // whole job is "obviously not normal" is knob sprawl; a different floor is a later one-line change.
-    // ⛔ CS036 P3 (FORK-CS036-D -> D1) — TWO QUESTIONS, TWO CONDITIONS, DELIBERATELY NOT ONE. `pulsing`
-    // is the GRACE (the window's last step, the only one that is live gameplay with damage off) and gates
-    // the alpha pulse; `levelEndSafe` is the WHOLE window and still gates the blink suppression, because
-    // that answers the different question "is a hit-stun strobe allowed to run", and a hit taken just
-    // before the clear leaves invuln decaying across the frozen hold whether anything pulses or not.
-    // Merging them would strobe the ship at 10Hz over a stopped field. The accumulator in update() reads
-    // the same `levelEndGraceT > 0`; the two sites move together or not at all.
+    // ⛔ TWO QUESTIONS, TWO NAMES, DELIBERATELY NOT ONE — AND AS OF CS043 P3 THEY ARE TEXTUALLY EQUAL.
+    // `pulsing` asks "should the ship TELL the player they cannot be hit" and gates the alpha pulse.
+    // `blink` asks "is a hit-stun strobe allowed to run", and is suppressed across the whole window
+    // because a hit taken just before the clear leaves invuln decaying into it, which would strobe the
+    // ship at 10Hz on top of the pulse. ⛔ DO NOT COLLAPSE THEM into one variable or one name because both
+    // now read game.levelEndSafe: that equality is a fact about today's window, not about the questions,
+    // and the next change to either one must be able to move it alone.
+    //   CS036 P3 (FORK-CS036-D -> D1) put `pulsing` on the GRACE only, reasoning that the pulse says "you
+    // cannot be hit right now" and so belongs only to the step that was live gameplay with damage off —
+    // the rest of CS036's window was a frozen field. ⛔ CS043 P3 (FORK-CS043-A, resolved by Paul at review
+    // 2026-09-09: SPAN THE WHOLE WINDOW) KEEPS D1'S REASONING AND REVERSES ONLY ITS CONCLUSION. CS043 P1
+    // deleted the freeze, so every frame of the window is now live play with damage off, and D1's own
+    // criterion selects all of it. This is not the fork being decided wrong twice.
+    //   The accumulator in update() reads the same game.levelEndSafe; THOSE two sites — the pulse's
+    // condition here and the phase's condition there — move together or not at all.
     const levelEndSafe = game.levelEndSafe;
-    const pulsing = game.levelEndGraceT > 0;
+    const pulsing = levelEndSafe;
     const blink = !levelEndSafe && this.invuln > 0 && Math.floor(this.invuln * 10) % 2 === 0;
     if (!blink) {
       // ⛔ SET-DRAW-RESTORE, the file's standing idiom (three other sites, the shield block below among
@@ -8227,6 +8349,14 @@ class Ship {
       // SCOOP_DEPTH[lvl]. This is a TELL for inScoopBox()'s capture region, not a literal outline of
       // it — the box's rear edge at forward=-SHIP_RADIUS isn't shown. Corners derived, never
       // hardcoded. No fill. Hidden at level 0.
+      // ⛔ CS044 P2 (spec §1.2) — THE DRAWN V CLAMPS AT SCOOP_MOUTH_LEVELS; THE CAPTURE REGION DOES
+      // NOT. buildScoopSteps() extrapolates past level 5, so SCOOP_WIDTH[6]/[7] and SCOOP_DEPTH[6]/[7]
+      // are genuinely larger and inScoopBox() captures with them. This render reads the tables at
+      // Math.min(lvl, SCOOP_MOUTH_LEVELS) instead, so a level-6 or level-7 ship draws EXACTLY the
+      // level-5 V. Paul's CS043 GATE A call (A10): the top two levels get a larger pickup cone and
+      // draw nothing bigger than level 5. Clamping at SCOOP_MAX_LEVEL here draws longer lines at 6-7,
+      // which is precisely what he ruled out. The V under-reports capture at 6-7 by design, the same
+      // knowing trade CS010 P1 already made for the box's undrawn rear edge.
       // ⛔ CS025 P5 — DO NOT RE-ADD A MAGNET-PULL RECOLOUR HERE. CS025 P3 made this stroke go
       // POWERUP_COLOR.magnet at SCOOP_MAGNET_W/_BLUR while magnetPulling(), plus a fixed nose-V at
       // scoopLevel 0, as the player-facing tell for §1's full-cargo suppression. The CS025 playtest
@@ -8234,57 +8364,28 @@ class Ship {
       // "charged" at all, so the tell informed nobody while adding a second thing moving on the hull.
       // Paul's call, on the record — the ship does not need another visual channel. The suppression
       // itself SHIPS and is unaffected; it simply has no on-ship tell. See GDD §2.14.1.
-      // ⛔ CS042 P11 (GATE C, G4) — EVERY SCOOP SHAPE STROKES DASHED, AND THAT IS THE WHOLE ANSWER
-      // TO G4. Paul's playtest read: the mouth V and the level-6/7 orbs look like ship geometry —
-      // solid glow-strokes that imply hittable hull — so a hit landing near one feels as though it
-      // should have hurt. Nothing drawn here has ever been collidable (inScoopBox() is a capture
-      // test; no collision pass reads any of these points), so the render was contradicting the
-      // mechanics. A broken outline reads as a projected field; a continuous one reads as a plate.
-      // ⛔ TRANSPARENCY WAS THE OTHER CANDIDATE AND IT IS NOT AVAILABLE IN THIS BLOCK. ctx.globalAlpha
-      //   here belongs to the level-end grace pulse under the SET-DRAW-RESTORE idiom above — the same
-      //   reason CS042 P8 made the level-7 tether COLOR.dim rather than scoop-violet at reduced alpha
-      //   ("faint is a colour choice, not an alpha one"). That call is unreversed and still stands.
-      //   A faint solid outline is also still an outline: it dims the boundary without stopping it
-      //   reading as one, and G4 is about what the shape MEANS, not how loud it is.
-      // ⛔ SET-DRAW-RESTORE, AND THE RESTORE IS MANDATORY. drawPoly() wraps its own save()/restore()
-      //   pair, which PRESERVES the dash across the call rather than clearing it — so once set the
-      //   pattern survives every later stroke until it is explicitly cleared. The hull, the thruster
-      //   flame, the shield and every entity drawn after the ship must stroke solid.
-      // ⚠ Cost, because it was flagged as a real question and not a knob turn: two setLineDash()
-      //   calls per drawn frame, on the ship alone, and only while a scoop exists. Nothing else in
-      //   the file uses the pattern — this is its one site.
-      const scoopField = game.scoopLevel > 0;
-      if (scoopField) ctx.setLineDash([SCOOP_FIELD_DASH, SCOOP_FIELD_GAP]);
+      // ⛔ CS044 P2 — CS042 P11'S DASHED FIELD AND CS042 P8'S FLANKING ORBS ARE BOTH DELETED FROM THIS
+      // BLOCK, at Paul's CS043 GATE A call (A10). Rewritten in place, not dropped, because both were
+      // deliberate and the reversal only reads right beside them.
+      //   P11 (GATE C, G4) wrapped every scoop shape in ctx.setLineDash([SCOOP_FIELD_DASH,
+      //   SCOOP_FIELD_GAP]) (6/6), armed here and cleared before the hull — mandatory, because
+      //   drawPoly()'s save()/restore() PRESERVES a dash — so the scoop would read as a projected
+      //   field rather than as hittable hull. P8 drew one SCOOP_ORB_SEGS-gon per side at ship-local
+      //   (0, +/-SCOOP_ORB_OFFSET[lvl]) in POWERUP_COLOR.scoop at levels 6-7, plus a COLOR.dim tether
+      //   to the hull at level 7.
+      //   GATE A: the dash was "distracting and cumbersome" — back to solid lines — and levels 6-7
+      //   extrapolate the mouth instead of growing orbs. The arm, the clear, the `scoopField`
+      //   binding, both orb rings and both tethers are gone; THE BUILD HAS ZERO setLineDash() SITES.
+      //   G4's observation still stands on the record (nothing drawn here is collidable —
+      //   inScoopBox() is a capture test); the dash just was not the answer to it.
+      // ⚠ SETTLED, AND UNCHANGED BY ANY OF THIS: nothing in this block writes ctx.globalAlpha. That
+      //   channel belongs to the level-end grace pulse's SET-DRAW-RESTORE above — which is why
+      //   transparency was never available as G4's answer, and why P8's tether was a COLOUR choice.
       if (game.scoopLevel > 0) {
-        const lvl = game.scoopLevel, hw = SCOOP_WIDTH[lvl] / 2, d = SCOOP_DEPTH[lvl];
+        const lvl = Math.min(game.scoopLevel, SCOOP_MOUTH_LEVELS);   // CS044 P2: the drawn V clamps at 5
+        const hw = SCOOP_WIDTH[lvl] / 2, d = SCOOP_DEPTH[lvl];
         drawPoly([[d, -hw], [16, 0], [d, hw]], this.x, this.y, this.angle, COLOR.dock, false);
       }
-      // The flanking orbs (CS042 P8, spec §4.3) — levels 6-7, drawn alongside the mouth V and still
-      // BEFORE the hull. One stroked ring per side at ship-local (0, +/-SCOOP_ORB_OFFSET[lvl]) with
-      // radius SCOOP_ORB_R[lvl], in POWERUP_COLOR.scoop so the orbs read as the Scoop's own violet
-      // rather than the mouth's collector green. A SCOOP_ORB_SEGS-gon through drawPoly, so it strokes
-      // through glowStroke like every other vector. NO FILL (Pillar 1) — never a ctx.arc fill.
-      // Geometry is derived from the same two tables inScoopBox() tests, never hardcoded.
-      // ⛔ The level-7 tether is COLOR.dim rather than scoop-violet at reduced alpha: ctx.globalAlpha
-      // in this block is already owned by the level-end grace pulse under the SET-DRAW-RESTORE idiom
-      // above, and a second writer here would clobber it. "Faint" is a colour choice, not an alpha one.
-      // ⛔ CS025 P5's prohibition applies here too — no magnet-pull recolour, on either shape.
-      if (SCOOP_ORB_R[game.scoopLevel] > 0) {
-        const lvl = game.scoopLevel, off = SCOOP_ORB_OFFSET[lvl], orbR = SCOOP_ORB_R[lvl];
-        for (const side of [-1, 1]) {
-          const ring = [];
-          for (let i = 0; i < SCOOP_ORB_SEGS; i++) {
-            const a = (i / SCOOP_ORB_SEGS) * TAU;
-            ring.push([Math.cos(a) * orbR, side * off + Math.sin(a) * orbR]);
-          }
-          drawPoly(ring, this.x, this.y, this.angle, POWERUP_COLOR.scoop);
-          if (lvl >= SCOOP_ORB_TETHER_LEVEL) {
-            drawPoly([[0, side * SHIP_RADIUS], [0, side * (off - orbR)]],
-              this.x, this.y, this.angle, COLOR.dim, false);
-          }
-        }
-      }
-      if (scoopField) ctx.setLineDash([]);   // ⛔ CS042 P11: back to solid BEFORE the hull below
       const pts = [[16, 0], [-11, -9], [-6, 0], [-11, 9]];
       drawPoly(pts, this.x, this.y, this.angle, COLOR.ship);
       if (this.thrusting && Math.random() < 0.8) {
@@ -8292,6 +8393,57 @@ class Ship {
         drawPoly(flame, this.x, this.y, this.angle, "#ffb060", false);
       }
       if (pulsing) ctx.globalAlpha = 1;   // CS035 P3: restore BEFORE the shield block below
+    }
+    // CS044 P3 (spec §2): the powerup-pickup flash — a fading glow of the capture area, armed by the
+    // pickup pass in update(). ⛔ Drawn AFTER the pulse's alpha restore above and OUTSIDE the
+    // `if (!blink)` gate: a hit-stun blink-off frame and the level-end window are both common moments
+    // to grab a powerup, and neither may hide or dim this tell. Opacity lives in the stroke colour
+    // string, never ctx.globalAlpha (⚠ SETTLED — that channel belongs to the pulse above). "No fill"
+    // held until CS044 GATE A, when Paul asked for a glowing fill under the outline (flashShape below).
+    // FORK-CS044-B, resolved (a): the TRUE capture region — rectangle + circle, both outlined — never
+    // the familiar V, and never clamped to SCOOP_MOUTH_LEVELS the way the mouth render above is; Paul
+    // asked for "the scoop hitbox area." FORK-CS044-C, resolved: POWERUP_COLOR.scoop (violet), never
+    // COLOR.dock, so it never reads as the mouth V it overlaps.
+    if (game.scoopFlashT > 0) {
+      const alpha = SCOOP_FLASH_ALPHA_END + (SCOOP_FLASH_ALPHA_START - SCOOP_FLASH_ALPHA_END) *
+                    (game.scoopFlashT / SCOOP_FLASH_TIME);
+      const flashColor = `rgba(${SCOOP_FLASH_RGB},${alpha})`;
+      // CS044 GATE A: each shape is FILLED with a glow first, then outlined — the fill's alpha is the
+      // outline's times SCOOP_FLASH_FILL_FRAC, baked into the colour string like the outline's. Same
+      // save/translate/rotate as drawPoly(), so the fill lands exactly under the stroke.
+      const fillColor = `rgba(${SCOOP_FLASH_RGB},${alpha * SCOOP_FLASH_FILL_FRAC})`;
+      const flashShape = pts => {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.angle);
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+        ctx.closePath();
+        ctx.fillStyle = fillColor;
+        ctx.shadowColor = flashColor;
+        ctx.shadowBlur = SCOOP_FLASH_GLOW;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.restore();
+        drawPoly(pts, this.x, this.y, this.angle, flashColor);
+      };
+      // The pickup circle: r = POWERUP_RADIUS + SHIP_RADIUS (43px), the exact base pickup test read
+      // from the same numbers, as a closed N-gon — the deleted orb ring's own idiom. Drawn even at
+      // scoopLevel 0 (Paul: a bare-hulled ship still flashes the pickup circle).
+      const fr = POWERUP_RADIUS + SHIP_RADIUS;
+      const circlePts = [];
+      for (let i = 0; i < 16; i++) { const th = (i / 16) * TAU; circlePts.push([Math.cos(th) * fr, Math.sin(th) * fr]); }
+      flashShape(circlePts);
+      // The capture square, at the TRUE scoop level (6-7 included, per spec §0.1) — the exact
+      // inScoopBox() region, never the mouth render's Math.min(lvl, SCOOP_MOUTH_LEVELS) clamp above.
+      // CS044 GATE A: this was the rectangle; it is now SCOOP_SQUARE's four corners — back corner on the
+      // V's apex, two sides along the V's lines (see SCOOP_SQUARE's header).
+      if (game.scoopLevel > 0) {
+        const q = SCOOP_SQUARE[game.scoopLevel];
+        const ux = q.side * q.cx, uy = q.side * q.cy;
+        flashShape([[SCOOP_APEX_X, 0], [SCOOP_APEX_X + ux, uy], [SCOOP_APEX_X + 2 * ux, 0], [SCOOP_APEX_X + ux, -uy]]);
+      }
     }
     if (this.shieldOn) {
       ctx.beginPath();
@@ -9453,7 +9605,7 @@ const game = {
   stats: resetGameStats(), // per-game achievement counters/flags (F9)
   toasts: [],       // active achievement-unlock toasts { name, life } (F9)
   pendingAch: [],   // CS030 P1: unlocks banked since the last celebration-panel flush
-  celebration: null, // CS030 P1: the live celebration panel { items, scroll }, or null
+  celebration: null, // CS030 P1: the live celebration panel { items, scroll, tab } (tab CS044 P4), or null
   // Pause-menu state machine (F8): screen = null | "root" | "options" | "controls";
   // index = cursor for root/options; row/col = cursor for the controls grid;
   // rebinding = { action, device } while capturing a new binding, else null.
@@ -9494,6 +9646,9 @@ const game = {
                                                         // NOT drawHUD() — see the update() call site.
   scoopLevel: 0,                                       // PERSISTENT scoop upgrade level 0..SCOOP_MAX_LEVEL (v3.3 P3; NOT a budgeted effect)
   scoopHits: 0,                                        // running non-lethal-hit tally; every SCOOP_HITS_PER_LEVEL costs a level
+  scoopFlashT: 0,                                      // CS044 P3: sec left on the powerup-pickup flash tell (§2.14.1).
+                                                        // Armed to SCOOP_FLASH_TIME by the pickup pass, ticked down in
+                                                        // update(), never saved — a resumed run starts with no flash.
   healthTimer: 0,                                      // countdown to the next ambient Health spawn
   healthSpawnLock: 0,                                  // CS042 P6: sec of global Health spawn lockout left. Armed to
                                                         // DEBUG.healthSpawnLock by EVERY spawn route and respected by
@@ -9629,9 +9784,12 @@ const game = {
   // saying — the exact failure Q6 was raised about. The two announcements share a string, nothing else.
   levelBanner: { text: "", life: 0 },
   // CS035 P3 (spec §3.3) — THE LEVEL-END PROTECTION WINDOW. Three fields, one window: it opens on the
-  // frame the last Garbage Satellite dies, spans the hold, the celebration panel, nextWave() and the
-  // "Level N" banner, and closes when the post-banner grace runs out. Declared in BOTH this literal and
-  // resetRun() per the standing CS016 P3 rule.
+  // frame the last Garbage Satellite dies, spans nextWave() and the "Level N+1" banner, and closes when
+  // the post-banner grace runs out. Declared in BOTH this literal and resetRun() per the standing
+  // CS016 P3 rule.
+  //   ⛔ CS043 P1 (spec §1.1): the hold and the level-seam celebration panel STOOD BETWEEN the clear and
+  // nextWave() and are both gone — nextWave() now runs on the clearing frame itself, at the latch that
+  // opens this window. Three fields is what CS035 P3 shipped; CS036's two extra ones came and went.
   //
   // ⛔ levelEndSafe IS NOT ship.invuln, AND THE TWO ARE NEVER MERGED. ship.invuln is HIT-STUN — it is set
   // by damageShip(), it decays in Ship.update(), and it drives a 10Hz hard square blink in Ship.draw().
@@ -9641,17 +9799,18 @@ const game = {
   //
   // ⛔ NOT RESET BY nextWave(), WHICH RUNS INSIDE THE WINDOW. See the note in nextWave().
   //
-  // ⛔ CS036 P3 (spec §1.2, FORK-CS036-C -> C2) — IT KEEPS ITS FULL EXTENT, AND MOST OF THAT EXTENT IS
-  // NOW REDUNDANT ON PURPOSE. Since CS036 P2 the field is FROZEN from the clear through the hold, the
-  // panel and most of the "Level N+1" banner, so across all of that there is nothing moving for the four
-  // gate sites to protect the ship from — updateLevelEndFreeze() resolves no collision at all. Only the
-  // grace, the window's last step, is doing load-bearing work. That overlap was weighed and KEPT, as
-  // belt-and-braces: narrowing this flag to the grace would make the protection depend on the freeze's
-  // extent being exactly right, in a build where the freeze can be lifted early by a debug knob
-  // (levelBannerTime/Fade) and where a death on the clearing frame already leaves an orphaned arm behind.
-  // ⛔ NO GATE SITE MOVES, AND A CLEANUP PASS THAT "NOTICES" THE REDUNDANCY IS READING THIS COMMENT FOR
-  // A REASON. The one thing that DID narrow to the grace is the alpha pulse (FORK-CS036-D, Ship.draw()),
-  // which is a tell rather than a protection and had nothing to say over a stopped field.
+  // ⛔ CS043 P1 (spec §1.1/§4.1) — CS036 P3's FORK-C -> C2 NOTE STOOD HERE, AND ITS CONCLUSION SURVIVES
+  // ITS PREMISE. That note read: the flag keeps its full extent even though most of that extent is
+  // redundant, because from CS036 the field was FROZEN from the clear through the hold, the panel and
+  // most of the "Level N+1" banner, so there was nothing moving for the gate sites to protect from.
+  // ⛔ THE REDUNDANCY IS GONE, NOT THE RULE. Nothing freezes any more, so EVERY frame this flag covers
+  // is now live gameplay with damage off — each of the four gate sites is doing load-bearing work for
+  // the whole of it, which is exactly what C2 was preserving the extent FOR. ⛔ NO GATE SITE MOVES, and
+  // a cleanup pass that "notices" a redundancy here is reading a comment that no longer claims one.
+  //   The window is now `levelBannerTime + levelEndGrace` long and bounded — there is no player-paced
+  // hold left to stretch it (spec §4.1). ⛔ CS043 P3 (FORK-CS043-A) widened the alpha pulse from the
+  // grace alone to the whole window, so this flag is now the pulse's condition as well as the blink
+  // suppression's and every damage gate's — see Ship.draw() for why `pulsing` and `blink` stay two names.
   levelEndSafe: false,
   // Seconds of post-banner grace left. > 0 only during the window's last step; armed as a one-shot at the
   // level banner's expiry crossing, and its arrival at exactly 0 is the ONE thing that clears levelEndSafe.
@@ -9660,51 +9819,31 @@ const game = {
   // levelEndGracePulseEnd shortens the period across the grace, and a seconds-based phase would jump
   // discontinuously the moment the period moved. Same integrate-the-phase reason as game.lowHpPhase above.
   levelEndPulseT: 0,
-  // CS036 P1 (spec §0.3, FORK-CS036-A) — THE LEVEL-END CEREMONY'S FREEZE. True while the field is held
-  // STILL for the completion announcement: a true freeze-frame, entities and collisions and the ship and
-  // the tow chain all stopped, run by updateLevelEndFreeze()'s reduced sim rather than by a per-system
-  // gate. A FOURTH field of the level-end window, and the same category as the three above — declared in
-  // BOTH this literal and resetRun() per the standing CS016 P3 rule.
+  // ⛔ CS043 P1 (spec §1.1) — game.levelEndFreeze (CS036 P1) AND game.levelDone (CS036 P2) STOOD HERE
+  // and are DELETED, with the whole level-end ceremony they were the two halves of: the field no longer
+  // stops at a level boundary and nothing announces "Level N Complete". The three fields above are once
+  // again the WHOLE of the level-end window, which is what they were before CS036 — and the window is
+  // now entirely live gameplay, which is the point of the change (spec §0.1a/b).
   //
-  // ⛔ NOT game.paused, for the identical reason CS030 P5's celebration-panel comment gives in update():
-  // setting that would satisfy menuActive() and drag in the whole menu chrome path — music ducking,
-  // drawMenu()'s input branch, the pause screen's semantics — and this is not a menu.
-  //
-  // ⛔ NOT RESET BY nextWave(), which runs INSIDE the freeze. See the note in nextWave().
-  //
-  // CS036 P1 owned the primitive and proved what a frozen frame may still run; CS036 P2 ARMS it, at the
-  // wave clear, and takes the input that lifts it (dismissLevelDone()).
-  levelEndFreeze: false,
-  // CS036 P2 (spec §1.3) — THE COMPLETION ANNOUNCEMENT: null, or { text, age } while "Level N Complete"
-  // is up. Seeded at the wave-clear arm beside levelEndFreeze and cleared by dismissLevelDone(), so it is
-  // the FREEZE's visible half and never outlives it. Reassigned wholesale, exactly like game.levelBanner
-  // and game.caption, and reset in resetRun() with the other four level-end fields.
-  //   `text` is seeded, not derived at draw time, for the same reason game.levelBanner's is: one string,
-  // built once, from the wave that was actually completed. `age` counts UP in seconds (the fade-in's
-  // clock) rather than down like levelBanner.life, because this announcement has no duration at all —
-  // FORK-CS036-E made it player-paced, so there is nothing for a countdown to count (spec §0.4).
-  levelDone: null,
-  // CS042 P5 (spec §3, GATE A) — THE CEREMONY'S FOUR RENDER-ONLY FADE CLOCKS. ⛔ RENDER-ONLY IS THE
-  // WHOLE POINT AND IS NOT A STYLE CHOICE. The cross-fade's new mechanism is "a gated beat's fade-out
-  // runs AFTER the confirm", and both dismissals hard-cut today by NULLING the state the rest of the
-  // build self-gates on. Keeping game.levelDone alive for another 0.35 s would hang updateLevelEndFreeze()
-  // (its hold/tail if/else reads that field, and a non-null levelDone IS the hold — the documented
-  // hard-hang failure mode); keeping game.celebration alive would keep freezing the field, keep owning
-  // both input handlers, and defer nextWave() for the same 0.35 s. So the dissolve gets its OWN state,
-  // which the RENDERER can see and nothing else in the build reads:
-  //   ⛔ NOTHING BELOW IS EVER READ BY INPUT, BY update(), OR BY A GATE. levelDoneActive() and
-  //   game.celebration are still the only two predicates either input handler asks, and neither one
-  //   changed. A future reader adding a term for one of these fields to an input branch, to
-  //   update()'s early return, or to updateLevelEndFreeze() would be re-creating the exact hang this
-  //   arrangement exists to avoid.
-  // All four are ticked by tickCeremony() in loop() — NOT in update() — because every one of them has
+  // CS042 P5 (spec §3, GATE A) — THE CEREMONY'S RENDER-ONLY FADE CLOCKS. ⛔ RENDER-ONLY IS THE
+  // WHOLE POINT AND IS NOT A STYLE CHOICE. The cross-fade's mechanism is "a gated beat's fade-out
+  // runs AFTER the confirm", and the dismissal hard-cuts by NULLING the state the rest of the build
+  // self-gates on: keeping game.celebration alive would keep freezing the field and keep owning both
+  // input handlers. So the dissolve gets its OWN state, which the RENDERER can see and nothing else in
+  // the build reads:
+  //   ⛔ NOTHING BELOW IS EVER READ BY INPUT, BY update(), OR BY A GATE. game.celebration is the only
+  //   such predicate either input handler asks, and it is unchanged. A future reader adding a term for
+  //   one of these fields to an input branch or to update()'s early return would be re-creating the
+  //   exact hang this arrangement exists to avoid.
+  //   ⛔ CS043 P1: there were FOUR of these and there are now THREE — game.levelDoneOut, the
+  //   announcement's dissolving ghost, went with the announcement, and so did its arm in tickCeremony().
+  // All three are ticked by tickCeremony() in loop() — NOT in update() — because every one of them has
   // to run across a state that update() refuses to run in at all (see that function's header). Declared
   // in BOTH this literal and resetRun(), per the standing CS016 P3 rule.
-  levelDoneOut: null,   // { text, t }: "Level N Complete" dissolving, t counting DOWN from CEREMONY_ANNOUNCE_OUT
   celebrationT: 0,      // the LIVE panel's fade-in clock, counting UP; zeroed whenever no panel is up
-  celebrationOut: null, // { items, scroll, resume, wave, t }: the dismissed panel dissolving. `wave` is
-                        // snapshotted because dismissCelebration() runs nextWave() on the next line at the
-                        // level-end site, and the sub-line reads the just-COMPLETED wave (§2.20).
+  celebrationOut: null, // { items, scroll, tab, t }: the dismissed panel dissolving. It carried `resume` and
+                        // `wave` too, for the level-end site's sub-line; CS043 P2 deleted `resume` with
+                        // that site, and `wave` went off-cycle 2026-09-13 once nothing read it (§2.20).
   gameoverT: 0          // the GAME OVER stack's fade-in clock, counting UP; zeroed unless the stack is
                         // actually drawing (state "gameover" with no panel over it), which is what makes
                         // it need no arming call site of its own at either the seam or the dismissal
@@ -9930,6 +10069,8 @@ function resetRun(wave, debugRun) {
                                    // the field must exist in both places (the CS016 P3 rule), and carrying a
                                    // stale `true` out of a previous run would swallow the first fill's kick.
   game.scoopLevel = 0; game.scoopHits = 0;               // persistent scoop upgrade resets each run (v3.3 P3)
+  game.scoopFlashT = 0;            // CS044 P3: no pickup flash carries into a fresh run — same
+                                    // both-places rule as magnetHoldT, above.
   game.healthBank = 0;             // CS040 P3: the spare-charge reserve is PER-RUN — a fresh run starts empty
   game.healthTimer = healthGapRoll();
   game.healthSpawnLock = 0;        // CS042 P6: no spawn lockout carries into a fresh run — the same
@@ -9973,21 +10114,18 @@ function resetRun(wave, debugRun) {
   // note). The order matters for exactly one of the four: startGame() calls nextWave() right after this
   // returns, which seeds the level-1 banner; the banner-expiry arm reads levelEndSafe, so it MUST already
   // be false by then or every new run would open with a free grace period.
-  //   CS036 P1 (spec §1.5 trap 2): game.levelEndFreeze joins them here, at the SAME site and for the same
-  // reason — the freeze arms at the wave clear and lifts partway through the NEXT level's banner, so it is
-  // in-flight state that must survive a wave boundary, not per-level state.
-  //   CS036 P2: game.levelDone (the freeze's visible half) joins them, at the same site and for the same
-  // reason — it is seeded at a wave clear and lives across everything the freeze spans.
+  //   ⛔ CS043 P1 (spec §1.1): CS036's game.levelEndFreeze and game.levelDone were reset HERE, on the two
+  // lines below the three, and both are DELETED with the ceremony. The three are back to being the whole
+  // list, and the paragraph above is unchanged — it was written about them and is still exactly right.
   game.levelEndSafe = false;
   game.levelEndGraceT = 0;
   game.levelEndPulseT = 0;
-  game.levelEndFreeze = false;
-  game.levelDone = null;
-  //   CS042 P5: the four ceremony fade clocks join them, at the same site and for a related reason —
+  //   CS042 P5: the ceremony fade clocks join them, at the same site and for a related reason —
   // a ghost mid-dissolve when the player quits to title must not be inherited by the next run. Unlike
-  // the five above they are pure render state, so this is their ONLY functional reset; the two counters
+  // the three above they are pure render state, so this is their ONLY functional reset; the two counters
   // re-zero themselves every frame they are not wanted (see tickCeremony()).
-  game.levelDoneOut = null;
+  //   ⛔ CS043 P1: game.levelDoneOut was the first of four here and went with the announcement it was the
+  // dissolving ghost of; three remain.
   game.celebrationT = 0;
   game.celebrationOut = null;
   game.gameoverT = 0;
@@ -10125,7 +10263,7 @@ function spawnFieldSatellites(n, speed) {
     // reachable (min distance keeps it off the ship, max keeps it from being
     // stranded on the far side of the big world)
     const a = rand(0, TAU);
-    const d = rand(SPAWN_MIN_DIST, SPAWN_MAX_DIST);
+    const d = rand(DEBUG.spawnMinDist, SPAWN_MAX_DIST);
     const p = wrapPos({ x: game.ship.x + Math.cos(a) * d, y: game.ship.y + Math.sin(a) * d });
     game.debris.push(new DebrisSatellite(p.x, p.y, 3, speed));
   }
@@ -10144,18 +10282,17 @@ function nextWave() {
   // game.waveTime above, and game.stats.dmgThisWave below (the perfect-wave window). Loose garbage, the
   // tow chain, the Hunters and the powerup budgets all survive by design (CS024 P3) — this has never been
   // a "clear the field" function.
-  //   game.levelEndSafe / levelEndGraceT / levelEndPulseT / levelEndFreeze / levelDone are the OPPOSITE
-  // of per-level state and MUST NOT BE ADDED HERE. nextWave() is called from INSIDE the level-end
-  // protection window (spec §3.1 step 4: clear -> hold -> panel -> THIS -> banner -> grace), so zeroing
-  // any of the five here would end the protection at the exact instant the "Level N" banner appears —
-  // the middle of the window, not its end. CS036 P1 (spec §1.5 trap 2) adds the fourth for the same
-  // reason one step further out: the FREEZE spans this call and is lifted partway through the banner
-  // this function seeds, so zeroing it here would unfreeze the field on the banner's very first frame.
-  // CS036 P2's game.levelDone is the fifth, and
-  // is the one case where a reset here would be merely REDUNDANT rather than wrong — dismissLevelDone()
-  // has already cleared it on the frame it calls this — which is exactly the shape a tidy-up pass adds
-  // "harmlessly" and then P3 has to unpick. They are reset in resetRun() and nowhere else. A future
-  // tidy-up pass that "notices" the omission is reading this comment for a reason.
+  //   game.levelEndSafe / levelEndGraceT / levelEndPulseT are the OPPOSITE of per-level state and MUST
+  // NOT BE ADDED HERE. nextWave() is called from INSIDE the level-end protection window (CS043 spec
+  // §3.1's sequence, now clear+arm -> THIS -> banner -> grace), so zeroing any of the three here would
+  // end the protection at the exact instant the "Level N+1" banner appears — the middle of the window,
+  // not its end. They are reset in resetRun() and nowhere else. A future tidy-up pass that "notices"
+  // the omission is reading this comment for a reason.
+  //   ⛔ CS043 P1 (spec §6): THIS RULE IS NOT WEAKENED BY BEING SHORTENED. CS036's levelEndFreeze and
+  // levelDone were the fourth and fifth names on this list and are deleted outright, so the list is
+  // three again — but the reason is UNCHANGED and if anything tighter: the window still spans this call,
+  // and the three are still armed BEFORE it runs and must still outlive it. The one name whose reset
+  // here would have been merely redundant rather than wrong (levelDone) is exactly the one that is gone.
   // CS042 P4 (spec §1.3): the SFX at the TRIGGER SITE, immediately above sayLevel() — see the
   // event-SFX rule block in AudioSys. Unconditional here; sayLevel()'s own gate may drop or park it.
   AudioSys.levelup();
@@ -10184,12 +10321,12 @@ function nextWave() {
   // wave the player reached before ever touching a powerup. (FLAG A-1-b — a MAX counter, not a sum.)
   if (game.stats.powerupsPicked === 0)
     Achievements.lifetime.maxWaveNoPowerup = Math.max(Achievements.lifetime.maxWaveNoPowerup, game.wave);
-  // CS022 P1 (§4.1/§4.2): the torus period is a function of the level's ARCHETYPE, so it can change at
-  // every wave boundary — up at every 3rd level and back down at the level after, 42 times in a
-  // 63-level run. THIS SITE IS THE ONLY CORRECT ONE and both halves of that are load-bearing: it must
-  // run AFTER game.wave++ (worldSizeFor reads the NEW level) and BEFORE `new Dock()` on the next line
-  // (dock placement is ship-relative and wrap-aware, so it needs both the new period and the
-  // re-centred ship). Only a real change resizes — a field level following a field level moves nothing.
+  // CS024 P1 retired the orbit-level archetypes: worldSizeFor() now has two return values and one
+  // boundary (earlyWorldLevels, default 5), firing exactly ONCE per run at the 5->6 boundary (never
+  // at all if earlyWorldLevels is 0). THIS SITE IS THE ONLY CORRECT ONE and both halves of that are
+  // load-bearing: it must run AFTER game.wave++ (worldSizeFor reads the NEW level) and BEFORE
+  // `new Dock()` on the next line (dock placement is ship-relative and wrap-aware, so it needs both
+  // the new period and the re-centred ship). Only a real change resizes — nothing moves otherwise.
   const nextWorldSize = worldSizeFor(game.wave);
   if (nextWorldSize !== game.worldSize) resizeWorld(nextWorldSize);
   game.dock = new Dock(); // recycling dock relocates each wave
@@ -10507,14 +10644,24 @@ function magnetPulling() {
   return powerActive("magnet") && game.magnetHoldT <= 0;
 }
 
-// The Scoop capture region (v3.3 P3, spec §8; orbs CS042 P8, spec §4.3) — an oriented "mouth" on the
-// ship's facing axis, plus two flanking orb discs at the top two levels. Rotate the wrap-aware
-// ship->garbage delta into ship-local space (project onto the facing axis and its normal) once, then
-// test the mouth box (|lateral| <= SCOOP_WIDTH[lvl]/2 AND -SHIP_RADIUS <= forward <= SCOOP_DEPTH[lvl])
-// and the orbs against that ONE projection. At scoopLevel 0 every table reads 0, so pickup falls back
-// to exactly the base circle.
+// The Scoop capture region (v3.3 P3, spec §8) — an oriented "mouth" on the ship's facing axis. Rotate
+// the wrap-aware ship->garbage delta into ship-local space (project onto the facing axis and its
+// normal), then test the mouth box (|lateral| <= SCOOP_WIDTH[lvl]/2 AND -SHIP_RADIUS <= forward <=
+// SCOOP_DEPTH[lvl]). At scoopLevel 0 both tables read 0, so pickup falls back to exactly the base circle.
+// ⛔ CS044 P2 (spec §1.2) — CS042 P8'S FLANKING-ORB DISC TEST IS DELETED FROM HERE, at Paul's CS043
+// GATE A call (A10). P8 OR'd two discs centred at ship-local (forward 0, lateral
+// +/-SCOOP_ORB_OFFSET[lvl]) in beside the box, off this same shortDelta() projection, to give levels
+// 6-7 lateral reach. CS044 gives those levels a bigger MOUTH instead — buildScoopSteps() extrapolates
+// past SCOOP_MOUTH_LEVELS — so the predicate is the one box test it was before P8, reading the
+// extrapolated tables, and the orb tables are gone. The capture region at levels 0-5 did not move by
+// a single probe. The SHAPE did not change at 6-7 either, only its size: making capture a true
+// triangle to match the drawn V would roughly halve every level's area, which nobody asked for.
 // ⛔ ONE PREDICATE, TWO CALLERS — the Debris pickup pass and the powerup pickup pass both call this,
-// and both get the orbs. Do not fork it.
+// and both get the extrapolated mouth. Do not fork it.
+// ⛔ CS044 GATE A (Paul): the box test above is REPLACED by the SCOOP_SQUARE test — the point, taken
+// from the V's apex, is decomposed onto the V's two lines (a along the upper, b along the lower) and is
+// inside iff both coordinates lie in [0, side]. Same projection, same level-0 early return, same two
+// callers; the name stays because both callers and the load-time guard's message read it.
 function inScoopBox(g) {
   const lvl = game.scoopLevel;
   if (lvl <= 0) return false;
@@ -10523,16 +10670,10 @@ function inScoopBox(g) {
   const ca = Math.cos(s.angle), sa = Math.sin(s.angle);
   const forward =  dx * ca + dy * sa;  // along the ship's facing axis
   const lateral = -dx * sa + dy * ca;  // perpendicular
-  if (Math.abs(lateral) <= SCOOP_WIDTH[lvl] / 2 && forward >= -SHIP_RADIUS && forward <= SCOOP_DEPTH[lvl]) return true;
-  // CS042 P8: the flanking orbs (levels 6-7). Discs centred at ship-local (forward 0,
-  // lateral +/-SCOOP_ORB_OFFSET[lvl]). The nearer orb is always the one whose sign matches
-  // `lateral`, so |lateral| collapses the mirrored pair into a single distance test.
-  // ⛔ WRAP-AWARE THROUGHOUT — this reuses the shortDelta() projection above and never takes a
-  // fresh Math.hypot on raw world coordinates, which breaks at the wrap seam.
-  const orbR = SCOOP_ORB_R[lvl];
-  if (orbR <= 0) return false;    // zero below the orb tier — the load-time guard's subject
-  const off = Math.abs(lateral) - SCOOP_ORB_OFFSET[lvl];
-  return forward * forward + off * off <= orbR * orbR;
+  const q = SCOOP_SQUARE[lvl];
+  const along = (forward - SCOOP_APEX_X) / q.cx, across = lateral / q.cy;
+  const a = (along + across) / 2, b = (along - across) / 2;
+  return a >= 0 && b >= 0 && a <= q.side && b <= q.side;
 }
 
 // Effective player-bullet cap. Triple Shot wins over Rapid Fire when both are active because its
@@ -12538,10 +12679,15 @@ function updateDeath(dt) {
     // FORK-CS030-F is OPEN (a P6 gate question): one fanfare on open, routed through the existing
     // AudioSys.achievement() rather than a new sound, so the gate can retune it to per-item or to
     // silent without restructuring anything.
-    // CS030 P5: `resume: null` — this panel owes nothing on dismissal. Its twin at level end stamps
-    // "wave" and owes the deferred nextWave(); see dismissCelebration(), which reads this field.
+    // CS030 P5 stamped `resume: null` here — this panel owes nothing on dismissal — because it had a
+    // twin at level end that stamped "wave" and owed the deferred nextWave(). ⛔ CS043 P2 (spec §2): the
+    // twin is gone (P1 deleted dismissLevelDone(), its only opener), so THIS IS THE ONE CALL SITE and the
+    // field that told the two apart is DELETED, not defaulted. Nothing opens the panel anywhere else; a
+    // second site is new design, and would have to re-answer what its dismissal owes.
+    //   ⚠ The bucket now spans a WHOLE RUN, not one level. Still a flush, never a filter by game.wave
+    // (CS030 §0.4) — a long list is celebrationScroll()'s shipped case, not a reason to stamp a wave.
     if (game.pendingAch.length) {
-      game.celebration = { items: game.pendingAch, scroll: 0, resume: null };
+      game.celebration = { items: game.pendingAch, scroll: 0, tab: CELEB_TABS[0].id };   // CS044 P4: Weekly first
       game.pendingAch = [];
       resetMenuNav();
       AudioSys.achievement();
@@ -12550,10 +12696,15 @@ function updateDeath(dt) {
 }
 
 // CS036 P1 — the level banner's per-frame tick, lifted VERBATIM out of update()'s playing body so the
-// level-end freeze can run the same one. ⛔ IT HAS EXACTLY TWO CALLERS AND MUST NEVER RUN TWICE IN A
-// FRAME: update()'s playing body (unfrozen) and updateLevelEndFreeze() (frozen). What keeps that true is
-// that the freeze branch RETURNS — a frozen frame never reaches the playing body — so a third caller, or
-// an if/else that still falls through, is what would break it.
+// level-end freeze could run the same one.
+// ⛔ CS043 P1 (spec §6) — IT SURVIVES, IT MATTERS MORE THAN BEFORE, AND IT HAS LOST ONE OF ITS TWO
+// CALLERS. updateLevelEndFreeze() is deleted with the ceremony, so update()'s playing body is the ONLY
+// caller again and the "must never run twice in a frame" hazard RETIRES — said here rather than dropped
+// silently, because the extraction's whole justification was that a second caller existed. The
+// extraction is KEPT anyway: the function is the grace's arm (below), and the arm deserves a name.
+// ⛔ NEITHER THE CROSSING ONE-SHOT NOR THE `game.levelEndSafe` CLAUSE MAY BE SIMPLIFIED. Both are
+// load-bearing and both are stated below; with the freeze gone this tick is the ONLY thing that opens
+// the grace, so an "obvious" tidy here silently deletes the window's last step.
 //
 // CS025 P5: in the PLAYING body, so it holds through a pause and resumes rather than expiring behind the
 // menu — the same treatment the caption gets, for the same reason. drawLevelBanner() gates on life > 0.
@@ -12573,80 +12724,29 @@ function tickLevelBanner(dt) {
   }
 }
 
-// CS036 P1 (spec §0.3) — THE LEVEL-END FREEZE'S REDUCED SIM, modelled on updateDeath() above. The field
-// is a freeze-frame: no ship, no entity updates, no chain relaxation, no spawns, no collisions, no
-// cleanup filters, no wave-clear. Five things happen instead, and each is here for a stated reason.
-//
-//   1. ⛔ AudioSys.thrust(false) — both existing early-return paths call it and so must this one. A
-//      player thrusting on the frame that cleared the wave would otherwise get a stuck engine loop
-//      droning over a silent, motionless field, because Ship.update() (which owns the only
-//      thrust(true)/thrust(false) edge) is exactly what this branch stops running.
-//   2. ⛔ tickLevelBanner(dt) — WITHOUT THIS THE FREEZE IS A HARD HANG (spec §0.3). The unfreeze is a
-//      read on game.levelBanner.life (P3), and the banner only ages in update()'s playing body, which
-//      this branch replaces. So the tick runs in BOTH paths, from the one function, never twice.
-//   3. ⛔ VoiceSys.update() — the critical-line queue drain. Parked lines live on the AUDIO clock and
-//      have no TTL by design (CLAUDE.md), so a queue frozen for the length of a player-paced hold would
-//      simply stop speaking. Last here, as it is last in the playing body.
-//   4. CS036 P2: game.levelDone.age — the completion announcement's fade-in clock, and the ONLY clock
-//      this build advances that is not also advanced by the playing body. It belongs here rather than
-//      there because the announcement exists only inside the freeze: it is seeded at the wave-clear arm
-//      (at the END of the last live frame, so it correctly ages 0 on the frame it appears) and cleared
-//      by dismissLevelDone() on the frame the player confirms. The `if` is not defensive padding — CS036
-//      P3 extends the freeze PAST that clear, so frozen frames with no announcement up are the norm.
-//      Those are the TAIL, and the `else` below is what ends them.
-//   5. ⛔ CS036 P3: game.caption.life — P1 RAISED THIS AND P2 HANDED THE CALL HERE ON PURPOSE ("P3 owns
-//      the call, and has the better view"). The answer is YES, the caption clock runs. This branch stops
-//      the SIM and deliberately keeps the ANNOUNCEMENT CHANNEL running — the banner countdown at 2 and
-//      the voice drain at 3 are both that channel — and a caption is that channel's visual half, not the
-//      field's. Two facts made it decidable from here and not from P2: nextWave() now fires INSIDE the
-//      freeze, so VoiceSys.sayLevel() raises a caption at the head of the TAIL on every single level
-//      transition, and the level banner it is the twin of (same call, same string) is ticking down right
-//      beside it. A stopped caption clock would hold that line at full alpha for the whole tail while its
-//      own audio, which runs on the AUDIO clock and never froze, finished seconds earlier — the "one
-//      gate, two outputs" rule's exact failure mode.
-//      ⛔ THIS IS NOT THE PAUSE'S RULE AND DOES NOT TOUCH IT. game.paused and the celebration panel both
-//      still hold the caption where it stands (CS011 P2's "resumes rather than expiring behind the
-//      menu"), because those states run no announcement channel at all — they run nothing. Only this
-//      branch ticks it, and it is the only one of the three that has anything to say while it is up.
-//
-// ⛔ WHAT IS DELIBERATELY LEFT STOPPED, AND WHY IT IS NOT AN OMISSION: Achievements.evaluate() and the
-// heartbeat. The celebration panel's own freeze already stops both, and the wave-clear branch's `return`
-// comment states the reason in terms — an unlock raised by THIS clear would toast on top of the panel
-// (drawToasts() draws last) and still not appear IN it, since evaluate() runs after that flush either
-// way. The completion hold is the same seam one step earlier, so running them here would change
-// achievement timing that has been stable since CS030 for no gain. Leave them stopped.
-//
-// ⛔ ARMED BY CS036 P2 (update()'s wave-clear latch sets game.levelEndFreeze), ENDED HERE BY CS036 P3
-// (spec §1.2, FORK-CS036-B). The freeze now SURVIVES the player's confirm and the whole of nextWave():
-// dismissLevelDone() hands off to the celebration panel or straight to the new level, and the field
-// stays stopped under either until the "Level N+1" label STARTS FADING OUT, at
-// game.levelBanner.life <= DEBUG.levelBannerFade (1.7 s into a 2.2 s banner at the shipped knobs).
-// ⛔ STILL NO TIMER (FORK-CS036-E): the hold is ended by input and the tail by the label's own render
-// knobs — neither half counts anything down of its own.
-//
-//   ⛔ THE HOLD AND THE TAIL ARE MUTUALLY EXCLUSIVE, WHICH IS WHY THEY ARE ONE if/else RATHER THAN TWO
-// ifs. game.levelDone is non-null for exactly the hold — seeded at the arm, nulled on dismissLevelDone()'s
-// first line, which is also the call that reaches nextWave() — so `else` IS the tail. Testing the banner
-// during the HOLD would unfreeze on the announcement's first frame instead: the banner standing then is
-// the level just FINISHED, expired seconds ago and running negative, which is <= any fade.
-//
-//   ⛔ BOTH DEGENERATE KNOB SETTINGS DEGRADE TO "UNFREEZE IMMEDIATELY", and the plain `<=` is what does
-// it — no special case, and no clamping (spec §1.5 trap 1). levelBannerTime is 0-8 s and levelBannerFade
-// is 0-3 s, both draggable from the debug panel mid-run: with fade >= time nextWave() seeds a banner
-// already inside its own fade-out, and with time === 0 there is no banner at all. In either case the
-// first tail frame's life is already <= fade and the field unfreezes on it, one frame after the confirm,
-// which is before anything is drawn. ⛔ A CROSSING ONE-SHOT — the idiom tickLevelBanner() uses three
-// lines up, and the obvious thing to reach for here — WOULD HANG ON BOTH: a banner seeded below the
-// threshold never crosses it. Same spirit as drawLevelBanner()'s own Math.max(0, ...) guard, which
-// exists for this exact pair of knobs.
-function updateLevelEndFreeze(dt) {
-  AudioSys.thrust(false);
-  game.caption.life -= dt;
-  tickLevelBanner(dt);
-  if (game.levelDone) game.levelDone.age += dt;                                  // the HOLD
-  else if (game.levelBanner.life <= DEBUG.levelBannerFade) game.levelEndFreeze = false;   // the TAIL
-  VoiceSys.update();
-}
+// ⛔ CS043 P1 (spec §1.1) — updateLevelEndFreeze(dt), CS036 P1'S REDUCED SIM, STOOD HERE AND IS DELETED,
+// together with its branch in update() below. It froze the field for the completion announcement: no
+// ship, no entity updates, no chain relaxation, no spawns, no collisions, no cleanup filters, no
+// wave-clear. ⛔ ALL FIVE OF THE JOBS IT RAN INSTEAD NOW BELONG TO THE PLAYING BODY AGAIN, and none of
+// them is lost, because an ordinary playing frame is what a level boundary runs now:
+//   1. AudioSys.thrust(false) — still called by update()'s general early-return path, which is where
+//      it lived before the freeze existed; nothing stops the field mid-play any more, so a stuck engine
+//      loop over a motionless field is no longer reachable at this seam at all.
+//   2. tickLevelBanner(dt) — back to ONE caller, in the playing body, at its unmoved call site. The
+//      hard-hang failure mode this callee was extracted to prevent retires with the freeze: there is
+//      no state left whose exit is a read on game.levelBanner.life.
+//   3. VoiceSys.update() — still last in the playing body, which is the only place it is called from
+//      now. Parked criticals still live on the audio clock with no TTL, and the queue is never frozen.
+//   4. game.levelDone.age — the announcement's fade-in clock, deleted with the announcement.
+//   5. game.caption.life — ticked by the playing body, as it was before CS036 P1 raised the question.
+//      ⛔ CS036 P3's deliberate asymmetry GOES WITH THE FREEZE, and it goes cleanly: game.paused and
+//      the celebration panel still HOLD the caption where it stands (CS011 P2, untouched), and there
+//      is no longer a third state that ticks it. The reason that asymmetry existed — a caption raised
+//      by sayLevel() inside a frozen tail would hold at full alpha while its own audio finished — is
+//      gone with the tail: sayLevel() now fires on a live frame and the caption ages beside its audio.
+// ⛔ WHAT IT DELIBERATELY LEFT STOPPED — Achievements.evaluate() and the heartbeat — needs no home:
+// the clearing frame runs both to its own end, exactly as it did before CS036 and exactly as the
+// wave-clear latch's own comment says it does.
 
 function update(dt) {
   // v3.6 P5: the death spectacle runs its own reduced sim. This branch sits BEFORE the general
@@ -12655,25 +12755,20 @@ function update(dt) {
     updateDeath(dt);
     return;
   }
-  // CS036 P1 (spec §0.3): the level-end freeze runs its own reduced sim too, and sits HERE for the same
-  // reason the "dying" branch above does — a naive extra term on the general early-return below would
-  // stall the level banner (a hard hang) and the voice queue along with everything it is meant to stop.
-  // ⛔ THE THREE NEGATIVE TERMS ARE NOT DEFENSIVE PADDING. They are what makes this branch a strict
-  // REPLACEMENT for an ordinary playing frame and nothing more: `state === "playing"` keeps a stale flag
-  // from freezing a gameover screen, `!game.paused` keeps the pause menu winning over the freeze exactly
-  // as it wins over the death spectacle, and `!game.celebration` leaves the celebration panel's own
-  // shipped full stop (which runs neither the banner tick nor the voice drain) byte-for-byte untouched —
-  // the panel opens INSIDE the freeze, and CS036 changes nothing about it (spec §1.6).
-  if (game.levelEndFreeze && game.state === "playing" && !game.paused && !game.celebration) {
-    updateLevelEndFreeze(dt);
-    return;
-  }
-  // CS030 P5 (§4.4): ⛔ THE CELEBRATION PANEL FREEZES THE FIELD. The term that earns its keep is the
-  // LEVEL-END panel, which is up while game.state is STILL "playing" — and the wave-clear window it
-  // opens in is live gameplay, not a lull (§0.1: Hunters hunt, saucers shoot, loose garbage drifts,
-  // and the player can die in it). Without this the field would keep simulating behind an opaque
-  // panel and kill a player who cannot see it coming. At game over the state test already covers the
-  // panel, so this term is redundant there — deliberately, so ONE condition covers both call sites.
+  // ⛔ CS043 P1 (spec §1.1): CS036 P1'S SECOND REDUCED-SIM BRANCH STOOD HERE, beside the "dying" one and
+  // above the same early-return — `if (game.levelEndFreeze && ...) { updateLevelEndFreeze(dt); return; }`.
+  // It is deleted with the function it called. A wave clear now runs an ordinary playing frame and the
+  // "dying" branch above is once again the only reduced sim in this function.
+  // CS030 P5 (§4.4): ⛔ THE CELEBRATION PANEL FREEZES THE FIELD. ⛔ CS043 P1 (spec §2) NARROWED WHAT THAT
+  // COSTS, AND THE TERM STAYS. The term used to earn its keep at the LEVEL-END panel, which was up while
+  // game.state was STILL "playing": without it the field would have kept simulating behind an opaque
+  // panel and killed a player who could not see it coming. CS043 P1 deletes dismissLevelDone(), the only
+  // thing that ever opened the panel at a level seam, so killShip()'s is the one remaining call site and
+  // the state test above already covers it — this term is now redundant rather than load-bearing.
+  // ⛔ IT IS KEPT DELIBERATELY AND NOT AS AN OVERSIGHT: removing it is a behaviour change to the panel's
+  // own freeze, and the panel is CS043 P2's scope, not P1's. P2 may look at it; a cleanup pass may not.
+  //   ⛔ CS043 P2 LOOKED AND KEPT IT. Spec §6 names "the panel's own freeze" as a thing that must not
+  // change, and P2's scope is the fork and the `resume` field, not this gate. Redundant, still kept.
   // ⛔ NOT game.paused. Setting that would satisfy menuActive() and drag in the whole menu chrome
   // path — music ducking, drawMenu()'s input branch, the pause screen's semantics — and the panel is
   // deliberately not part of the menu system (see drawCelebration()'s header).
@@ -12723,18 +12818,24 @@ function update(dt) {
   // would snap the moment either knob moved. Same integrate-the-phase reason as game.lowHpPhase above.
   //   Deliberately NOT wrapped with a modulo here: Ship.draw() takes `% 2` at the point of use, and 60 fps
   // of the shortest period still needs ~10^13 seconds to lose a bit of precision.
-  //   ⛔ CS036 P3 (FORK-CS036-D -> D1) — THE CONDITION IS THE GRACE, NOT game.levelEndSafe. The pulse says
-  // "you cannot be hit right now", which is meaningless over the frozen field the rest of the window is
-  // spent on: from the clear to the banner's fade-out nothing moves, and the stopped field plus the
-  // announcement over it are already telling the player where they are. The grace is the one step that is
-  // live gameplay with damage off, so it is the only step the tell belongs to. ⛔ BOTH KNOBS ARE RETAINED
-  // AND STILL DO EXACTLY WHAT THEY DID — levelEndFade is the resting one-way time the ramp starts from and
-  // levelEndGracePulseEnd the one it ends at; the ramp simply now spans the whole of the pulse's life
-  // rather than its tail. Ship.draw() reads the SAME condition, and the two must move together.
-  //   The `graceFrac` ternary went with it: its `: 0` branch was the resting phase before the grace armed,
-  // and there is no such phase any more — inside this block the grace is always live, by construction.
-  if (game.levelEndGraceT > 0) {
-    const graceFrac = 1 - game.levelEndGraceT / Math.max(0.0001, DEBUG.levelEndGrace);
+  //   ⛔ CS043 P3 (FORK-CS043-A -> SPAN THE WHOLE WINDOW) — THE CONDITION IS game.levelEndSafe AGAIN.
+  // CS036 P3 (FORK-CS036-D -> D1) had narrowed it to the grace: the pulse says "you cannot be hit right
+  // now", which was meaningless over the frozen field the rest of CS036's window was spent on, so the
+  // grace — the one live step — was the only step the tell belonged to. CS043 P1 deleted the freeze, so
+  // the WHOLE window is now live gameplay with damage off and D1's own criterion selects all of it: the
+  // reasoning is kept, only the conclusion reverses. Ship.draw()'s `pulsing` reads the SAME condition,
+  // and the two must move together.
+  //   ⛔ THE RAMP DID NOT FOLLOW THE CONDITION, AND THAT IS THE TRAP (spec §4.3 item 2). During the banner
+  // step levelEndGraceT is 0, so a bare `1 - levelEndGraceT / levelEndGrace` reads 1 and resolves oneWay
+  // to levelEndGracePulseEnd — the FASTEST period, at the START of the window, exactly backwards. The
+  // `graceFrac` ternary CS036 P3 removed is therefore BACK: its `: 0` branch holds the banner step at the
+  // resting levelEndFade, and the ramp to levelEndGracePulseEnd still spans the grace alone. ⛔ BOTH KNOBS
+  // ARE RETAINED AND STILL DO EXACTLY WHAT THEY DID. It also covers levelEndGrace = 0, which never arms a
+  // live grace and so sits at rest rather than dividing by the Math.max floor.
+  if (game.levelEndSafe) {
+    const graceFrac = game.levelEndGraceT > 0
+      ? 1 - game.levelEndGraceT / Math.max(0.0001, DEBUG.levelEndGrace)
+      : 0;
     const oneWay = DEBUG.levelEndFade + (DEBUG.levelEndGracePulseEnd - DEBUG.levelEndFade) * graceFrac;
     game.levelEndPulseT += dt / Math.max(0.0001, oneWay);
   }
@@ -13064,9 +13165,17 @@ function update(dt) {
     if (!p.dead && !game.ship.dead) {
       const r = p.radius + SHIP_RADIUS;
       // CS015 P3 (item 8): scoop mouth also captures powerups — scoop only, no magnet multiplier.
-      if (dist2(p, game.ship) < r * r || inScoopBox(p)) { p.dead = true; applyPowerup(p.type); }
+      if (dist2(p, game.ship) < r * r || inScoopBox(p)) {
+        p.dead = true;
+        applyPowerup(p.type);
+        // CS044 P3 (spec §2.1): arm the pickup flash AFTER applyPowerup(), never inside it and never
+        // on a Debris pickup — so a Scoop pickup that raises scoopLevel flashes the NEW level's area.
+        // A pickup mid-fade RESTARTS the timer at full (Paul: "start the same effect over").
+        game.scoopFlashT = SCOOP_FLASH_TIME;
+      }
     }
   }
+  if (game.scoopFlashT > 0) game.scoopFlashT -= dt;   // CS044 P3: game time, clamped at 0 by this guard
   // CS024 P6: the per-frame powerFx countdown STOOD HERE — the last piece of timed expiry, and the
   // reason this block existed at all. Nothing takes its slot: every budget is spent at the EVENT that
   // consumes it (a trigger pull, a hooked canister, an absorbed break, a thrusting frame), never on a
@@ -13596,24 +13705,20 @@ function update(dt) {
     // four places — the else branch below zeroes waveClearTimer on every frame Debris exists, so this
     // re-arms on every clear and fires once per clear. levelEndPulseT restarts with it so the pulse
     // always opens at full brightness rather than wherever the previous window left it.
-    //   CS036 P2 (spec §1.1 steps 1-2, FORK-CS036-A/E) — THE CEREMONY ARMS ON THAT SAME LATCH, and the
-    // whole of what used to sit below it (a levelEndHold-long wait, then the panel-or-nextWave() fork) is
-    // gone: the fork moved to dismissLevelDone(), which the player reaches by pressing confirm. From the
-    // NEXT frame on, updateLevelEndFreeze() replaces the whole of this function until they do.
-    //   ⛔ THE ARM IS AT THE END OF A NORMAL FRAME, NOT INSTEAD OF ONE. This frame keeps running to its
-    // own end (Achievements.evaluate(), the heartbeat, the voice drain all still fire below), exactly as
-    // it did before; the freeze starts one frame later. That is what makes the clear's own unlocks bank
-    // before anything freezes.
-    //   ⛔ resetMenuNav(), exactly as the celebration panel's open does and for the reason its own comment
-    // gives: the player is mid-flight and may well be holding the stick when the field stops. Nothing the
-    // announcement itself reads is directional (its two input branches take confirm/back only) and the
-    // panel re-arms the latch at its own open, so this is belt-and-braces — deliberately, because the
-    // alternative is a phantom first move landing in whichever screen takes input next.
+    //   ⛔ CS043 P1 (spec §1.2) — THE LATCH STAYS EXACTLY WHERE IT IS; WHAT CHANGED IS WHAT IT DOES NEXT.
+    // CS036 P2 armed a ceremony here (`levelEndFreeze = true`, a `game.levelDone` announcement and a
+    // resetMenuNav()) and deferred nextWave() to the player's confirm inside dismissLevelDone(). All four
+    // of those are DELETED, and this latch calls nextWave() DIRECTLY, LAST. The beat is gone because of
+    // WHERE it landed, not because it was a bad beat (spec §0, Paul's reversal): the wave-clear condition
+    // reads game.debris only, so it can and does fire mid-fight with Hunters and saucers still hunting.
+    //   ⛔ resetMenuNav() GOES WITH IT. Its own comment said it was belt-and-braces for a field stopping
+    // under a held stick; nothing stops now and no screen takes input at this seam, so it has no consumer.
+    // killShip()'s celebration-panel resetMenuNav() is a DIFFERENT call and stays.
+    //   ⛔ THE ARM IS AT THE END OF A NORMAL FRAME, AND NOW SO IS THE WHOLE TRANSITION. This frame keeps
+    // running to its own end — Achievements.evaluate(), the heartbeat and the voice drain all still fire
+    // below — which is what banks the clear's own unlocks. Nothing starts one frame later any more.
     if (game.waveClearTimer === 0) {
       game.levelEndSafe = true; game.levelEndPulseT = 0;
-      game.levelEndFreeze = true;
-      game.levelDone = { text: "Level " + game.wave + " Complete", age: 0 };
-      resetMenuNav();
       // Achievements (F9): a wave completed with zero damage taken -> Perfect Wave (lifetime, 10×)
       // and, if it was wave 3, No Scratches (weekly). game.wave is still the completed wave here
       // (nextWave increments it), so read it before advancing.
@@ -13621,18 +13726,46 @@ function update(dt) {
       // few seconds later in the same window. It is behaviourally identical and that is provable rather
       // than hopeful: levelEndSafe is set on the line above, so damageShip() cannot touch the ship
       // between the two points and game.stats.dmgThisWave cannot change; game.wave is still the
-      // COMPLETED wave at both, since nextWave() is deferred past both. It is a real move all the same,
-      // and it is said out loud here so a future reader does not read it as always having lived at the
-      // latch. It fires ONCE PER CLEAR because the latch does — see the `=== 0` idiom above.
+      // COMPLETED wave at both. It is a real move all the same, and it is said out loud here so a future
+      // reader does not read it as always having lived at the latch. It fires ONCE PER CLEAR because the
+      // latch does — see the `=== 0` idiom above.
+      //   ⛔ CS043 P1 (spec §1.2, TRAP 1): IT STAYS AT THE LATCH AND IT STAYS ABOVE THE nextWave() CALL
+      // BELOW. All three reads want game.wave as the COMPLETED wave and nextWave() increments it, so
+      // moving this block below that call — or the call above this block — silently shifts three shipped
+      // achievement thresholds by one level, and no test written by instinct would catch it. The
+      // constraint is CS036 P2's own, and it survives the deletion of everything that surrounded it.
       if (game.stats.dmgThisWave === 0) {
         Achievements.lifetime.perfectWaves++;
         if (game.wave === 3) game.stats.noScratchWave3 = true;
         // Flawless Run (weekly, P8 / FLAG A-6-b): a damage-free clear of wave 8 or later — a real feat
         // once the Hunter family + saucers + Debris density are all mid-ramp. game.wave is still the
-        // completed wave here (nextWave increments it, later, from dismissLevelDone()).
+        // completed wave here (nextWave increments it, on the line below).
         if (game.wave >= 8) game.stats.flawlessLateWave = true;
       }
+      // ⛔ CS043 P1 (spec §1.2) — THE ADVANCE, INLINE AND LAST. It runs INSIDE the protection window the
+      // two lines above just opened, which is why nextWave() still must not zero levelEndSafe /
+      // levelEndGraceT / levelEndPulseT (see that function's own note). It seeds the "Level N+1" banner,
+      // whose expiry crossing arms the grace in tickLevelBanner() — the window's last step and its only
+      // close. It also spawns the new field, so the `else` branch below zeroes waveClearTimer on the very
+      // next frame and the latch re-arms for the next clear.
+      //   ⛔ THE `game.state === "playing"` TERM IS NOT DECORATION AND IT IS NOT NEW — IT IS THE ONE
+      // SURVIVING TERM OF levelDoneActive(), CARRIED HERE WITH THE CALL IT USED TO GATE. killShip()
+      // flips the state to "dying" MID-FRAME, from a collision pass a few dozen lines above this, and
+      // update() runs on to this branch regardless — so a player who dies on the very frame the last
+      // Garbage Satellite dies reaches this line already dying. Before CS043 the advance was reached
+      // only through an input branch that asked levelDoneActive(), whose own header names this exact
+      // case as the reason its state term is load-bearing; deleting the predicate without carrying the
+      // term would ADVANCE THE LEVEL OUT FROM UNDER A DYING RUN, over-reporting game.wave by one in the
+      // high-score record and the leaderboard's wave_reached (both written at the "dying" -> "gameover"
+      // seam, after this), and spawning a fresh field into the death spectacle. ⛔ THE ARM ABOVE STAYS
+      // UNCONDITIONAL, which is also shipped: an orphaned levelEndSafe on a death frame is cleared by
+      // resetRun() at the next run, and CS030 P5's own pin says so.
+      if (game.state === "playing") nextWave();
     }
+    //   ⚠ game.waveClearTimer SURVIVES AND STILL COUNTS, and this pair is why. Nothing reads the
+    // accumulated value any more — but the `+= dt` here and the `= 0` in the `else` are what make the
+    // `=== 0` test above a latch, and the latch must fire exactly once per clear. Removing the
+    // accumulation removes the latch.
     game.waveClearTimer += dt;
   } else {
     game.waveClearTimer = 0;
@@ -13727,126 +13860,28 @@ function drawLevelBanner() {
   }
 }
 
-// ---------- CS036 P2: the level-end COMPLETION ANNOUNCEMENT (spec §1.3/§1.4) ----------
-// "Level N Complete", held on a frozen field until the player presses on. The three functions below are
-// the whole of it — one predicate, one verb, one renderer — and they sit together for the reason
-// celebrationScroll()/dismissCelebration()/drawCelebration() do: two input handlers and one draw() call
-// site read them, so none of the three may grow a private copy of any part.
+// ---------- ⛔ CS043 P1 (spec §1.1): THE LEVEL-END COMPLETION ANNOUNCEMENT STOOD HERE ----------
+// CS036 P2 built it and CS042 P5 gave it a dissolve. Four functions are DELETED, not parked, and none
+// of them has a surviving caller: levelDoneActive() (the one predicate both input handlers and the
+// renderer asked), dismissLevelDone() (the one verb, which carried CS030 P5's panel-or-nextWave() fork
+// and one AudioSys.achievement() call), drawLevelDone() and drawLevelDoneText() (the ink, live branch
+// and dissolving ghost). Their two input branches, their draw() call and their constants go with them.
 //
-// ⛔ ONE PREDICATE, THREE READERS. drawLevelDone() and BOTH input branches ask this and nothing else, so
-// "is the announcement up?" cannot be answered differently by the renderer and the keyboard. The three
-// terms are drawCaption()'s and drawLevelBanner()'s, exactly — this is in-play chrome, never over a
-// menu, a gameover or the title.
-//   ⛔ THE `game.state === "playing"` TERM IS LOAD-BEARING, not copied furniture. killShip() flips the
-// state to "dying" MID-FRAME and update() runs on to the wave-clear branch regardless, so a player who
-// dies on the very frame the last Garbage Satellite dies arms this announcement while already dying. The
-// freeze itself already refuses to run in that state (see update()'s branch), and this is what stops the
-// orphaned announcement from ALSO drawing over the death spectacle or eating the gameover screen's
-// confirm — which, without the term, would call nextWave() at game over. The orphan is cleared by
-// resetRun() at the next run, exactly as game.levelEndSafe's own arm on that frame is.
-//   No `!game.celebration` term, deliberately: the two can never both be live, because the only thing
-// that opens the panel is dismissLevelDone(), which nulls this first.
-function levelDoneActive() {
-  return game.state === "playing" && !game.paused && !!game.levelDone;
-}
-
-// The announcement's ONE verb, and the dismissCelebration() analogue: BOTH input handlers call THIS, so
-// the fork below cannot drift between them (the CS030 P4 both-handlers rule, made structural).
+// ⛔ TWO CONSEQUENCES, BOTH DELIBERATE AND NEITHER A REGRESSION:
+//   1. dismissLevelDone()'s fork was the ONLY thing that opened the celebration panel at a level seam.
+//      With it gone, killShip() is the panel's one call site and the panel is a GAME-OVER beat (spec
+//      §0.1c). The `resume === "wave"` arm inside dismissCelebration() is therefore unreachable from
+//      this phase on; ⛔ CS043 P2 deletes it whole, and P1 deliberately leaves it standing rather than
+//      half-deleting a fork across two phases. (CS043 P2: done — the arm, the `resume` field at every
+//      site and the level-end sub-line are gone together; see dismissCelebration()'s header.)
+//   2. ⛔ A DUPLICATE FANFARE DISAPPEARS, AND THAT IS A FIX (spec §1.4). A level-seam unlock used to
+//      play AudioSys.achievement() twice — once at Achievements.onUnlock() during play, and again
+//      seconds later when this function opened the panel. It is now one per unlock, plus one when the
+//      game-over panel opens. Recorded here so a future reader does not read the missing second cue as
+//      a lost call.
 //
-// ⛔ THE FORK IS NOT NEW CODE. It is CS030 P5's wave-clear fork (§4.4, FORK-CS030-A = both), moved here
-// whole by CS036 P2 together with its reasoning, because the levelEndHold crossing that used to run it
-// is retired: the player's confirm is what reaches it now. Everything it says still holds at this site
-// bar one clause, which the move made obsolete rather than false — the old site's `return` also DROPPED
-// the rest of that update() frame (Achievements.evaluate(), the heartbeat, the voice drain), which was
-// half of why an unlock raised by this clear could not toast on top of the panel. This is not inside
-// update() at all, and the frozen frames that precede it already run neither of the first two (see
-// updateLevelEndFreeze()), so that outcome is now structural rather than incidental:
-//   ⛔ THE `return` IS THE DEFERRAL. Do not "tidy" it into an if/else that still falls through.
-// nextWave() — and with it game.levelBanner AND VoiceSys.sayLevel(), which both fire from inside it —
-// waits for dismissCelebration(). "Level 8" announces after the celebration, never underneath it.
-//   ⛔ `game.state === "playing"` came with the block and stays. At THIS site levelDoneActive() has
-// already established it (both handlers gate on it), so it is belt-and-braces rather than the sole
-// guard it was in update() — kept because the fork moved verbatim, and because it is the one line
-// standing between a stray future caller and a nextWave() at game over.
-//   The re-entry that the old site's "waveClearTimer was zeroed / update() freezes on game.celebration"
-// note ruled out is ruled out differently here, and just as completely: game.levelDone is nulled on the
-// first line, so the second confirm of a double-tap finds levelDoneActive() false and never arrives.
-//   ⛔ IT DOES NOT LIFT THE FREEZE, AND THE ABSENCE IS THE FEATURE (CS036 P3, FORK-CS036-B). P2 cleared
-// game.levelEndFreeze on the line under this one as its own answer, said so, and P3 deleted it: the
-// freeze runs on through the panel and through nextWave() below, and lifts in updateLevelEndFreeze()
-// when the "Level N+1" label starts fading out. Re-adding a clear here would end the ceremony a step
-// early and put the field back in motion under a banner nobody has read yet — which is the whole of
-// what step 4 was asking for. What this function still ends is the ANNOUNCEMENT (line one), and that is
-// all it ever needed to end.
-function dismissLevelDone() {
-  // ⛔ CS042 P5 (GATE A, A2 "out 0.35 easeIn — after the press"): the announcement HANDS ITS TEXT TO A
-  // GHOST and then nulls itself, on the same line pair, in this order. game.levelDone still goes null
-  // here and that is non-negotiable — the freeze's hold/tail if/else reads it, and a levelDone kept
-  // alive for the dissolve's 0.35 s is the documented HARD HANG. The ghost is render-only: drawLevelDone()
-  // is its only reader, tickCeremony() its only clock, and levelDoneActive() — which BOTH input handlers
-  // ask — never sees it, so the second confirm of a double-tap still finds nothing to dismiss.
-  //   The `if` is not padding: this function's own header records that it is the one line standing
-  // between a stray future caller and a nextWave() at game over, so a call with nothing up is a
-  // contemplated shape — and a dismissal of nothing dissolves nothing.
-  if (game.levelDone) game.levelDoneOut = { text: game.levelDone.text, t: CEREMONY_ANNOUNCE_OUT };
-  game.levelDone = null;
-  if (game.state === "playing" && game.pendingAch.length) {
-    game.celebration = { items: game.pendingAch, scroll: 0, resume: "wave" };
-    game.pendingAch = [];
-    resetMenuNav();
-    AudioSys.achievement();
-    return;
-  }
-  nextWave();
-}
-
-// The announcement itself (spec §1.3): the shipped "Level N" banner's style, exactly — same size knob,
-// same y knob, same COLOR.text, same centred drawText, same ctx.globalAlpha fade mechanism. It is NOT a
-// panel and NOT a card, and it adds no new visual vocabulary; the prompt line under it is drawMenuHint(),
-// the shared footer look every menu already uses.
-// ⛔ A SIBLING of drawHUD() in draw(), not inside it, and NOT gated by Capture's H toggle — the rule
-// drawLevelBanner()'s own header states, for the same reason: a transient announcement is the same
-// category as the achievement toast and the game-over text.
-// FADE IN over DEBUG.levelBannerFade — the banner's own knob, so the two announcements ramp in alike —
-// then hold at full for as long as the player leaves it there.
-//   The `fade > 0` test is not a style choice. levelBannerFade's slider goes down to 0, and age/0 is
-// Infinity — or NaN on the arm frame, where age is 0 too, and a NaN globalAlpha is silently ignored by
-// the canvas, which would leave the announcement drawing at whatever alpha the previous pass left set.
-// Written as a positive test for the same reason achLeader()'s guards are (CLAUDE.md, Rendering).
-//
-// ⛔ CS042 P5 (GATE A, A2 "out 0.35 easeIn — after the press") — IT NOW FADES OUT TOO, AND THE OLD
-// "FADE IN ONLY" RULE IS REVERSED, NOT MISLAID. That rule's reason was "there is nothing to fade out
-// into: the celebration panel or the 'Level N+1' banner replaces it on the confirming frame" — true of
-// a HARD CUT, and the cross-fade is precisely the decision that there should be something to fade out
-// into. The replacement now arrives over 0.35 s (panel) or 0.50 s (banner) while this dissolves under it.
-//   ⛔ TWO SEPARATE STATES, TWO SEPARATE BRANCHES, AND THE LIVE ONE STILL ASKS levelDoneActive() AND
-// NOTHING ELSE. That predicate answers "is the announcement up?" for this renderer and for both input
-// handlers, and it must keep answering FALSE the instant the player confirms or a second confirm would
-// re-enter dismissLevelDone(). The ghost is a different question — "is its dissolve still running?" —
-// which no input path asks. Its own two terms are levelDoneActive()'s in-play-chrome pair, for the
-// identical reason: this is never drawn over a menu, a gameover or the title.
-//   ⛔ DRAW ORDER IS LOAD-BEARING AND ALREADY CORRECT: draw() calls this BEFORE drawCelebration(), so
-// the dissolving announcement passes under the panel fading in over it, never on top of it.
-function drawLevelDone() {
-  const y = VIEW_H/2 + DEBUG.levelBannerY;
-  if (levelDoneActive()) {
-    const fade = DEBUG.levelBannerFade;
-    ctx.globalAlpha = fade > 0 ? Math.min(1, game.levelDone.age / fade) : 1;
-    drawLevelDoneText(game.levelDone.text, y);
-    return;
-  }
-  const out = game.levelDoneOut;
-  if (!out || game.state !== "playing" || game.paused) return;
-  ctx.globalAlpha = easeIn(clamp01(out.t / CEREMONY_ANNOUNCE_OUT));
-  drawLevelDoneText(out.text, y);
-}
-// The announcement's ink, shared by the live branch and the dissolving one so the two can never drift
-// in position, size, colour or hint — the only thing that differs between them is the alpha already set.
-function drawLevelDoneText(text, y) {
-  drawText(text, VIEW_W/2, y, DEBUG.levelBannerSize, COLOR.text, "center");
-  drawMenuHint(LEVEL_DONE_HINT, VIEW_W/2, y + LEVEL_DONE_HINT_DY);
-  ctx.globalAlpha = 1;
-}
+// The wave now advances at update()'s wave-clear latch, inline, on the frame the last Garbage Satellite
+// dies — see that latch. drawLevelBanner() above is the level announcement, and now the only one.
 
 // ---------- Pause menu / Options / Controls rendering (F8) ----------
 // Screen-fixed overlays, drawn after the HUD when game.paused. A dimmed backdrop plus a
@@ -14893,12 +14928,19 @@ function drawToasts() {
 // celebrationMaxScroll() is called from the two INPUT handlers, which have no drawing context, and
 // has to derive the exact numbers drawCelebration() renders with. Panel position is deterministic
 // (VIEW_W/H and the panel's own w/h are fixed), so this needs no second menuPanel() call.
-const CELEB_PANEL_W = 820, CELEB_PANEL_H = 560;
+// CS044 P4 (spec §4.2): the tab header needed a band between the sub-line and the row clip, and THE
+// PANEL GREW 560 -> 584 TO GIVE IT ONE rather than the row region shrinking — ROW0_Y, CLIP_BOTTOM and
+// HINT_Y each moved +24, so CELEB_ROW_VISIBLE_H is unchanged and every row count keeps the scroll
+// ceiling it had (a 4-row tab still fits outright). A GATE A look-call, like the rest of this cluster.
+const CELEB_PANEL_W = 820, CELEB_PANEL_H = 584;
 const CELEB_PANEL_X = (VIEW_W - CELEB_PANEL_W) / 2;   // menuPanel()'s own maths, mirrored (cf. ACH_PANEL_X)
 const CELEB_PANEL_Y = (VIEW_H - CELEB_PANEL_H) / 2;
 const CELEB_SUB_Y = CELEB_PANEL_Y + 82;               // the "N NEW UNLOCKS" count line, under menuPanel's title
 const CELEB_ROW_X = CELEB_PANEL_X + 40;               // a row's left edge — which is the emblem's left edge
-const CELEB_ROW0_Y = CELEB_PANEL_Y + 168;             // first row's NAME baseline
+const CELEB_TAB_Y = CELEB_PANEL_Y + 120;              // CS044 P4: the WEEKLY / LIFETIME header's baseline
+const CELEB_TAB_STEP = 220;                           // CS044 P4: px between tab labels (cf. ACH_TAB_STEP)
+const CELEB_TAB_SIZE = 22;                            // CS044 P4: tab label size — CELEB_NAME_SIZE's
+const CELEB_ROW0_Y = CELEB_PANEL_Y + 192;             // first row's NAME baseline
 const CELEB_ROW_STEP = 84;                            // row-to-row baseline spacing — playtest knob
 const CELEB_DESC_DY = 26;                             // description baseline, below the row's name baseline
 const CELEB_NAME_SIZE = 22;
@@ -14906,10 +14948,35 @@ const CELEB_DESC_SIZE = 14;
 const CELEB_EMBLEM_DY = 4;                            // emblem centre, relative to the row's name baseline
 const CELEB_EMBLEM_GAP = 24;                          // clear air between the emblem's right edge and the text
 const CELEB_ROW_CLIP_TOP = CELEB_ROW0_Y - 44;         // headroom above row 0's emblem, below the count line
-const CELEB_ROW_CLIP_BOTTOM = CELEB_PANEL_Y + 484;    // headroom above the footer hint
+const CELEB_ROW_CLIP_BOTTOM = CELEB_PANEL_Y + 508;    // headroom above the footer hint
 const CELEB_ROW_VISIBLE_H = CELEB_ROW_CLIP_BOTTOM - CELEB_ROW_CLIP_TOP;
-const CELEB_HINT_Y = CELEB_PANEL_Y + 522;
-const CELEB_HINT = "↑↓ scroll    ENTER / A / ESC / B  continue";
+const CELEB_HINT_Y = CELEB_PANEL_Y + 546;
+// ⚠ tools/ceremony-lab.html mirrors this string and is NOT resynced (spec §4.2): preview-only drift.
+const CELEB_HINT = "←→ tab    ↑↓ scroll    ENTER / A / ESC / B  continue";
+const CELEB_EMPTY_TEXT = "None this game.";           // CS044 P4: an empty tab's one line, centred in the row region
+
+// CS044 P4 (spec §4.2): the panel's two tabs. ⛔ A tab's `id` IS A POOL NAME — onUnlock() copies ach.pool
+// ("weekly" | "lifetime") onto every item, and the tab filters on exactly that, at render and scroll time
+// only; `items` is never split or reordered. ⛔ THIS IS THE PANEL'S OWN TABLE AND celebration.tab IS THE
+// PANEL'S OWN STATE — never game.menu.achTab, never setAchTab(), never ACH_TABS (whose rows() are the
+// viewer's pools, not this bucket). The LOOK is the viewer's (COLOR.text + ACH_TAB_MARK / COLOR.menuIdle);
+// the state is not. Weekly is entry 0, so it opens first.
+const CELEB_TABS = [
+  { id: "weekly",   label: "WEEKLY" },
+  { id: "lifetime", label: "LIFETIME" }
+];
+// Resolves c.tab to a table position, defaulting to 0 (Weekly) for an absent or unknown id — so a panel
+// object built without `tab` (every pre-CS044 fixture) degrades to "show Weekly", never to a crash.
+function celebrationTabIndex(c) {
+  const i = CELEB_TABS.findIndex(t => t.id === (c && c.tab));
+  return i < 0 ? 0 : i;
+}
+// The active tab's rows, in unlock order — a filter over items, never a copy stored anywhere.
+function celebrationRows(c) {
+  if (!c) return [];
+  const id = CELEB_TABS[celebrationTabIndex(c)].id;
+  return c.items.filter(it => it.pool === id);
+}
 
 // The panel's ONE scroll ceiling — the game.celebration.items analogue of achMaxScroll(), and a
 // top-level function for the same reason: drawCelebration() clamps with it, and so do both input
@@ -14930,8 +14997,10 @@ const CELEB_HINT = "↑↓ scroll    ENTER / A / ESC / B  continue";
 // still ask about the live panel. It exists because the renderer now also draws a dismissed panel's
 // snapshot mid-dissolve (see dismissCelebration()), and that ghost has to clamp against ITS OWN row
 // count — through this function, never through a second copy of the arithmetic this header forbids.
+//   ⛔ CS044 P4: `n` is THE ACTIVE TAB'S row count (celebrationRows), not items.length — the renderer
+// draws only that tab's rows, so a whole-bucket ceiling would scroll a short tab into empty space.
 function celebrationMaxScroll(c = game.celebration) {
-  const n = c ? c.items.length : 0;
+  const n = celebrationRows(c).length;
   if (n === 0) return 0;
   const rowBottom = Math.max(CELEB_DESC_DY + CELEB_DESC_SIZE, CELEB_EMBLEM_DY + CELEB_EMBLEM_SIZE);
   const contentH = (CELEB_ROW0_Y - CELEB_ROW_CLIP_TOP) + (n - 1) * CELEB_ROW_STEP + rowBottom;
@@ -14946,37 +15015,58 @@ function celebrationScroll(dir) {
   if (!c) return;
   c.scroll = Math.max(0, Math.min(celebrationMaxScroll(), c.scroll + dir * CELEB_SCROLL_STEP));
 }
+// CS044 P4 (spec §4.2): the THIRD verb, under the same rule — BOTH handlers call this one function
+// (keyboard left/right under the panel's `!e.repeat` guard, gamepad menuNavEdges() left/right). `dir` is
+// -1/+1 and wraps like setAchTab(); with two tabs either direction lands on the other. Every switch
+// ZEROES scroll — the viewer's precedent: the two lists differ in height.
+function celebrationTab(dir) {
+  const c = game.celebration;
+  if (!c) return;
+  const n = CELEB_TABS.length;
+  c.tab = CELEB_TABS[(((celebrationTabIndex(c) + dir) % n) + n) % n].id;
+  c.scroll = 0;
+  AudioSys.ui(false);
+}
 // Confirm/back dismisses UNCONDITIONALLY, at any scroll position — the Achievements viewer's own
 // convention (§2.6, FORK-CS030-E). No "scroll to the bottom before you can leave" gate exists
 // anywhere in this codebase's menu idiom, and the panel does not invent one; the ▲/▼ affordance is
 // the shipped mitigation for a player who dismisses without having looked at everything.
 //
-// CS030 P5: ONE dismissal, TWO resumes. `resume` is stamped at the open site and records WHY the
-// panel opened, which is the only thing dismissal has to answer — deliberately not `game.state`,
-// which answers the different question "what is underneath" and only agrees by an invariant
-// maintained elsewhere. "wave" is the level-end panel and owes the deferred nextWave() (and with it
-// the level banner and Dan's "Level N"); the game-over panel owes nothing and just closes, handing
-// input back to initials entry / the gameover screen. BOTH input handlers call THIS one function, so
-// neither knows or cares which panel it dismissed — the scroll/dismiss logic is never forked per
-// call site, which is the whole of spec §5.1's mitigation. Cleared BEFORE nextWave() runs, so the
-// wave it builds is never seeded under a panel that is still up.
-// ⛔ CS042 P5 (GATE A, A3/B3 "out 0.35 easeIn — after the press"): SAME ARRANGEMENT AS
-// dismissLevelDone()'s, for the same reason and with a second wrinkle. game.celebration still goes null
-// here, unconditionally: it gates update()'s early return (the panel is what freezes the field), BOTH
-// input handlers, and — at the level-end site — the deferred nextWave() on the line below. A panel that
-// outlived its own dismissal by 0.35 s would keep freezing the field and keep owning input for that
-// long. So the dissolve is a SNAPSHOT that only drawCelebration() reads.
-//   ⛔ THE SNAPSHOT CARRIES game.wave, and that is the wrinkle. nextWave() runs on the very next line
-// and increments it, so a ghost reading game.wave live would spend its whole dissolve saying "During
-// level N+1 you earned:" about unlocks earned in level N. Everything else the renderer needs (items,
-// scroll, resume) is copied for the ordinary reason: the live object is gone.
+// CS030 P5 made this ONE dismissal with TWO resumes. `resume` was stamped at the open site and recorded
+// WHY the panel opened, which was the only thing dismissal had to answer — deliberately not
+// `game.state`, which answers the different question "what is underneath" and only agreed by an
+// invariant maintained elsewhere. "wave" was the level-end panel and owed the deferred nextWave() (and
+// with it the level banner and Dan's "Level N"); the game-over panel owed nothing and just closed,
+// handing input back to initials entry / the gameover screen. BOTH input handlers call THIS one
+// function, so neither knows or cares which panel it dismissed — the scroll/dismiss logic is never
+// forked per call site, which is the whole of spec §5.1's mitigation. The panel was cleared BEFORE
+// nextWave() ran, so the wave it built was never seeded under a panel that was still up.
+// ⛔ CS043 P2 (spec §2) — THERE IS NOW ONE OPEN SITE AND NOTHING TO RESUME, SO THE FORK IS DELETED WHOLE.
+// CS043 P1 deleted dismissLevelDone(), the only thing that ever opened the panel at a level seam; from
+// then on killShip() was the one opener and always stamped null, so `if (resume === "wave") nextWave();`
+// was unreachable. It is gone together with the `resume` binding, the field at killShip()'s open and in
+// the snapshot below, and drawCelebrationPanel()'s sub-line fork — all in one phase, never half. An
+// unreachable branch calling nextWave() from a panel dismissal is exactly the shape a later session would
+// resurrect or trip over. ⛔ A dismissal owes NOTHING now. Adding a call here is new design, not repair.
+// ⛔ CS042 P5 (GATE A, A3/B3 "out 0.35 easeIn — after the press"): the arrangement dismissLevelDone() also
+// used, for the same reason. game.celebration still goes null here, unconditionally: it gates update()'s
+// early return (the panel is what freezes the field) and BOTH input handlers — and, until CS043 P2, it
+// also had to be null before the level-end site's deferred nextWave(). A panel that outlived its own
+// dismissal by 0.35 s would keep freezing the field and keep owning input for that long. So the dissolve
+// is a SNAPSHOT that only drawCelebration() reads.
+//   ⛔ THE SNAPSHOT USED TO CARRY game.wave. It was forced by the level-end site: nextWave() ran on the
+// very next line and incremented it, so a ghost reading game.wave live would have spent its whole
+// dissolve saying "During level N+1 you earned:" about unlocks earned in level N. CS043 P2 deleted that
+// site and that sub-line, and spec §2 kept the field anyway; with no reader left, Paul removed it
+// off-cycle on 2026-09-13 (DECISIONS.md) on the spec's own argument for deleting the fork — a field
+// kept for a reader that no longer exists is the shape a later session resurrects or trips over.
+// ⛔ If a sub-line ever names a level again, snapshot game.wave HERE; never read it live in the ghost.
+// What the renderer needs (items, scroll, and since CS044 P4 tab — so the dissolve shows the tab the
+// player left on) is copied for the ordinary reason: the live object is gone.
 function dismissCelebration() {
   const c = game.celebration;
-  const resume = c ? c.resume : null;
-  if (c) game.celebrationOut = { items: c.items, scroll: c.scroll, resume: c.resume,
-                                 wave: game.wave, t: CEREMONY_PANEL_FADE };
+  if (c) game.celebrationOut = { items: c.items, scroll: c.scroll, tab: c.tab, t: CEREMONY_PANEL_FADE };
   game.celebration = null;
-  if (resume === "wave") nextWave();
 }
 
 // One row: the emblem, then the name (carrying its tier badge, in that tier's colour) over the
@@ -15004,44 +15094,60 @@ function drawCelebrationRow(item, x, ry) {
 // ⛔ CS042 P5 (GATE A, A3/B3 "in 0.35 easeOut / out 0.35 easeIn") — THE PANEL'S INK, DRAWN AT A GIVEN
 // ALPHA, WITH NO PER-SITE FORK. The copy-out gives the level-end and game-over panels the SAME two fade
 // numbers and the SAME two curves, so there is one fade implementation and one renderer; the only fork
-// inside it is the `resume`-derived sub-line, which predates this phase and is untouched.
-//   `c` is either game.celebration (live) or the snapshot dismissCelebration() parked, which is why
-// `wave` arrives as an argument instead of being read off game: the ghost must keep naming the level
-// its unlocks were earned in after nextWave() has moved on (see that function's header).
+// inside it was the `resume`-derived sub-line, which predated that phase and which CS043 P2 deleted.
+//   `c` is either game.celebration (live) or the snapshot dismissCelebration() parked. A third `wave`
+// argument used to ride along so the ghost could keep naming the level its unlocks were earned in after
+// nextWave() had moved on; CS043 P2 deleted the only line that read it, and it was removed off-cycle
+// 2026-09-13 (see dismissCelebration()'s header). Everything this draws comes from `c` and `a`.
 //   ⛔ THE ALPHA IS ctx.globalAlpha AND NOTHING ELSE. menuPanel()'s own near-opaque backdrop fill is the
 // shipped one and rides the same alpha — GDD §3.2's two sanctioned fill exceptions gain no third here,
 // and no shadowBlur is added. ctx.save() below captures this alpha and ctx.restore() puts it back, so
 // the clip block cannot leak it.
-function drawCelebrationPanel(c, a, wave) {
+function drawCelebrationPanel(c, a) {
   ctx.globalAlpha = a;
-  // CS034 P5 (§4): the level-end open (resume === "wave") reads differently from the game-over one —
-  // derived from `resume`, never `game.state` (see dismissCelebration()'s header for why). game.wave is
-  // still the just-completed wave here (nextWave() is deferred to dismissal), so it needs no new field.
+  // CS034 P5 (§4): the level-end open (resume === "wave") read differently from the game-over one —
+  // derived from `resume`, never `game.state` (see dismissCelebration()'s header for why). game.wave was
+  // still the just-completed wave there (nextWave() was deferred to dismissal), so it needed no new field.
   //   ⛔ CS036 P3 (spec §1.2, FORK-CS036-F -> F2) — THE HEADER NO LONGER FORKS. CS034 P5 made the wave
   // branch title itself "LEVEL N COMPLETE"; CS036 P2 put a full-screen "Level N Complete" announcement
   // two seconds ahead of this panel, so the header was saying it a second time to a player who had just
   // pressed a button to dismiss the first one. Both branches read "ACHIEVEMENTS UNLOCKED" again — the
-  // string the game-over branch always used — and this panel is back to being about the unlocks. ⛔ The
-  // `isWave` binding STAYS: the SUBTITLE below still forks on it, and that is the fork worth keeping,
-  // since "During level N you earned:" is the line that says which level these came from.
-  const isWave = c.resume === "wave";
+  // string the game-over branch always used — and this panel is back to being about the unlocks. CS036
+  // P3 kept the `isWave` binding because the SUBTITLE still forked on it: "During level N you earned:"
+  // was the line that said which level these came from.
+  //   ⛔ CS043 P2 (spec §2) — THE SUBTITLE NO LONGER FORKS EITHER, AND `isWave` IS DELETED. The level-end
+  // panel is gone (see dismissCelebration()), so no panel can say "During level N": the one that is left
+  // opens at game over over a bucket spanning the WHOLE RUN, and "N NEW UNLOCKS" — the game-over wording
+  // it always used — is the only true line. Title and sub-line are now both single-valued.
   const { x } = menuPanel(CELEB_PANEL_W, CELEB_PANEL_H, "ACHIEVEMENTS UNLOCKED");
   const n = c.items.length;
-  const sub = isWave ? "During level " + wave + " you earned:"
-                      : (n === 1 ? "1 NEW UNLOCK" : n + " NEW UNLOCKS");
-  drawText(sub, VIEW_W / 2, CELEB_SUB_Y, 14, COLOR.dim);
+  const sub = n === 1 ? "1 NEW UNLOCK" : n + " NEW UNLOCKS";
+  drawText(sub, VIEW_W / 2, CELEB_SUB_Y, 14, COLOR.dim);   // ⛔ the RUN total — never the active tab's count
+
+  // CS044 P4 (spec §4.2): the tab header, in drawAchievements()'s convention — lit COLOR.text wearing
+  // ACH_TAB_MARK, idle COLOR.menuIdle — but read off `c` (live panel or dissolving ghost), never game.menu.
+  const ti = celebrationTabIndex(c);
+  CELEB_TABS.forEach((t, i) => {
+    drawText(t.label + (i === ti ? ACH_TAB_MARK : ""), CELEB_ROW_X + i * CELEB_TAB_STEP, CELEB_TAB_Y,
+             CELEB_TAB_SIZE, i === ti ? COLOR.text : COLOR.menuIdle, "left");
+  });
 
   // Clamp against the same ceiling both input handlers clamp against, then clip the row region so a
   // scrolled row can never spill past the panel or under the header/footer — drawAchievements()'s
   // idiom, reproduced rather than shared (that renderer reads game.menu.scroll and this one must not).
+  const rows = celebrationRows(c);
   const maxScroll = celebrationMaxScroll(c);
   c.scroll = Math.max(0, Math.min(maxScroll, c.scroll));
   ctx.save();
   ctx.beginPath();
   ctx.rect(x, CELEB_ROW_CLIP_TOP, CELEB_PANEL_W, CELEB_ROW_VISIBLE_H);
   ctx.clip(); // not a fill — GDD §3.2's no-fills rule gains no new exception here
-  c.items.forEach((it, i) => drawCelebrationRow(it, CELEB_ROW_X, CELEB_ROW0_Y + i * CELEB_ROW_STEP - c.scroll));
+  rows.forEach((it, i) => drawCelebrationRow(it, CELEB_ROW_X, CELEB_ROW0_Y + i * CELEB_ROW_STEP - c.scroll));
   ctx.restore();
+  // An empty tab says so, centred in the row region; its ceiling is 0, so no ▲/▼ can follow.
+  if (rows.length === 0) {
+    drawText(CELEB_EMPTY_TEXT, VIEW_W / 2, (CELEB_ROW_CLIP_TOP + CELEB_ROW_CLIP_BOTTOM) / 2, CELEB_NAME_SIZE, COLOR.menuIdle, "center");
+  }
 
   // Scroll affordance: drawn OUTSIDE the clip like the header/footer chrome, and only while there is
   // anything to scroll — ▲ iff something sits above, ▼ iff something sits below.
@@ -15059,9 +15165,9 @@ function drawCelebrationPanel(c, a, wave) {
 // one on top. That is also why draw() still calls this exactly once, in its shipped tail slot.
 function drawCelebration() {
   const out = game.celebrationOut;
-  if (out) drawCelebrationPanel(out, easeIn(clamp01(out.t / CEREMONY_PANEL_FADE)), out.wave);
+  if (out) drawCelebrationPanel(out, easeIn(clamp01(out.t / CEREMONY_PANEL_FADE)));
   const c = game.celebration;
-  if (c) drawCelebrationPanel(c, easeOut(clamp01(game.celebrationT / CEREMONY_PANEL_FADE)), game.wave);
+  if (c) drawCelebrationPanel(c, easeOut(clamp01(game.celebrationT / CEREMONY_PANEL_FADE)));
 }
 
 // Background stars scattered across the whole world (count scales with world area
@@ -15168,6 +15274,35 @@ function drawShockwave() {
   ctx.globalAlpha = 1;
 }
 
+// CS044 P1 (spec §3.2): the debug collision-hitbox overlay. Self-gated on DEBUG.hitboxOverlay; called
+// from draw() inside the camera transform, right after game.ship.draw(), so world coords map straight
+// to screen the way drawEntity() relies on. Every circle is HITBOX_FILL, unconditionally — no read of
+// ship.invuln or game.levelEndSafe (FORK-CS044-E, declined: always red). The ship's circle is ALWAYS
+// SHIP_RADIUS, never SHIELD_RADIUS (Paul: non-shield collisions only) — the one place this overlay's
+// radius deliberately differs from what damageShip's own collision passes would use this frame.
+// Hostile bullets draw nothing: a bullet is tested as a POINT against the ship's circle, so the
+// ship's own circle already is that test (spec §3.2's table).
+function drawHitboxes() {
+  if (!DEBUG.hitboxOverlay) return;
+  ctx.fillStyle = HITBOX_FILL;
+  const circle = (x, y, r) => {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, TAU);
+    ctx.fill();
+  };
+  circle(game.ship.x, game.ship.y, SHIP_RADIUS);
+  ctx.beginPath();                                   // CS044 GATE A: the ship's disc also gets a ring
+  ctx.arc(game.ship.x, game.ship.y, SHIP_RADIUS, 0, TAU);
+  glowStroke(HITBOX_RING, 2, 10);
+  const cam = game.camera;
+  for (const e of [...game.debris, ...game.hunters, ...game.saucers]) {
+    if (!onScreen(e)) continue;
+    const ox = wrapOffset(e.x, cam.x, WORLD_W);
+    const oy = wrapOffset(e.y, cam.y, WORLD_H);
+    circle(e.x + ox, e.y + oy, e.radius);
+  }
+}
+
 function draw() {
   ctx.clearRect(0, 0, VIEW_W, VIEW_H);
   drawStarfield();
@@ -15234,6 +15369,8 @@ function draw() {
   game.powerups.forEach(drawEntity);   // above hazards so pickups stay readable (F6)
   game.bullets.forEach(drawEntity);
   game.ship.draw();                 // always at the camera center
+  drawHitboxes();     // CS044 P1 (spec §3.2): debug-only, self-gated; sits over hazards and the ship,
+                       // under floaters and the HUD
   game.floaters.forEach(drawEntity);
   if (game.state === "dying") drawShockwave();  // v3.6 P5: expanding ring from the death point (world space)
   ctx.restore();
@@ -15257,7 +15394,10 @@ function draw() {
   if (Capture.hudVisible) drawHUD();
   drawCaption(); // CS011 P2: sibling of drawHUD (NOT inside it) — captions show regardless of the H toggle
   drawLevelBanner(); // CS025 P5: likewise a sibling — the transient "Level N", drawn over the HUD, self-gated
-  drawLevelDone(); // CS036 P2: a third sibling — "Level N Complete" over the frozen field, self-gated
+  // ⛔ CS043 P1 (spec §1.1): drawLevelDone() — CS036 P2's THIRD sibling, "Level N Complete" over the
+  // frozen field — was called HERE and is deleted with the announcement. Two siblings again, and the
+  // draw-order note that used to sit in drawLevelDone()'s header ("this draws BEFORE drawCelebration(),
+  // so the dissolving announcement passes under the panel") has nothing left to order.
 
   // ⛔ CS042 P5 (GATE A, B4 "drawn under the previous beat: yes → no" + "fade-in 0.00 → 0.40 easeOut") —
   // THIS REVERSES A CS034 P7 DECISION, AND THE REVERSAL IS DELIBERATE, NOT A REDISCOVERY. What follows
@@ -15735,26 +15875,30 @@ function updateMusic() {
   MusicSys.update();
 }
 
-// CS042 P5 (spec §3, GATE A) — THE CEREMONY'S FADE CLOCKS, all four in one place.
+// CS042 P5 (spec §3, GATE A) — THE CEREMONY'S FADE CLOCKS, all of them in one place. ⛔ CS043 P1: FOUR
+// BECAME THREE. game.levelDoneOut, the "Level N Complete" dissolve, went with the announcement itself;
+// the sentences below that named it as an example are rewritten rather than deleted, because the
+// property each was illustrating is unchanged and still has an illustration.
 //
 // ⛔ IT RUNS IN loop(), NOT IN update(), AND THAT IS THE WHOLE REASON IT EXISTS AS ITS OWN FUNCTION.
 // updateToasts() above is the precedent and states the rule in its own header: a thing that has to
 // animate across every state cannot be clocked by the function that refuses to run in most of them.
-// Every one of these four crosses at least one such state, and the celebration panel's fade-in crosses
+// Every one of these three crosses at least one such state, and the celebration panel's fade-in crosses
 // the hardest of them:
 //   * the panel's fade-IN runs while game.celebration is set, which is precisely the term update()
-//     early-returns on. Nothing inside update() ticks during a panel — not even the level-end freeze,
-//     whose own branch carries `!game.celebration` — so a clock placed there would sit at zero for the
-//     panel's entire life and the fade would never happen at all.
-//   * the panel's fade-OUT and the announcement's dissolve cross that same panel at the level-end site
-//     (the announcement dissolves under a panel that is still up), and the frozen tail after it.
+//     early-returns on. Nothing inside update() ticks during a panel, so a clock placed there would sit
+//     at zero for the panel's entire life and the fade would never happen at all.
+//   * the panel's fade-OUT starts on the confirming frame, which NULLS game.celebration — so the ghost
+//     it leaves behind outlives the only state update() could have clocked it from. (CS043 P1: this
+//     bullet used to reach for the announcement's own dissolve under a still-live panel as its example;
+//     that example is gone and the property it showed is the panel's own, stated directly.)
 //   * the GAME OVER stack's fade-in runs in state "gameover", where update() returns on its first term.
 //
 // ⛔ IT HOLDS THROUGH A PAUSE, and that is the announcement channel's convention, not the toasts'.
 // game.caption.life and game.levelBanner.life both tick in update()'s PLAYING body precisely so they
 // hold behind a menu and resume rather than expiring unseen (CS025 P5's own note); a ceremony beat is
 // the same category and gets the same treatment from the one term available here. Toasts deliberately
-// do NOT hold, which is why this is a separate function rather than four more lines in that one.
+// do NOT hold, which is why this is a separate function rather than three more lines in that one.
 //
 // ⛔ THE TWO COUNTERS RE-ZERO THEMSELVES. celebrationT and gameoverT are each derived from a condition
 // that is checked every frame, so neither needs an arming call site: no panel means the panel clock is
@@ -15762,10 +15906,10 @@ function updateMusic() {
 // correct at the "dying" → "gameover" seam AND at a panel's dismissal without a line at either place.
 function tickCeremony(dt) {
   if (game.paused) return;
-  if (game.levelDoneOut) {
-    game.levelDoneOut.t -= dt;
-    if (game.levelDoneOut.t <= 0) game.levelDoneOut = null;
-  }
+  // ⛔ CS043 P1 (spec §1.3): the game.levelDoneOut arm STOOD HERE, first of four, and is deleted with
+  // the announcement whose dissolve it clocked. The other three survive unchanged and so does this
+  // function — the panel's fade-in still runs while game.celebration is set, which is precisely the
+  // term update() early-returns on, so this is NOT a candidate for folding back into update().
   if (game.celebrationOut) {
     game.celebrationOut.t -= dt;
     if (game.celebrationOut.t <= 0) game.celebrationOut = null;
