@@ -5,24 +5,17 @@ statClass: Indie Developer
 statTools: Astro, Decap CMS, Netlify
 statStatus: Building three games at once
 ---
-Why remake arcade classics when today's hardware can render almost anything?
 
-Because the limits left room for me. A pixelated tree, a blocky crate, a few blips of sound, and my imagination filled in everything else.
+**Why remake arcade classics when today’s hardware can render almost anything?**
 
-* What was behind that tree?
-* What was in that box?
-* Who was this character, and what were they actually fighting for?
+Because the limits left room for me. A pixelated tree, a blocky crate, a few blips of sound, and my imagination did the rest. What was behind that tree? What was in that box? Who was this character, and what were they fighting for? The game handed me a sketch, and I built the world myself.
 
-Like a good book, the game handed me a sketch and I built the world myself. And what you build yourself, you're committed to.
+Eventually I wanted that world on the screen: the story behind the battle, and abilities that grew as the difficulty climbed. A few classics delivered. Most couldn’t, because they were coin-operated. Every decision was tuned for revenue: engaging enough to keep you pumping quarters, never so satisfying that you’d last long on one.
 
-But sometimes I wanted that world to show up on the screen. I wanted the story behind the battle. I wanted my abilities to grow as the difficulty climbed, because that seemed like the only fair deal. A few classics gave us that. Most didn't, and I understand why.
+I could feel it as a kid, standing at the cabinet. So I make games without it.
 
-They were coin-operated, and needed to make money. Every decision sat on an edge: engaging enough to keep you playing, never so satisfying that you'd survive too long on a single quarter. The difficulty wasn't tuned for fun. It was tuned for revenue.
+That’s what “coinless” means. My games are hard, and the challenge is the fun, but it’s there because it’s good, not because your failure is a business model. No quarters. No shop. No enhancements for sale. You pay a fair price once, press start, and the game gives you everything it’s got.
 
-I could feel those decisions as a kid, standing at the cabinet. I make games without them.
-
-That's the whole idea here. My games are hard, challenge is the fun. But the challenge exists because it's good, not because your failure is a business model. No quarters. No shop. No enhancements for sale. You press start, and the game gives you everything it's got.
-
-When I enhance a classic, I'm not thinking about making more money. I'm thinking about making more fun.
+I price them fairly so I can keep making more.
 
 — Paul
